@@ -2901,68 +2901,83 @@ describe("free tier gate on the chat path", () => {
   })
 })
 
-describe("install.sh config preservation", () => {
-  function runInstall(tmp, destPort) {
-    const env = {
-      ...process.env,
-      HOME: toPosix(path.join(tmp, "home")),
-      ZEN_PROXY_DIR: toPosix(path.join(tmp, "install")),
-      ZEN_PROXY_PORT: String(destPort),
-    }
+describe("install.sh config location", () => {
+  // The test process sets ZEN_PROXY_CONFIG for itself; the installer must not
+  // inherit it, nor any XDG dir of the machine running the tests.
+  function installEnv(tmp, port = 8899) {
+    const env = { ...process.env, HOME: toPosix(path.join(tmp, "home")), ZEN_PROXY_DIR: toPosix(path.join(tmp, "install")), ZEN_PROXY_PORT: String(port) }
+    for (const k of ["ZEN_PROXY_CONFIG", "ZEN_PROXY_STATS", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]) delete env[k]
     fs.mkdirSync(env.HOME, { recursive: true })
-    execFileSync("bash", ["install.sh", "--local", toPosix(path.join(tmp, "src"))], { env, cwd: REPO_ROOT })
     return env
   }
-
-  test("fresh install creates a default config", () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
+  const install = (tmp, env) => execFileSync("bash", ["install.sh", "--local", toPosix(path.join(tmp, "src"))], { env, cwd: REPO_ROOT })
+  function source(tmp, extra = {}) {
     const src = path.join(tmp, "src")
     fs.mkdirSync(src, { recursive: true })
     fs.writeFileSync(path.join(src, "zen-proxy.mjs"), "console.log('zen-proxy')\n")
-    const env = runInstall(tmp, 8899)
-    const cfg = JSON.parse(fs.readFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json"), "utf8"))
-    assert.equal(cfg.port, 8899)
+    for (const [f, body] of Object.entries(extra)) fs.writeFileSync(path.join(src, f), body)
+  }
+  const cfgPath = (env) => path.join(env.HOME, ".config", "zen-proxy", "zen-proxy.json")
+  const statsPath = (env) => path.join(env.HOME, ".local", "share", "zen-proxy", "stats.json")
+
+  test("fresh install creates the default config under ~/.config", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
+    source(tmp)
+    const env = installEnv(tmp)
+    install(tmp, env)
+    assert.equal(JSON.parse(fs.readFileSync(cfgPath(env), "utf8")).port, 8899)
     assert.ok(fs.existsSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.mjs")))
+    assert.ok(!fs.existsSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json")), "nothing user-owned inside the install dir")
   })
 
-  test("reinstall preserves an existing user config", () => {
+  test("reinstall leaves the user config and analytics alone, and ignores a checkout's own", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
-    const src = path.join(tmp, "src")
-    fs.mkdirSync(src, { recursive: true })
-    fs.writeFileSync(path.join(src, "zen-proxy.mjs"), "console.log('zen-proxy')\n")
-    fs.writeFileSync(path.join(src, "zen-proxy.json"), JSON.stringify({ src: true, port: 1111 }))
-    const env = runInstall(tmp, 8899)
-    fs.writeFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json"), JSON.stringify({ user: true, port: 7777 }))
-    // second run = reinstall over an existing install
-    execFileSync("bash", ["install.sh", "--local", toPosix(path.join(tmp, "src"))], { env, cwd: REPO_ROOT })
-    const cfg = JSON.parse(fs.readFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json"), "utf8"))
-    assert.deepEqual(cfg, { user: true, port: 7777 }, "user config must survive reinstall")
+    source(tmp, { "zen-proxy.json": JSON.stringify({ src: true }), "zen-proxy-stats.json": '{"from":"src"}' })
+    const env = installEnv(tmp)
+    install(tmp, env)
+    fs.writeFileSync(cfgPath(env), JSON.stringify({ user: true, port: 7777 }))
+    fs.mkdirSync(path.dirname(statsPath(env)), { recursive: true })
+    fs.writeFileSync(statsPath(env), '{"buckets":[1]}')
+    install(tmp, env)
+    assert.deepEqual(JSON.parse(fs.readFileSync(cfgPath(env), "utf8")), { user: true, port: 7777 })
+    assert.equal(fs.readFileSync(statsPath(env), "utf8"), '{"buckets":[1]}')
+    assert.ok(!fs.existsSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json")))
   })
 
-  test("reinstall preserves token analytics", () => {
+  test("moves a config and analytics left in the install dir by an older build", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
-    const src = path.join(tmp, "src")
-    fs.mkdirSync(src, { recursive: true })
-    fs.writeFileSync(path.join(src, "zen-proxy.mjs"), "console.log('zen-proxy')\n")
-    fs.writeFileSync(path.join(src, "zen-proxy-stats.json"), '{"from":"src"}')
-    const env = runInstall(tmp, 8899)
-    fs.writeFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy-stats.json"), '{"buckets":[1]}')
-    execFileSync("bash", ["install.sh", "--local", toPosix(path.join(tmp, "src"))], { env, cwd: REPO_ROOT })
-    assert.equal(fs.readFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy-stats.json"), "utf8"), '{"buckets":[1]}')
+    source(tmp)
+    const env = installEnv(tmp)
+    fs.mkdirSync(env.ZEN_PROXY_DIR, { recursive: true })
+    fs.writeFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json"), JSON.stringify({ legacy: true, port: 7000 }))
+    fs.writeFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy-stats.json"), '{"buckets":[2]}')
+    install(tmp, env)
+    assert.deepEqual(JSON.parse(fs.readFileSync(cfgPath(env), "utf8")), { legacy: true, port: 7000 })
+    assert.equal(fs.readFileSync(statsPath(env), "utf8"), '{"buckets":[2]}')
+  })
+
+  test("an old install-dir config never overwrites the one already in ~/.config", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
+    source(tmp)
+    const env = installEnv(tmp)
+    fs.mkdirSync(path.dirname(cfgPath(env)), { recursive: true })
+    fs.writeFileSync(cfgPath(env), JSON.stringify({ current: true }))
+    fs.mkdirSync(env.ZEN_PROXY_DIR, { recursive: true })
+    fs.writeFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy.json"), JSON.stringify({ legacy: true }))
+    install(tmp, env)
+    assert.deepEqual(JSON.parse(fs.readFileSync(cfgPath(env), "utf8")), { current: true })
+    assert.deepEqual(JSON.parse(fs.readFileSync(cfgPath(env) + ".from-install-dir", "utf8")), { legacy: true }, "the old one is kept, not lost")
   })
 
   test("refuses to install into /", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
-    const src = path.join(tmp, "src")
-    fs.mkdirSync(src, { recursive: true })
-    fs.writeFileSync(path.join(src, "zen-proxy.mjs"), "console.log('zen-proxy')\n")
-    const env = { ...process.env, HOME: toPosix(path.join(tmp, "home")), ZEN_PROXY_DIR: "/" }
-    fs.mkdirSync(env.HOME, { recursive: true })
-    assert.throws(() => execFileSync("bash", ["install.sh", "--local", toPosix(src)], { env, cwd: REPO_ROOT }), /Refusing/)
+    source(tmp)
+    const env = { ...installEnv(tmp), ZEN_PROXY_DIR: "/" }
+    assert.throws(() => execFileSync("bash", ["install.sh", "--local", toPosix(path.join(tmp, "src"))], { env, cwd: REPO_ROOT }), /Refusing/)
   })
 })
 
-describe("install.ps1 config preservation", () => {
+describe("install.ps1 config location", () => {
   let hasPwsh = false
   try {
     execFileSync("pwsh", ["-NoProfile", "-Command", "$true"], { stdio: "ignore" })
@@ -2972,7 +2987,7 @@ describe("install.ps1 config preservation", () => {
   }
 
   test(
-    "reinstall preserves an existing user config",
+    "moves an install-dir config to %APPDATA% and ignores a checkout's own",
     { skip: hasPwsh ? false : "pwsh not available on this host" },
     () => {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
@@ -2987,13 +3002,18 @@ describe("install.ps1 config preservation", () => {
         ...process.env,
         HOME: path.join(tmp, "home"),
         TEMP: path.join(tmp, "temp"),
+        APPDATA: path.join(tmp, "appdata"),
+        LOCALAPPDATA: path.join(tmp, "localappdata"),
         ZEN_PROXY_DIR: dest,
       }
+      delete env.ZEN_PROXY_CONFIG
+      delete env.ZEN_PROXY_STATS
       fs.mkdirSync(env.HOME, { recursive: true })
       fs.mkdirSync(env.TEMP, { recursive: true })
       execFileSync("pwsh", ["-NoProfile", "-File", "install.ps1", "-LocalSrc", src], { env, cwd: REPO_ROOT })
-      const cfg = JSON.parse(fs.readFileSync(path.join(dest, "zen-proxy.json"), "utf8"))
-      assert.deepEqual(cfg, { user: true, port: 7777 }, "user config must survive reinstall")
+      const cfg = JSON.parse(fs.readFileSync(path.join(env.APPDATA, "zen-proxy", "zen-proxy.json"), "utf8"))
+      assert.deepEqual(cfg, { user: true, port: 7777 }, "the user's config must move, not be replaced")
+      assert.ok(!fs.existsSync(path.join(dest, "zen-proxy.json")), "the checkout's config is not copied into the install")
     },
   )
 })
@@ -3486,5 +3506,40 @@ describe("token analytics", () => {
     assert.equal(all.totals.input, 51)
     assert.equal(all.totals.calls, 6)
     assert.ok(zp.usageBuckets.size <= 3, `old hours should have folded into a day, got ${zp.usageBuckets.size} buckets`)
+  })
+})
+
+describe("config location at startup", () => {
+  test("a config and analytics left beside zen-proxy.mjs move to the user's config and data dirs", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-migrate-"))
+    const app = path.join(tmp, "app")
+    fs.mkdirSync(path.join(app, "public"), { recursive: true })
+    for (const f of ["zen-proxy.mjs", "models.json", "agent-tools.json"]) fs.copyFileSync(path.join(REPO_ROOT, f), path.join(app, f))
+    const port = 40000 + Math.floor(Math.random() * 20000)
+    fs.writeFileSync(path.join(app, "zen-proxy.json"), JSON.stringify({ port, legacy: true }))
+    fs.writeFileSync(path.join(app, "zen-proxy-stats.json"), JSON.stringify({ version: 1, buckets: [] }))
+    const env = { ...process.env, XDG_CONFIG_HOME: path.join(tmp, "cfg"), XDG_DATA_HOME: path.join(tmp, "data"), APPDATA: path.join(tmp, "cfg"), LOCALAPPDATA: path.join(tmp, "data"), AUTO_SYNC: "0", AUTO_UA: "0" }
+    for (const k of ["ZEN_PROXY_CONFIG", "ZEN_PROXY_STATS", "PORT"]) delete env[k]
+    const { spawn } = await import("node:child_process")
+    const child = spawn(process.execPath, [path.join(app, "zen-proxy.mjs")], { env })
+    let out = ""
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error(`no startup: ${out}`)), 15_000)
+        child.stdout.on("data", (d) => {
+          out += d
+          if (/migration: moved .*zen-proxy-stats\.json/.test(out)) clearTimeout(t), resolve()
+        })
+        child.on("exit", () => reject(new Error(`exited: ${out}`)))
+      })
+    } finally {
+      child.kill()
+    }
+    const cfgFile = path.join(tmp, "cfg", "zen-proxy", "zen-proxy.json")
+    assert.equal(JSON.parse(fs.readFileSync(cfgFile, "utf8")).legacy, true)
+    assert.ok(fs.existsSync(path.join(tmp, "data", "zen-proxy", "stats.json")))
+    assert.ok(fs.existsSync(path.join(app, "zen-proxy.json.migrated")), "the old file is renamed, not deleted")
+    assert.ok(!fs.existsSync(path.join(app, "zen-proxy.json")))
+    assert.match(out, new RegExp(`listening on http://127\\.0\\.0\\.1:${port}`), "the migrated config is the one in use")
   })
 })

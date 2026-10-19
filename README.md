@@ -139,6 +139,16 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 
 `zen-proxy.json`, created on first run, hot-reloaded, and editable from the dashboard. Environment variables override at startup.
 
+Where things live — outside the install dir, so a reinstall or `git pull` never touches them:
+
+| | Linux / macOS | Windows |
+|---|---|---|
+| Config | `~/.config/zen-proxy/zen-proxy.json` (`$XDG_CONFIG_HOME`) | `%APPDATA%\zen-proxy\zen-proxy.json` |
+| Analytics | `~/.local/share/zen-proxy/stats.json` (`$XDG_DATA_HOME`) | `%LOCALAPPDATA%\zen-proxy\stats.json` |
+
+`ZEN_PROXY_CONFIG` and `ZEN_PROXY_STATS` override both; with only `ZEN_PROXY_CONFIG` set, analytics go next to that file. Builds before this kept `zen-proxy.json` (and `zen-proxy-stats.json`) beside `zen-proxy.mjs`: the proxy and the installers move them on first start, renaming the old file to `*.migrated` (proxy) or keeping it as `*.from-install-dir` if the new location already had one (installer). The startup log prints both paths.
+
+
 <details>
 <summary>Keys</summary>
 
@@ -204,7 +214,7 @@ Proxied response bodies are read with backpressure: when the reader falls behind
 
 `proxyHealthChecks` decides how model probes, sync, the model **TEST** button, `/health` and `/v1/models` reach upstream: `proxy` (through the pool) or `direct`. Use `direct` to tell a dead model from a dead proxy. The npm lookup behind `autoUA` always goes direct.
 
-Passwords are masked everywhere they are shown (dashboard, `/api/config`, `/api/proxies`, logs) and kept only in `zen-proxy.json`. Remote (non-local) clients still have their IP forwarded as `x-real-ip`, as before. Respect OpenCode's terms and quotas.
+Passwords are masked everywhere they are shown (dashboard, `/api/config`, `/api/proxies`, logs) and kept only in your `zen-proxy.json`. Remote (non-local) clients still have their IP forwarded as `x-real-ip`, as before. Respect OpenCode's terms and quotas.
 </details>
 
 <details>
@@ -219,7 +229,7 @@ The dashboard's **Analytics** tab answers two questions: how many tokens went th
 
 Counts come from the `usage` the upstream stream reports; nothing is estimated. Only client traffic is metered, not probes or model tests. "Calls" are upstream attempts, retries included. Note that tool-less requests carry OpenCode's tool manifest (see below), which shows up as input tokens, mostly cached.
 
-Data is kept in `zen-proxy-stats.json` next to the config, saved every 30 seconds and on shutdown, and preserved by the installers. Hourly detail is kept for 31 days; older hours fold into one bucket per day, so the file stays small. `GET /api/analytics?range=today|24h|7d|30d|all` returns the same numbers as JSON.
+Data is kept in `stats.json` in the zen-proxy data dir (see Configuration), saved every 30 seconds and on shutdown. Hourly detail is kept for 31 days; older hours fold into one bucket per day, so the file stays small. `GET /api/analytics?range=today|24h|7d|30d|all` returns the same numbers as JSON.
 </details>
 
 <details>

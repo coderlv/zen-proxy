@@ -6,3 +6,5 @@ zen-proxy-stats.json
 zen-proxy/
 *.log
 .DS_Store
+# left behind when an older build's config/analytics move to ~/.config and ~/.local/share
+*.migrated

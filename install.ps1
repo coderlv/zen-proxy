@@ -8,6 +8,8 @@
 #   ZEN_PROXY_REPO   GitHub "owner/repo" (default: 12errh/zen-proxy)
 #   ZEN_PROXY_DIR    install directory (default: $HOME\.zen-proxy)
 #   ZEN_PROXY_PORT   default port (default: 8787)
+#   ZEN_PROXY_CONFIG config file (default: %APPDATA%\zen-proxy\zen-proxy.json)
+#   ZEN_PROXY_STATS  analytics file (default: %LOCALAPPDATA%\zen-proxy\stats.json)
 
 param(
   [string]$LocalSrc = ""
@@ -35,23 +37,42 @@ if ([string]::IsNullOrWhiteSpace($InstallDir) -or $InstallDir -eq "/") {
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Info "Installing zen-proxy to $InstallDir"
 
-$ConfigPath = Join-Path $InstallDir "zen-proxy.json"
-$CfgBak = $null
-if (Test-Path $ConfigPath) {
-  $CfgBak = Join-Path $env:TEMP ("zen-proxy-config-" + [guid]::NewGuid().ToString() + ".json")
-  Copy-Item $ConfigPath $CfgBak -Force
+# Same resolution as zen-proxy.mjs, so the installer and the proxy agree.
+$AppData = $env:APPDATA
+if (-not $AppData) { $AppData = Join-Path $HOME "AppData\Roaming" }
+$LocalAppData = $env:LOCALAPPDATA
+if (-not $LocalAppData) { $LocalAppData = Join-Path $HOME "AppData\Local" }
+$ConfigPath = $env:ZEN_PROXY_CONFIG
+if (-not $ConfigPath) { $ConfigPath = Join-Path $AppData "zen-proxy\zen-proxy.json" }
+$StatsPath = $env:ZEN_PROXY_STATS
+if (-not $StatsPath) {
+  if ($env:ZEN_PROXY_CONFIG) { $StatsPath = Join-Path (Split-Path $env:ZEN_PROXY_CONFIG -Parent) "zen-proxy-stats.json" }
+  else { $StatsPath = Join-Path $LocalAppData "zen-proxy\stats.json" }
 }
-# Token analytics survive a reinstall the same way the config does.
-$StatsPath = Join-Path $InstallDir "zen-proxy-stats.json"
-$StatsBak = $null
-if (Test-Path $StatsPath) {
-  $StatsBak = Join-Path $env:TEMP ("zen-proxy-stats-" + [guid]::NewGuid().ToString() + ".json")
-  Copy-Item $StatsPath $StatsBak -Force
+New-Item -ItemType Directory -Force -Path (Split-Path $ConfigPath -Parent) | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path $StatsPath -Parent) | Out-Null
+
+# Builds before this kept the config and analytics inside the install dir,
+# which a reinstall wipes. Move them out; if the new location already has a
+# file, keep the old one next to it instead of losing it.
+function Move-Legacy($from, $to) {
+  if (-not (Test-Path $from)) { return }
+  if (Test-Path $to) {
+    Move-Item $from "$to.from-install-dir" -Force
+    Info "Kept $to; the copy from the install dir is now $to.from-install-dir"
+  } else {
+    Move-Item $from $to
+    Info "Moved $from -> $to"
+  }
 }
+Move-Legacy (Join-Path $InstallDir "zen-proxy.json") $ConfigPath
+Move-Legacy (Join-Path $InstallDir "zen-proxy-stats.json") $StatsPath
 
 if ($LocalSrc) {
   if (-not (Test-Path $LocalSrc)) { Die "Local source not found: $LocalSrc" }
   Copy-Item -Path (Join-Path $LocalSrc "*") -Destination $InstallDir -Recurse -Force
+  # A checkout may carry its own config; it is not this install's.
+  Remove-Item (Join-Path $InstallDir "zen-proxy.json"), (Join-Path $InstallDir "zen-proxy-stats.json") -Force -ErrorAction SilentlyContinue
   Info "Copied from local source: $LocalSrc"
 }
 else {
@@ -68,14 +89,6 @@ else {
   Info "Downloaded and extracted $Repo"
 }
 
-if ($CfgBak -and (Test-Path $CfgBak)) {
-  Copy-Item $CfgBak $ConfigPath -Force
-  Remove-Item $CfgBak -Force
-}
-if ($StatsBak -and (Test-Path $StatsBak)) {
-  Copy-Item $StatsBak $StatsPath -Force
-  Remove-Item $StatsBak -Force
-}
 
 if (-not (Test-Path (Join-Path $InstallDir "zen-proxy.mjs"))) {
   Die "zen-proxy.mjs not found after install - check ZEN_PROXY_REPO"
@@ -83,7 +96,7 @@ if (-not (Test-Path (Join-Path $InstallDir "zen-proxy.mjs"))) {
 
 if (-not (Test-Path $ConfigPath)) {
   Set-Content -Path $ConfigPath -Value "{ `"host`": `"127.0.0.1`", `"port`": $Port }"
-  Info "Created default config with port $Port"
+  Info "Created default config with port ${Port}: $ConfigPath"
 }
 
 $Script = Join-Path $InstallDir "zen-proxy.ps1"
@@ -121,6 +134,8 @@ if (($userPath -split ";") -notcontains $BinDir) {
 Info ""
 Info "  zen-proxy installed!"
 Info "  Dashboard: http://127.0.0.1:$Port"
+Info "  Config:    $ConfigPath"
+Info "  Analytics: $StatsPath"
 Info ""
 Info "  Run it:   zen-proxy"
 Info "  Or:       powershell -ExecutionPolicy Bypass -File `"$Script`""

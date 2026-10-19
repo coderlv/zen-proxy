@@ -34,7 +34,10 @@ if (-not $main) { Fail "zen-claude: could not find zen-proxy.mjs" }
 
 $config = $env:ZEN_PROXY_CONFIG
 if (-not $config) {
-    foreach ($c in @((Join-Path $root "zen-proxy.json"), (Join-Path (Split-Path $root -Parent) "zen-proxy.json"))) {
+    # %APPDATA%\zen-proxy is the config's home; the install-dir copies are where
+    # older builds kept it, still read until the proxy migrates them.
+    $appConfig = Join-Path $env:APPDATA "zen-proxy\zen-proxy.json"
+    foreach ($c in @($appConfig, (Join-Path $root "zen-proxy.json"), (Join-Path (Split-Path $root -Parent) "zen-proxy.json"))) {
         if (Test-Path $c) { $config = $c; break }
     }
 }

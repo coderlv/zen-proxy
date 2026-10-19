@@ -19,6 +19,19 @@ const CMD = path.join(REPO, "bin", "claude-zen.cmd")
 const MAKER = path.join(REPO, "bin", "make-settings.mjs")
 const SETTINGS = path.join(REPO, "claude", "zen-proxy.settings.json")
 
+// The proxy keeps its config in the user's config dir; point every one of those
+// at the staged copy so a test never reads, migrates into or talks to the real one.
+function isolated(dir) {
+  return {
+    XDG_CONFIG_HOME: path.join(dir, "xdg-config"),
+    XDG_DATA_HOME: path.join(dir, "xdg-data"),
+    APPDATA: path.join(dir, "appdata"),
+    LOCALAPPDATA: path.join(dir, "localappdata"),
+    ZEN_PROXY_CONFIG: "",
+    ZEN_PROXY_STATS: "",
+  }
+}
+
 // A copy laid out the way the installer produces, on a port nothing is using.
 function stage(port, { fakeClaude = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-claude-test-"))
@@ -55,7 +68,7 @@ function run(wrapper, { withFakeClaude = true, env = {}, binDir } = {}) {
   const PATH = withFakeClaude ? `${binDir ?? path.dirname(wrapper)}:${process.env.PATH}` : "/usr/bin:/bin"
   const r = spawnSync("bash", [wrapper, "-p", "hi"], {
     encoding: "utf8",
-    env: { ...process.env, PATH, ...env },
+    env: { ...process.env, ...isolated(path.dirname(path.dirname(wrapper))), PATH, ...env },
   })
   return { code: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" }
 }
@@ -251,7 +264,7 @@ describe("windows launcher (powershell)", { skip: !isWindows && "powershell laun
   const psRun = (dir, extra = []) =>
     spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(dir, "bin", "claude-zen.ps1"), ...extra], {
       encoding: "utf8",
-      env: { ...process.env, PATH: `${path.join(dir, "bin")};${process.env.PATH ?? ""}` },
+      env: { ...process.env, ...isolated(dir), PATH: `${path.join(dir, "bin")};${process.env.PATH ?? ""}` },
     })
 
   test("the script parses", () => {
@@ -347,7 +360,7 @@ describe("the launcher keeps the proxy alive", { skip: isWindows && "drives the 
       assert.ok(down(), "precondition: nothing on the port")
       const r = spawnSync("bash", [path.join(dir, "bin", "claude-zen")], {
         encoding: "utf8",
-        env: { ...process.env, PATH: `${path.join(dir, "bin")}:${process.env.PATH ?? ""}` },
+        env: { ...process.env, ...isolated(dir), PATH: `${path.join(dir, "bin")}:${process.env.PATH ?? ""}` },
         timeout: 90_000,
       })
       const out = `${r.stdout ?? ""}${r.stderr ?? ""}`

@@ -3,17 +3,66 @@ import http from "node:http"
 import net from "node:net"
 import tls from "node:tls"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { randomBytes, createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-const CONFIG_PATH = process.env.ZEN_PROXY_CONFIG || path.join(__dirname, "zen-proxy.json")
-// Token analytics live next to the config so a reinstall keeps both.
-const STATS_PATH = process.env.ZEN_PROXY_STATS || path.join(path.dirname(CONFIG_PATH), "zen-proxy-stats.json")
-const UI_PATH = path.join(__dirname, "public", "index.html")
+// realpath, not resolve: through a symlinked path (macOS /tmp, a linked checkout)
+// argv[1] and the module URL differ, and the server used to exit doing nothing.
+const isMain = (() => {
+  try {
+    return !!process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+})()
 const ENV = process.env
+// Settings and data live where the OS expects them, outside the install dir, so
+// a reinstall or `git pull` never touches them: XDG (as opencode itself does,
+// macOS included) or %APPDATA% / %LOCALAPPDATA% on Windows. A custom
+// ZEN_PROXY_CONFIG keeps its analytics beside it unless ZEN_PROXY_STATS says
+// otherwise, so a test or second instance never writes into the real ones.
+const WIN = process.platform === "win32"
+const HOME = os.homedir()
+const CONFIG_DIR = WIN
+  ? path.join(ENV.APPDATA || path.join(HOME, "AppData", "Roaming"), "zen-proxy")
+  : path.join(ENV.XDG_CONFIG_HOME || path.join(HOME, ".config"), "zen-proxy")
+const DATA_DIR = WIN
+  ? path.join(ENV.LOCALAPPDATA || path.join(HOME, "AppData", "Local"), "zen-proxy")
+  : path.join(ENV.XDG_DATA_HOME || path.join(HOME, ".local", "share"), "zen-proxy")
+const CONFIG_PATH = ENV.ZEN_PROXY_CONFIG || path.join(CONFIG_DIR, "zen-proxy.json")
+const STATS_PATH =
+  ENV.ZEN_PROXY_STATS || (ENV.ZEN_PROXY_CONFIG ? path.join(path.dirname(CONFIG_PATH), "zen-proxy-stats.json") : path.join(DATA_DIR, "stats.json"))
+const UI_PATH = path.join(__dirname, "public", "index.html")
+
+// Earlier builds kept both files in the install dir. Move them once; the old
+// file is renamed rather than deleted, so nothing is lost if anything goes wrong.
+// When the new location already has a file, it wins and the old one is left alone.
+const migrationNotes = []
+function migrateLegacyFile(from, to) {
+  if (!fs.existsSync(from)) return
+  if (fs.existsSync(to)) {
+    migrationNotes.push(`ignoring ${from}: ${to} already exists and is the one in use`)
+    return
+  }
+  try {
+    fs.mkdirSync(path.dirname(to), { recursive: true })
+    fs.copyFileSync(from, to)
+    fs.renameSync(from, from + ".migrated")
+    migrationNotes.push(`moved ${from} → ${to} (old file kept as ${path.basename(from)}.migrated)`)
+  } catch (err) {
+    migrationNotes.push(`could not move ${from} → ${to}: ${err.message}`)
+  }
+}
+if (isMain) {
+  if (!ENV.ZEN_PROXY_CONFIG) migrateLegacyFile(path.join(__dirname, "zen-proxy.json"), CONFIG_PATH)
+  if (!ENV.ZEN_PROXY_STATS && !ENV.ZEN_PROXY_CONFIG) migrateLegacyFile(path.join(__dirname, "zen-proxy-stats.json"), STATS_PATH)
+  for (const dir of new Set([path.dirname(CONFIG_PATH), path.dirname(STATS_PATH)])) {
+    try { fs.mkdirSync(dir, { recursive: true }) } catch {}
+  }
+}
 
 // Model ids only ever travel inside JSON bodies, never a URL or a path, so the
 // guarantee here is narrow but real: whitespace, quotes, backslashes and shell
@@ -3214,7 +3263,8 @@ if (isMain) {
   server.listen(config.port, config.host, () => {
     log(`zen-proxy listening on http://${config.host}:${config.port}`)
     log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel || "(auto)"}`)
-    log(`config file: ${CONFIG_PATH}  UI: /`)
+    log(`config file: ${CONFIG_PATH}  analytics: ${STATS_PATH}  UI: /`)
+    for (const note of migrationNotes) log(`migration: ${note}`)
     if (!fs.existsSync(CONFIG_PATH)) {
       try {
         // fallbackModels is deliberately left out: it comes from models.json, so
@@ -3250,6 +3300,7 @@ export {
   compactUsage,
   handleAnalytics,
   STATS_PATH,
+  CONFIG_PATH,
   parseProxyLine,
   parseProxyList,
   maskProxy,

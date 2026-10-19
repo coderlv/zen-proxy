@@ -9,12 +9,19 @@
 #   ZEN_PROXY_REPO   GitHub "owner/repo" (default: 12errh/zen-proxy)
 #   ZEN_PROXY_DIR    install directory (default: ~/.zen-proxy)
 #   ZEN_PROXY_PORT   default port (default: 8787)
+#   ZEN_PROXY_CONFIG config file (default: ${XDG_CONFIG_HOME:-~/.config}/zen-proxy/zen-proxy.json)
+#   ZEN_PROXY_STATS  analytics file (default: ${XDG_DATA_HOME:-~/.local/share}/zen-proxy/stats.json)
 
 set -euo pipefail
 
 REPO="${ZEN_PROXY_REPO:-12errh/zen-proxy}"
 INSTALL_DIR="${ZEN_PROXY_DIR:-$HOME/.zen-proxy}"
 PORT="${ZEN_PROXY_PORT:-8787}"
+# Same resolution as zen-proxy.mjs, so the installer and the proxy agree.
+CONFIG_FILE="${ZEN_PROXY_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/zen-proxy/zen-proxy.json}"
+if [ -n "${ZEN_PROXY_STATS:-}" ]; then STATS_FILE="$ZEN_PROXY_STATS"
+elif [ -n "${ZEN_PROXY_CONFIG:-}" ]; then STATS_FILE="$(dirname "$ZEN_PROXY_CONFIG")/zen-proxy-stats.json"
+else STATS_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/zen-proxy/stats.json"; fi
 LOCAL_SRC=""
 RESET_MODELS=0
 while [ "$#" -gt 0 ]; do
@@ -42,28 +49,34 @@ if [ "$NODE_MAJOR" -lt 18 ]; then die "Node.js >= 18 is required (found $(node -
 mkdir -p "$INSTALL_DIR"
 info "Installing zen-proxy to $INSTALL_DIR"
 
-# Preserve an existing config and token analytics across the wipe/copy below.
-CFG_BAK="$(mktemp)"
-if [ -f "$INSTALL_DIR/zen-proxy.json" ]; then
-  cp "$INSTALL_DIR/zen-proxy.json" "$CFG_BAK"
-fi
-STATS_BAK="$(mktemp)"
-if [ -f "$INSTALL_DIR/zen-proxy-stats.json" ]; then
-  cp "$INSTALL_DIR/zen-proxy-stats.json" "$STATS_BAK"
-fi
+# Builds before this kept the config and analytics inside the install dir,
+# which the copy below wipes. Move them out to where they live now; if the new
+# location already has a file, keep the old one next to it instead of losing it.
+mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$STATS_FILE")"
+migrate() {
+  [ -f "$1" ] || return 0
+  if [ -f "$2" ]; then
+    mv "$1" "$2.from-install-dir"
+    warn "Kept $2; the copy from the install dir is now $2.from-install-dir"
+  else
+    mv "$1" "$2"
+    info "Moved $1 → $2"
+  fi
+}
+migrate "$INSTALL_DIR/zen-proxy.json" "$CONFIG_FILE"
+migrate "$INSTALL_DIR/zen-proxy-stats.json" "$STATS_FILE"
 
 if [ -n "$LOCAL_SRC" ]; then
   [ -d "$LOCAL_SRC" ] || die "Local source not found: $LOCAL_SRC"
-  # Clear the tree first (the config is preserved separately below), then copy
+  # Clear the tree first (config and analytics now live outside it), then copy
   # with exclusions rather than copying and deleting after: copying .git from the
   # source tree fails outright, and a publish mirror named zen-proxy/ would
   # collide with the zen-proxy launcher this script installs.
-  find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name zen-proxy.json -exec rm -rf {} + 2>/dev/null || true
+  find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
   ( cd "$LOCAL_SRC" && tar -cf - \
       --exclude=./.git --exclude=./node_modules --exclude=./.mimocode \
       --exclude=./zen-proxy --exclude=./zen-proxy.json --exclude=./zen-proxy-stats.json . ) \
     | ( cd "$INSTALL_DIR" && tar -xf - )
-  rm -f "$INSTALL_DIR/zen-proxy.json.tmp"
   info "Copied from local source: $LOCAL_SRC"
 else
   TARBALL="https://codeload.github.com/$REPO/tar.gz/refs/heads/main"
@@ -77,22 +90,14 @@ else
   info "Downloaded and extracted $REPO"
 fi
 
-if [ -s "$CFG_BAK" ]; then
-  cp "$CFG_BAK" "$INSTALL_DIR/zen-proxy.json"
-fi
-rm -f "$CFG_BAK"
-if [ -s "$STATS_BAK" ]; then
-  cp "$STATS_BAK" "$INSTALL_DIR/zen-proxy-stats.json"
-fi
-rm -f "$STATS_BAK"
 
 if [ ! -f "$INSTALL_DIR/zen-proxy.mjs" ]; then
   die "zen-proxy.mjs not found after install — check ZEN_PROXY_REPO"
 fi
 
-if [ ! -f "$INSTALL_DIR/zen-proxy.json" ]; then
-  printf '{ "host": "127.0.0.1", "port": %s }\n' "$PORT" > "$INSTALL_DIR/zen-proxy.json"
-  info "Created default config with port $PORT"
+if [ ! -f "$CONFIG_FILE" ]; then
+  printf '{ "host": "127.0.0.1", "port": %s }\n' "$PORT" > "$CONFIG_FILE"
+  info "Created default config with port $PORT: $CONFIG_FILE"
 elif [ "$RESET_MODELS" = "1" ]; then
   # Drop a model list that an older build may have trimmed, keeping every other
   # setting (keys, port, aliases) untouched.
@@ -103,7 +108,7 @@ elif [ "$RESET_MODELS" = "1" ]; then
       const c = JSON.parse(fs.readFileSync(p, "utf8"));
       delete c.fallbackModels;
       fs.writeFileSync(p, JSON.stringify(c, null, 2));
-    ' "$INSTALL_DIR/zen-proxy.json" && info "Reset model list to defaults (keys preserved)"
+    ' "$CONFIG_FILE" && info "Reset model list to defaults (keys preserved)"
   fi
 fi
 
@@ -133,6 +138,8 @@ fi
 info ""
 info "✓ zen-proxy installed!"
 info "  Dashboard: http://127.0.0.1:$PORT"
+info "  Config:    $CONFIG_FILE"
+info "  Analytics: $STATS_FILE"
 info ""
 info "Run it:            zen-proxy"
 info "Or add PATH:       export PATH=\"\$HOME/.local/bin:\$PATH\""
@@ -177,6 +184,8 @@ ExecStart=$(command -v node) $INSTALL_DIR/zen-proxy.mjs
 Restart=always
 RestartSec=3
 Environment=NODE_ENV=production
+Environment=ZEN_PROXY_CONFIG=$CONFIG_FILE
+Environment=ZEN_PROXY_STATS=$STATS_FILE
 
 [Install]
 WantedBy=multi-user.target

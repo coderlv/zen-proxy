@@ -162,6 +162,8 @@ The free tier accepts an Anthropic request only when it also carries opencode's 
 
 Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded when edited — the dashboard writes it too). Env vars can override at startup.
 
+It is kept outside the install dir, so reinstalls and `git pull` never touch it: `~/.config/zen-proxy/zen-proxy.json` on Linux and macOS (`$XDG_CONFIG_HOME` respected), `%APPDATA%\zen-proxy\zen-proxy.json` on Windows. Token analytics go to `~/.local/share/zen-proxy/stats.json` (`$XDG_DATA_HOME`), or `%LOCALAPPDATA%\zen-proxy\stats.json`. `ZEN_PROXY_CONFIG` / `ZEN_PROXY_STATS` override them; with only `ZEN_PROXY_CONFIG` set, analytics sit next to that file. Older builds kept both files beside `zen-proxy.mjs`; the proxy moves them on first start (the old file becomes `*.migrated`), and the installers move them before replacing the install dir (an old file that would clash is kept as `*.from-install-dir`).
+
 | Key | Default | Description |
 |---|---|---|
 | `host` | `127.0.0.1` | Bind address (restart needed) |
@@ -191,7 +193,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: route for probes, sync, model test, `/health`, `/v1/models` |
 | `proxySessionMode` | `per-proxy` | `per-proxy` (session rotates with the proxy) or `per-client` (only the IP rotates) |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `PROXIES` (comma-separated), `PROXY_STRATEGY`, `PROXY_COOLDOWN_MS`, `PROXY_HEALTH_CHECKS`, `PROXY_SESSION_MODE`, `ZEN_PROXY_CONFIG` (custom config path), `ZEN_PROXY_STATS` (analytics file, default next to the config).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `PROXIES` (comma-separated), `PROXY_STRATEGY`, `PROXY_COOLDOWN_MS`, `PROXY_HEALTH_CHECKS`, `PROXY_SESSION_MODE`, `ZEN_PROXY_CONFIG` (custom config path), `ZEN_PROXY_STATS` (analytics file).
 
 ### token analytics
 
@@ -199,7 +201,7 @@ Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable)
 - **Speed**: time to first token runs from sending the call to the first non-empty delta (text, reasoning or tool call). Tokens/s is output tokens over the time from that first token to the end; replies that arrive in one burst (<100 ms) are left out of the speed average. Both are averages over the period, token-weighted for tokens/s.
 - **Calls** are upstream attempts, retries included, so a model's error rate is what it actually did; 429s are counted separately.
 - **Session modes**: every call is tagged `per-proxy`, `per-client` or `direct`, so the cache hit of each can be compared over the same period.
-- **Storage**: `zen-proxy-stats.json` next to the config (`ZEN_PROXY_STATS` overrides), saved every 30 s and on shutdown, kept across reinstalls. Hourly buckets for 31 days, then one per local day.
+- **Storage**: `stats.json` in the data dir (see configuration; `ZEN_PROXY_STATS` overrides), saved every 30 s and on shutdown, outside the install dir so reinstalls keep it. Hourly buckets for 31 days, then one per local day.
 - **API**: `GET /api/analytics?range=today|24h|7d|30d|all` → `totals`, `prev` (previous window), `series` (per hour or day: uncached input, cached input, output), `models`, `modes`.
 
 ### outbound proxies

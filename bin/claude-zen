@@ -39,8 +39,10 @@ for c in "$ROOT/zen-proxy.mjs" "$ROOT/../zen-proxy.mjs" "$HERE/../zen-proxy.mjs"
 done
 [ -n "$MAIN" ] || die "zen-claude: could not find zen-proxy.mjs"
 
+# The config lives in ~/.config/zen-proxy (XDG); the install-dir copies are
+# where builds before that kept it, still read until the proxy migrates them.
 CONFIG="${ZEN_PROXY_CONFIG:-}"
-[ -n "$CONFIG" ] || { for c in "$ROOT/zen-proxy.json" "$ROOT/../zen-proxy.json"; do [ -f "$c" ] && { CONFIG="$c"; break; }; done; }
+[ -n "$CONFIG" ] || { for c in "${XDG_CONFIG_HOME:-$HOME/.config}/zen-proxy/zen-proxy.json" "$ROOT/zen-proxy.json" "$ROOT/../zen-proxy.json"; do [ -f "$c" ] && { CONFIG="$c"; break; }; done; }
 PORT=8787
 if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then
   PORT="$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).port||8787)}catch{console.log(8787)}' "$CONFIG" 2>/dev/null || echo 8787)"
