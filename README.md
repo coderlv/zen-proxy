@@ -89,6 +89,7 @@ It stays up until you stop it, so you point your agent at it once and keep using
 | Automatic fallback | Retries the next free model on `429` / `5xx` / unavailable |
 | Model aliases | Call it `gpt-4o`, get a free model back |
 | Auth | Anonymous `Bearer public`, or bring your own Zen key |
+| Outbound proxies | HTTP / HTTPS / SOCKS5 pool with round-robin, random, sticky, least-used or failover rotation |
 | Dashboard | `http://127.0.0.1:8787/` |
 
 The free-model catalog in [`models.json`](models.json) is refreshed from OpenCode's public catalog by a GitHub Action every 6 hours.
@@ -157,16 +158,52 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 | `timeoutMs` / `cacheMs` | `120000` / `30000` | Upstream timeout, `/v1/models` cache TTL |
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
 | `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
+| `proxies` | `[]` | Outbound proxy URLs; manage them in the dashboard's Proxies tab or via `/api/proxies` |
+| `proxyStrategy` | `round-robin` | `round-robin`, `random`, `sticky`, `least-used` or `failover` |
+| `proxyCooldownMs` | `60000` | How long a failing or rate-limited proxy sits out |
+| `proxyHealthChecks` | `proxy` | `proxy` or `direct`: how probes, sync, model TEST, `/health` and `/v1/models` reach upstream |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_HEALTH_CHECKS=direct` `ZEN_PROXY_CONFIG`
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service.
 </details>
 
 <details>
+<summary>Outbound proxies and rotation</summary>
+
+Upstream traffic can leave through a pool of proxies instead of your own IP. Manage it from the dashboard's **Proxies** tab: paste one proxy or a whole batch, pick a rotation strategy, and check each proxy with one click. No proxies configured means traffic goes direct, exactly as before.
+
+Accepted lines (one per line, or comma-separated):
+
+```
+1.2.3.4:8080                      # scheme taken from the dropdown (http by default)
+1.2.3.4:8080:user:pass            # the usual seller export
+user:pass@1.2.3.4:8080
+socks5://user:pass@proxy.example:1080
+https://user:pass@proxy.example:443
+```
+
+HTTP, HTTPS (TLS to the proxy) and SOCKS5 with username/password are supported. The tunnels are built on Node's own `net`/`tls`, so there are still zero dependencies.
+
+| Strategy | Picks |
+|---|---|
+| `round-robin` | the next proxy on every request and every retry |
+| `random` | any live proxy |
+| `sticky` | the same proxy for one client (its session id) until that proxy fails |
+| `least-used` | the live proxy with the fewest requests so far |
+| `failover` | always the first live proxy, the next one only after a failure |
+
+A proxy that fails to connect, rejects its credentials, or gets a `429` from upstream sits out `proxyCooldownMs`, and the normal retry loop moves on to the next one. `403` responses do not bench a proxy: they come from the free-tier gate, not from the IP. When every proxy is cooling down, requests fail with `503` instead of quietly going out from your own IP. A successful **Check** brings a proxy back early.
+
+`proxyHealthChecks` decides how model probes, sync, the model **TEST** button, `/health` and `/v1/models` reach upstream: `proxy` (through the pool) or `direct`. Use `direct` to tell a dead model from a dead proxy. The npm lookup behind `autoUA` always goes direct.
+
+Passwords are masked everywhere they are shown (dashboard, `/api/config`, `/api/proxies`, logs) and kept only in `zen-proxy.json`. Remote (non-local) clients still have their IP forwarded as `x-real-ip`, as before. Respect OpenCode's terms and quotas.
+</details>
+
+<details>
 <summary>Dashboard</summary>
 
-`http://127.0.0.1:8787/` — upstream health and uptime, a live request feed, one-click model testing, instant config editing, and a log tail.
+`http://127.0.0.1:8787/` — upstream health and uptime, a live request feed, one-click model testing, the outbound proxy pool, instant config editing, and a log tail.
 
 ![zen-proxy dashboard](assets/dashboard.png)
 </details>
@@ -189,6 +226,10 @@ Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set
 | `GET` | `/api/logs` | Log tail |
 | `POST` | `/api/sync` | Re-run model discovery |
 | `POST` | `/api/reset` | Reset request statistics |
+| `GET` | `/api/proxies` | Proxy pool with per-proxy stats (credentials masked) |
+| `POST` | `/api/proxies` | Add proxies — `{"text":"one or many lines","scheme":"http\|https\|socks5"}` |
+| `DELETE` | `/api/proxies` | Remove one — `{"id":"..."}` — or all — `{"all":true}` |
+| `POST` | `/api/proxies/test` | Reach upstream through one proxy (`{"id":"..."}`) or all of them (`{}`) |
 </details>
 
 <details>

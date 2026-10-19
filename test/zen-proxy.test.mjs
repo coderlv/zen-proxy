@@ -2,6 +2,7 @@ import { test, describe, beforeEach, after } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import http from "node:http"
+import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { execFile, execFileSync } from "node:child_process"
@@ -2983,4 +2984,273 @@ describe("install.ps1 config preservation", () => {
       assert.deepEqual(cfg, { user: true, port: 7777 }, "user config must survive reinstall")
     },
   )
+})
+
+// ---- outbound proxies ----
+
+// A plain-HTTP upstream behind real local CONNECT and SOCKS5 servers, so the
+// whole tunnel path runs without certificates and on every CI OS.
+function listen(server) {
+  return new Promise((r) => server.listen(0, "127.0.0.1", () => r(server.address().port)))
+}
+
+async function startProxyRig() {
+  const seen = { upstream: [], connect: 0, socks: 0 }
+  const upstream = http.createServer((req, res) => {
+    seen.upstream.push({ url: req.url, method: req.method, host: req.headers.host })
+    if (req.url.startsWith("/limited")) {
+      res.writeHead(429, { "content-type": "application/json" })
+      return res.end('{"error":{"type":"rate_limit"}}')
+    }
+    if (req.url.startsWith("/sse")) {
+      res.writeHead(200, { "content-type": "text/event-stream" })
+      res.write("data: one\n\n")
+      return setTimeout(() => res.end("data: [DONE]\n\n"), 20)
+    }
+    let body = ""
+    req.on("data", (d) => (body += d))
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" })
+      res.end(JSON.stringify({ ok: true, echo: body }))
+    })
+  })
+  const upstreamPort = await listen(upstream)
+
+  const connectProxy = http.createServer((_req, res) => res.writeHead(405).end())
+  connectProxy.on("connect", (req, client) => {
+    const want = "Basic " + Buffer.from("alice:s3cret").toString("base64")
+    if (req.headers["proxy-authorization"] !== want) {
+      return client.end("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+    }
+    seen.connect++
+    const [host, port] = req.url.split(":")
+    const out = net.connect(Number(port), host, () => {
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
+      out.pipe(client)
+      client.pipe(out)
+    })
+    out.on("error", () => client.destroy())
+    client.on("error", () => out.destroy())
+  })
+  const connectPort = await listen(connectProxy)
+
+  // Minimal SOCKS5 with RFC 1929 auth, enough to exercise the handshake.
+  const socks = net.createServer((client) => {
+    client.once("data", (greet) => {
+      if (!greet.includes(0x02)) return client.end(Buffer.from([5, 0xff]))
+      client.write(Buffer.from([5, 2]))
+      client.once("data", (auth) => {
+        const ulen = auth[1]
+        const user = auth.subarray(2, 2 + ulen).toString()
+        const pass = auth.subarray(3 + ulen, 3 + ulen + auth[2 + ulen]).toString()
+        if (user !== "bob" || pass !== "p@ss") return client.end(Buffer.from([1, 1]))
+        client.write(Buffer.from([1, 0]))
+        client.once("data", (reqBuf) => {
+          const len = reqBuf[4]
+          const host = reqBuf.subarray(5, 5 + len).toString()
+          const port = reqBuf.readUInt16BE(5 + len)
+          seen.socks++
+          const out = net.connect(port, host, () => {
+            client.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]))
+            out.pipe(client)
+            client.pipe(out)
+          })
+          out.on("error", () => client.destroy())
+          client.on("error", () => out.destroy())
+        })
+      })
+    })
+  })
+  const socksPort = await listen(socks)
+  return {
+    seen,
+    upstreamUrl: `http://127.0.0.1:${upstreamPort}`,
+    httpProxy: `http://alice:s3cret@127.0.0.1:${connectPort}`,
+    badHttpProxy: `http://alice:wrong@127.0.0.1:${connectPort}`,
+    socksProxy: `socks5://bob:p%40ss@127.0.0.1:${socksPort}`,
+    close() {
+      for (const s of [upstream, connectProxy, socks]) {
+        s.closeAllConnections?.()
+        s.close()
+      }
+    },
+  }
+}
+
+describe("proxy parsing", () => {
+  test("accepts every common line format", () => {
+    assert.equal(zp.parseProxyLine("1.2.3.4:8080"), "http://1.2.3.4:8080")
+    assert.equal(zp.parseProxyLine("1.2.3.4:1080", "socks5"), "socks5://1.2.3.4:1080")
+    assert.equal(zp.parseProxyLine("u:p@1.2.3.4:8080"), "http://u:p@1.2.3.4:8080")
+    assert.equal(zp.parseProxyLine("1.2.3.4:8080:user:p@ss"), "http://user:p%40ss@1.2.3.4:8080")
+    assert.equal(zp.parseProxyLine("socks5://u:p@host.example:1080"), "socks5://u:p@host.example:1080")
+    assert.equal(zp.parseProxyLine("  # comment"), null)
+    assert.throws(() => zp.parseProxyLine("ftp://1.2.3.4:21"), /unsupported/)
+  })
+
+  test("a batch dedupes and reports bad lines without dropping good ones", () => {
+    const { proxies, errors } = zp.parseProxyList("1.1.1.1:80\n1.1.1.1:80\nftp://x:1, 2.2.2.2:3128\n\n")
+    assert.deepEqual(proxies, ["http://1.1.1.1:80", "http://2.2.2.2:3128"])
+    assert.equal(errors.length, 1)
+  })
+
+  test("credentials never leave masked", () => {
+    assert.equal(zp.maskProxy("http://alice:s3cret@1.2.3.4:8080"), "http://alice:••••@1.2.3.4:8080")
+    zp.saveConfig({ proxies: ["http://alice:s3cret@1.2.3.4:8080"] })
+    assert.deepEqual(zp.sanitize(zp.config).proxies, ["http://alice:••••@1.2.3.4:8080"])
+    assert.ok(!JSON.stringify(zp.proxyStatus()).includes("s3cret"))
+  })
+
+  test("PUT /api/config cannot clobber the list with its masked copy", async () => {
+    zp.saveConfig({ proxies: ["http://alice:s3cret@1.2.3.4:8080"] })
+    const body = JSON.stringify({ ...zp.sanitize(zp.config), proxyStrategy: "bogus" })
+    const res = mockRes()
+    await zp.handleApiConfig(mockReq({ method: "PUT", _body: body }), res)
+    assert.equal(res.state.status, 200)
+    assert.deepEqual(zp.config.proxies, ["http://alice:s3cret@1.2.3.4:8080"])
+    assert.equal(zp.config.proxyStrategy, "round-robin")
+  })
+})
+
+describe("proxy rotation", () => {
+  const A = "http://a:1", B = "http://b:1", C = "http://c:1"
+  beforeEach(() => {
+    zp.proxyState.clear()
+    zp.saveConfig({ proxies: [A, B, C], proxyCooldownMs: 60_000 })
+  })
+
+  test("round-robin cycles and skips proxies in cooldown", () => {
+    zp.saveConfig({ proxyStrategy: "round-robin" })
+    const first = [zp.pickProxy(), zp.pickProxy(), zp.pickProxy()]
+    assert.deepEqual([...first].sort(), [A, B, C])
+    zp.proxyStat(B).cooldownUntil = Date.now() + 60_000
+    const picks = Array.from({ length: 4 }, () => zp.pickProxy())
+    assert.ok(!picks.includes(B))
+    assert.notEqual(picks[0], picks[1])
+  })
+
+  test("failover sticks to the first live proxy", () => {
+    zp.saveConfig({ proxyStrategy: "failover" })
+    assert.equal(zp.pickProxy(), A)
+    assert.equal(zp.pickProxy(), A)
+    zp.proxyStat(A).cooldownUntil = Date.now() + 60_000
+    assert.equal(zp.pickProxy(), B)
+  })
+
+  test("least-used picks the proxy with the fewest uses", () => {
+    zp.saveConfig({ proxyStrategy: "least-used" })
+    zp.proxyStat(A).uses = 5
+    zp.proxyStat(B).uses = 1
+    zp.proxyStat(C).uses = 3
+    assert.equal(zp.pickProxy(), B)
+  })
+
+  test("sticky keeps a client on one proxy and re-pins when it cools down", () => {
+    zp.saveConfig({ proxyStrategy: "sticky" })
+    const mine = zp.pickProxy("client-1")
+    assert.equal(zp.pickProxy("client-1"), mine)
+    assert.equal(zp.pickProxy("client-1"), mine)
+    assert.notEqual(zp.pickProxy("client-2"), mine)
+    zp.proxyStat(mine).cooldownUntil = Date.now() + 60_000
+    const moved = zp.pickProxy("client-1")
+    assert.notEqual(moved, mine)
+    assert.equal(zp.pickProxy("client-1"), moved)
+  })
+
+  test("random only ever returns live proxies", () => {
+    zp.saveConfig({ proxyStrategy: "random" })
+    zp.proxyStat(A).cooldownUntil = Date.now() + 60_000
+    for (let i = 0; i < 30; i++) assert.notEqual(zp.pickProxy(), A)
+  })
+
+  test("all proxies cooling down is an error, never a silent direct call", () => {
+    for (const p of [A, B, C]) zp.proxyStat(p).cooldownUntil = Date.now() + 60_000
+    assert.throws(() => zp.pickProxy(), (e) => e.code === "NO_PROXY")
+  })
+})
+
+describe("proxy transport", () => {
+  let rig
+  beforeEach(async () => {
+    zp.proxyState.clear()
+    rig ??= await startProxyRig()
+  })
+  after(() => rig?.close())
+
+  test("no proxies configured means plain fetch, untouched", async () => {
+    zp.saveConfig({ proxies: [] })
+    let called = null
+    globalThis.fetch = async (url, opts) => ((called = { url, opts }), jsonResponse({ ok: 1 }))
+    const opts = { method: "POST", body: "{}" }
+    await zp.upstreamFetch("http://x/y", opts)
+    assert.equal(called.opts, opts)
+  })
+
+  test("HTTP CONNECT proxy with basic auth carries a POST body", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy] })
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: '{"hi":1}' })
+    assert.equal(r.status, 200)
+    assert.deepEqual(await r.json(), { ok: true, echo: '{"hi":1}' })
+    assert.ok(rig.seen.connect >= 1)
+  })
+
+  test("SOCKS5 proxy with username/password streams SSE", async () => {
+    zp.saveConfig({ proxies: [rig.socksProxy] })
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/sse`, {})
+    assert.equal(r.headers.get("content-type"), "text/event-stream")
+    assert.equal(await r.text(), "data: one\n\ndata: [DONE]\n\n")
+    assert.ok(rig.seen.socks >= 1)
+  })
+
+  test("a 407 cools the proxy down and surfaces the reason", async () => {
+    zp.saveConfig({ proxies: [rig.badHttpProxy] })
+    await assert.rejects(zp.upstreamFetch(`${rig.upstreamUrl}/x`, {}), /407/)
+    const st = zp.proxyStatus().proxies[0]
+    assert.ok(st.coolingMs > 0)
+    assert.match(st.lastError, /407/)
+  })
+
+  test("an upstream 429 benches that proxy and rotation moves on", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover" })
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/limited`, {})
+    assert.equal(r.status, 429)
+    await r.body?.cancel()
+    assert.equal(zp.pickProxy(), rig.socksProxy)
+  })
+
+  test("health checks can bypass the pool", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy], proxyHealthChecks: "direct" })
+    let direct = false
+    globalThis.fetch = async () => ((direct = true), jsonResponse({}))
+    await zp.upstreamFetch(`${rig.upstreamUrl}/models`, {}, { health: true })
+    assert.ok(direct)
+  })
+
+  test("chat answers 503 at once when every proxy is cooling down", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy] })
+    zp.proxyStat(rig.httpProxy).cooldownUntil = Date.now() + 60_000
+    const res = mockRes()
+    const t0 = Date.now()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: DEFAULT_MODEL, messages: [{ role: "user", content: "x" }] }) }), res)
+    assert.equal(res.state.status, 503)
+    assert.match(res.body, /cooling down/)
+    assert.ok(Date.now() - t0 < 1000, "must not back off through the model chain")
+  })
+
+  test("/api/proxies adds a batch, tests and removes", async () => {
+    zp.saveConfig({ proxies: [], upstream: rig.upstreamUrl })
+    let res = mockRes()
+    const text = `${rig.httpProxy}\n${rig.httpProxy}\nnot a proxy::\n${rig.badHttpProxy}`
+    await zp.handleProxies(mockReq({ method: "POST", _body: JSON.stringify({ text }) }), res)
+    let out = JSON.parse(res.body)
+    assert.equal(out.added, 2)
+    assert.equal(out.errors.length, 1)
+    res = mockRes()
+    await zp.handleProxyTest(mockReq({ _body: "{}" }), res)
+    out = JSON.parse(res.body)
+    assert.deepEqual(out.results.map((r) => r.ok), [true, false])
+    res = mockRes()
+    await zp.handleProxies(mockReq({ method: "DELETE", _body: JSON.stringify({ id: out.proxies[1].id }) }), res)
+    assert.deepEqual(zp.config.proxies, [rig.httpProxy])
+  })
 })

@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import http from "node:http"
+import net from "node:net"
+import tls from "node:tls"
 import fs from "node:fs"
 import path from "node:path"
-import { randomBytes } from "node:crypto"
+import { randomBytes, createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -171,6 +173,341 @@ function remapAgentTool(name, rawArgs) {
   return { name: spec.name, args: JSON.stringify(out) }
 }
 
+// ---- outbound proxies -------------------------------------------------------
+// Upstream traffic can leave through a pool of HTTP(S) or SOCKS5 proxies. The
+// tunnels are hand-rolled on net/tls so the project stays dependency-free, and
+// the result is wrapped in a standard Response so every caller (streams
+// included) is unchanged.
+const PROXY_SCHEMES = new Set(["http:", "https:", "socks5:", "socks5h:"])
+const PROXY_STRATEGIES = ["round-robin", "random", "sticky", "least-used", "failover"]
+// shortcut: fixed cap on TCP connect + proxy handshake, make it a config key if slow proxies need more
+const PROXY_CONNECT_TIMEOUT_MS = 10_000
+
+// Accepts `scheme://user:pass@host:port`, `user:pass@host:port`, `host:port`
+// and the `host:port:user:pass` export most proxy sellers use. Returns a
+// normalised URL string, null for blank/comment lines, and throws on garbage.
+function parseProxyLine(line, scheme = "http") {
+  let s = String(line ?? "").trim()
+  if (!s || s.startsWith("#")) return null
+  if (!/^[a-z0-9]+:\/\//i.test(s)) {
+    const parts = s.split(":")
+    if (parts.length === 4 && /^\d+$/.test(parts[1])) {
+      s = `${encodeURIComponent(parts[2])}:${encodeURIComponent(parts[3])}@${parts[0]}:${parts[1]}`
+    }
+    s = `${scheme}://${s}`
+  }
+  let u
+  try {
+    u = new URL(s)
+  } catch {
+    throw new Error(`not a proxy: ${line}`)
+  }
+  if (!PROXY_SCHEMES.has(u.protocol)) throw new Error(`unsupported proxy scheme ${u.protocol} (use http, https or socks5)`)
+  if (!u.hostname) throw new Error(`proxy needs a host: ${line}`)
+  // Keep the port explicit even when it is the scheme default, so the list reads back as typed.
+  const port = u.port || (u.protocol.startsWith("socks") ? 1080 : u.protocol === "https:" ? 443 : 80)
+  return `${u.protocol}//${u.username ? `${u.username}:${u.password}@` : ""}${u.hostname}:${port}`
+}
+
+// A batch is newline- or comma-separated text, or an array of lines.
+function parseProxyList(input, scheme = "http") {
+  const lines = Array.isArray(input) ? input : String(input ?? "").split(/[\r\n,]+/)
+  const proxies = []
+  const errors = []
+  for (const line of lines) {
+    try {
+      const p = parseProxyLine(line, scheme)
+      if (p && !proxies.includes(p)) proxies.push(p)
+    } catch (err) {
+      errors.push(err.message)
+    }
+  }
+  return { proxies, errors }
+}
+
+function proxyId(url) {
+  return createHash("sha1").update(url).digest("hex").slice(0, 10)
+}
+
+function maskProxy(url) {
+  try {
+    const u = new URL(url)
+    return `${u.protocol}//${u.username ? `${decodeURIComponent(u.username)}:••••@` : ""}${u.host}`
+  } catch {
+    return "(invalid)"
+  }
+}
+
+// Reads a handshake off a raw socket: exact byte counts for SOCKS, a
+// terminator for the HTTP CONNECT reply.
+function socketReader(sock) {
+  let buf = Buffer.alloc(0)
+  let wake = null
+  const onData = (d) => {
+    buf = Buffer.concat([buf, d])
+    wake?.()
+  }
+  sock.on("data", onData)
+  const until = async (ready) => {
+    while (!ready()) await new Promise((r) => (wake = r))
+    wake = null
+  }
+  return {
+    async read(n) {
+      await until(() => buf.length >= n)
+      const out = buf.subarray(0, n)
+      buf = buf.subarray(n)
+      return out
+    },
+    async readUntil(sep) {
+      await until(() => buf.includes(sep))
+      const end = buf.indexOf(sep) + sep.length
+      const out = buf.subarray(0, end)
+      buf = buf.subarray(end)
+      return out
+    },
+    done() {
+      sock.off("data", onData)
+      sock.pause()
+      if (buf.length) sock.unshift(buf)
+    },
+  }
+}
+
+async function httpConnectHandshake(sock, p, host, port) {
+  const target = `${net.isIPv6(host) ? `[${host}]` : host}:${port}`
+  let head = `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n`
+  if (p.username) {
+    const cred = `${decodeURIComponent(p.username)}:${decodeURIComponent(p.password)}`
+    head += `Proxy-Authorization: Basic ${Buffer.from(cred).toString("base64")}\r\n`
+  }
+  sock.write(head + "\r\n")
+  const r = socketReader(sock)
+  const reply = (await r.readUntil("\r\n\r\n")).toString("latin1")
+  r.done()
+  const status = Number(reply.split(" ")[1])
+  if (status !== 200) throw new Error(status === 407 ? "proxy rejected the credentials (407)" : `proxy CONNECT failed: ${reply.split("\r\n")[0]}`)
+}
+
+const SOCKS_ERRORS = ["", "general failure", "not allowed by ruleset", "network unreachable", "host unreachable", "connection refused", "TTL expired", "command not supported", "address type not supported"]
+async function socks5Handshake(sock, p, host, port) {
+  const r = socketReader(sock)
+  const auth = !!p.username
+  sock.write(Buffer.from(auth ? [5, 2, 0x00, 0x02] : [5, 1, 0x00]))
+  const [ver, method] = await r.read(2)
+  if (ver !== 5) throw new Error("not a SOCKS5 proxy")
+  if (method === 0x02) {
+    // RFC 1929 username/password sub-negotiation.
+    const user = Buffer.from(decodeURIComponent(p.username))
+    const pass = Buffer.from(decodeURIComponent(p.password))
+    sock.write(Buffer.concat([Buffer.from([1, user.length]), user, Buffer.from([pass.length]), pass]))
+    const [, ok] = await r.read(2)
+    if (ok !== 0) throw new Error("SOCKS5 proxy rejected the credentials")
+  } else if (method !== 0x00) {
+    throw new Error(auth ? "SOCKS5 proxy offers no supported auth method" : "SOCKS5 proxy requires credentials")
+  }
+  // Always send the hostname (ATYP 3) so DNS resolves at the proxy, not here.
+  const name = Buffer.from(host)
+  sock.write(Buffer.concat([Buffer.from([5, 1, 0, 3, name.length]), name, Buffer.from([port >> 8, port & 0xff])]))
+  const [, rep, , atyp] = await r.read(4)
+  if (rep !== 0) throw new Error(`SOCKS5 connect failed: ${SOCKS_ERRORS[rep] ?? `code ${rep}`}`)
+  const addrLen = atyp === 1 ? 4 : atyp === 4 ? 16 : (await r.read(1))[0]
+  await r.read(addrLen + 2)
+  r.done()
+}
+
+// Opens a raw TCP stream to host:port through the proxy.
+async function openTunnel(proxy, host, port, signal) {
+  const p = new URL(proxy)
+  const socks = p.protocol.startsWith("socks")
+  const pport = Number(p.port) || (socks ? 1080 : p.protocol === "https:" ? 443 : 80)
+  const sock =
+    p.protocol === "https:"
+      ? tls.connect({ host: p.hostname, port: pport, servername: net.isIP(p.hostname) ? undefined : p.hostname })
+      : net.connect(pport, p.hostname)
+  let reject
+  const failed = new Promise((_, j) => (reject = j))
+  failed.catch(() => {})
+  const onError = (err) => reject(err)
+  const onClose = () => reject(new Error("proxy closed the connection"))
+  const onAbort = () => reject(signal.reason ?? new Error("aborted"))
+  const timer = setTimeout(() => reject(new Error("proxy handshake timed out")), PROXY_CONNECT_TIMEOUT_MS)
+  sock.once("error", onError)
+  sock.once("close", onClose)
+  signal?.addEventListener("abort", onAbort, { once: true })
+  try {
+    await Promise.race([new Promise((r) => sock.once(p.protocol === "https:" ? "secureConnect" : "connect", r)), failed])
+    await Promise.race([(socks ? socks5Handshake : httpConnectHandshake)(sock, p, host, port), failed])
+    return sock
+  } catch (err) {
+    sock.destroy()
+    throw err
+  } finally {
+    clearTimeout(timer)
+    sock.off("error", onError)
+    sock.off("close", onClose)
+    signal?.removeEventListener("abort", onAbort)
+  }
+}
+
+// fetch() over a proxy tunnel. Supports the subset of fetch the upstream calls
+// use: string body, plain-object headers, an AbortSignal.
+async function proxiedFetch(proxy, url, init = {}) {
+  const target = new URL(url)
+  const secure = target.protocol === "https:"
+  const port = Number(target.port) || (secure ? 443 : 80)
+  const signal = init.signal
+  if (signal?.aborted) throw signal.reason ?? new Error("aborted")
+  let sock = await openTunnel(proxy, target.hostname, port, signal)
+  // The reader left it paused; nothing arrives before our request is written,
+  // so handing it over flowing loses no bytes.
+  sock.resume()
+  if (secure) {
+    sock = tls.connect({ socket: sock, servername: net.isIP(target.hostname) ? undefined : target.hostname, ALPNProtocols: ["http/1.1"] })
+  }
+  const headers = { ...init.headers, host: target.host }
+  // fetch() decompresses for its callers; this path does not, so ask for identity.
+  delete headers["accept-encoding"]
+  if (init.body != null) headers["content-length"] = Buffer.byteLength(init.body)
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      method: init.method ?? "GET",
+      path: target.pathname + target.search,
+      headers,
+      createConnection: () => sock,
+      signal,
+    })
+    req.on("error", (err) => {
+      sock.destroy()
+      reject(err)
+    })
+    req.on("response", (res) => {
+      const out = new Headers()
+      for (const [k, v] of Object.entries(res.headers)) out.set(k, Array.isArray(v) ? v.join(", ") : v)
+      const noBody = [204, 205, 304].includes(res.statusCode) || req.method === "HEAD"
+      // Hand-built rather than Readable.toWeb so cancel() reliably hangs up the
+      // tunnel on every supported Node — probes rely on that.
+      const body = noBody
+        ? null
+        : new ReadableStream({
+            start(c) {
+              res.on("data", (d) => c.enqueue(new Uint8Array(d)))
+              res.on("end", () => { try { c.close() } catch {} })
+              res.on("error", (e) => { try { c.error(e) } catch {} })
+            },
+            cancel() {
+              res.destroy()
+              sock.destroy()
+            },
+          })
+      if (noBody) res.resume()
+      resolve(new Response(body, { status: res.statusCode, statusText: res.statusMessage, headers: out }))
+    })
+    req.end(init.body ?? undefined)
+  })
+}
+
+const proxyState = new Map()
+const proxySticky = new Map()
+let proxyCursor = 0
+function proxyStat(url) {
+  let st = proxyState.get(url)
+  if (!st) proxyState.set(url, (st = { uses: 0, fails: 0, cooldownUntil: 0, lastError: "", lastMs: 0, lastStatus: 0 }))
+  return st
+}
+
+function proxyCooldown(url, why) {
+  const st = proxyStat(url)
+  st.fails++
+  st.lastError = why
+  st.cooldownUntil = Date.now() + Math.max(0, Number(config.proxyCooldownMs) || 0)
+  log(`proxy ${maskProxy(url)} cooling down: ${why}`)
+}
+
+// Next live proxy in list order from the cursor, skipping ones in cooldown.
+function nextRoundRobin(list, live) {
+  for (let i = 0; i < list.length; i++) {
+    const u = list[(proxyCursor + i) % list.length]
+    if (live.includes(u)) {
+      proxyCursor = (proxyCursor + i + 1) % list.length
+      return u
+    }
+  }
+}
+
+function pickProxy(key = "server", now = Date.now()) {
+  const list = config.proxies ?? []
+  const live = list.filter((u) => proxyStat(u).cooldownUntil <= now)
+  if (!live.length) {
+    const err = new Error(`all ${list.length} proxies are cooling down`)
+    err.code = "NO_PROXY"
+    throw err
+  }
+  switch (config.proxyStrategy) {
+    case "random":
+      return live[Math.floor(Math.random() * live.length)]
+    case "failover":
+      return live[0]
+    case "least-used":
+      return live.reduce((a, b) => (proxyStat(b).uses < proxyStat(a).uses ? b : a))
+    case "sticky": {
+      const pinned = proxySticky.get(key)
+      if (pinned && live.includes(pinned)) return pinned
+      const next = nextRoundRobin(list, live)
+      proxySticky.set(key, next)
+      return next
+    }
+    default:
+      return nextRoundRobin(list, live)
+  }
+}
+
+// Every upstream call goes through here. No proxies configured (or a health
+// check while proxyHealthChecks is "direct") means plain fetch, untouched.
+// A network failure or a 429 benches the proxy for proxyCooldownMs; the caller's
+// retry loop then naturally lands on the next one. 403s are request-shape
+// verdicts from the gate, not the IP's fault, so they never cool a proxy.
+async function upstreamFetch(url, init = {}, { req, health = false, proxy } = {}) {
+  const list = config.proxies ?? []
+  if (!proxy && (!list.length || (health && config.proxyHealthChecks === "direct"))) return fetch(url, init)
+  const chosen = proxy ?? pickProxy(req ? sessionFor(req).value : "server")
+  const st = proxyStat(chosen)
+  st.uses++
+  const t0 = Date.now()
+  try {
+    const r = await proxiedFetch(chosen, url, init)
+    st.lastMs = Date.now() - t0
+    st.lastStatus = r.status
+    if (r.status === 429) proxyCooldown(chosen, "upstream 429 (rate limited)")
+    return r
+  } catch (err) {
+    if (!init.signal?.aborted) proxyCooldown(chosen, err.message)
+    throw err
+  }
+}
+
+function proxyStatus(now = Date.now()) {
+  return {
+    strategy: config.proxyStrategy,
+    cooldownMs: config.proxyCooldownMs,
+    healthChecks: config.proxyHealthChecks,
+    strategies: PROXY_STRATEGIES,
+    proxies: (config.proxies ?? []).map((url) => {
+      const st = proxyStat(url)
+      return {
+        id: proxyId(url),
+        url: maskProxy(url),
+        uses: st.uses,
+        fails: st.fails,
+        lastMs: st.lastMs,
+        lastStatus: st.lastStatus,
+        lastError: st.lastError,
+        coolingMs: Math.max(0, st.cooldownUntil - now),
+      }
+    }),
+  }
+}
+
 // Request bodies get big in real sessions: Claude Code's compaction POSTs the
 // whole transcript (base64 images included) and upstream itself accepted a 30MB
 // probe untouched. The old 1MB ceiling turned those requests into 413s, which
@@ -229,6 +566,14 @@ const DEFAULT_CONFIG = {
   cacheMs: Number(ENV.CACHE_MS ?? 30000),
   autoSync: ENV.AUTO_SYNC !== "0",
   autoSyncIntervalMs: Number(ENV.AUTO_SYNC_MS ?? 3600000),
+  // Outbound proxy pool for upstream traffic (see upstreamFetch). Managed from
+  // the dashboard's Proxies tab or /api/proxies; PROXIES takes a comma list.
+  proxies: parseProxyList(ENV.PROXIES ?? "").proxies,
+  proxyStrategy: PROXY_STRATEGIES.includes(ENV.PROXY_STRATEGY) ? ENV.PROXY_STRATEGY : "round-robin",
+  proxyCooldownMs: Number(ENV.PROXY_COOLDOWN_MS ?? 60_000),
+  // "proxy" = model probes, sync, /health and dashboard tests use the pool too;
+  // "direct" = they go straight out, so you can tell a dead model from a dead proxy.
+  proxyHealthChecks: ENV.PROXY_HEALTH_CHECKS === "direct" ? "direct" : "proxy",
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -268,6 +613,9 @@ function loadConfig() {
     // Older installs (and the shipped zen-proxy.json) still name the legacy
     // `/zen/v1` base, which upstream now gates. Upgrade it in place so an
     // existing config file keeps working after an update.
+    const parsedProxies = parseProxyList(merged.proxies)
+    merged.proxies = parsedProxies.proxies
+    for (const e of parsedProxies.errors) log(`config: ignoring proxy — ${e}`)
     const upstream = normalizeUpstream(merged.upstream)
     if (upstream !== merged.upstream) {
       merged.upstream = upstream
@@ -347,6 +695,7 @@ function sanitize(cfg) {
   const out = { ...cfg }
   if (out.proxyKey) out.proxyKey = "••••••••"
   if (out.defaultZenKey) out.defaultZenKey = maskKey(out.defaultZenKey)
+  out.proxies = (out.proxies ?? []).map(maskProxy)
   return out
 }
 
@@ -1094,13 +1443,18 @@ async function handleMessages(req, res) {
       delayMs = 0
       let upstreamRes
       try {
-        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+        upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
           signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
-        })
+        }, { req })
       } catch (err) {
+        // Walking the rest of the chain cannot help when no proxy is usable.
+        if (err?.code === "NO_PROXY") {
+          recordReq(req, requested, Date.now() - start, 503)
+          return json(res, 503, anthropicError(503, { error: { type: "api_error", message: err.message } }).body)
+        }
         lastErr = { error: { type: "api_error", message: err.message } }
         lastStatus = 502
         if (attempt < retries) {
@@ -1240,13 +1594,17 @@ async function handleChat(req, res) {
       delayMs = 0
       let upstreamRes
       try {
-        upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+        upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
           signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
-        })
+        }, { req })
       } catch (err) {
+        if (err?.code === "NO_PROXY") {
+          recordReq(req, requested, Date.now() - start, 503)
+          return json(res, 503, { error: { type: "upstream_error", message: err.message } })
+        }
         lastErr = { error: { type: "upstream_error", message: err.message } }
         lastStatus = 502
         if (attempt < retries) {
@@ -1759,12 +2117,12 @@ async function probeModel(id, auth, session) {
     "user-agent": config.ua,
   }
   if (session) for (const h of SESSION_HEADERS) headers[h] = session
-  const r = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+  const r = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
     method: "POST",
     headers,
     body: JSON.stringify(agentProbePayload(id, format)),
     signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
-  })
+  }, { health: true })
   // A live model answers the streamed probe with SSE, and sync only needs the
   // status. Hang up instead of waiting for the model to finish its "ping".
   if (r.ok) {
@@ -1883,10 +2241,10 @@ async function fetchModels() {
   if (modelsFetching) return modelsFetching
   modelsFetching = (async () => {
     try {
-      const res = await fetch(`${config.upstream}/models`, {
+      const res = await upstreamFetch(`${config.upstream}/models`, {
         headers: { "user-agent": config.ua },
         signal: AbortSignal.timeout(15_000),
-      })
+      }, { health: true })
       if (res.ok) {
         const parsed = await res.json()
         const upstreamModels = parsed.data ?? []
@@ -1921,10 +2279,10 @@ async function syncModels() {
   syncState.at = Date.now()
   const start = Date.now()
   try {
-    const res = await fetch(`${config.upstream}/models`, {
+    const res = await upstreamFetch(`${config.upstream}/models`, {
       headers: { "user-agent": config.ua },
       signal: AbortSignal.timeout(15_000),
-    })
+    }, { health: true })
     if (!res.ok) throw new Error(`upstream /models → ${res.status}`)
     const parsed = await res.json()
     const upstreamIds = new Set((parsed.data ?? []).map((m) => m.id))
@@ -2180,6 +2538,12 @@ async function handleApiConfig(req, res) {
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
+      // The list is only ever edited through /api/proxies: what GET returns here
+      // is masked, and round-tripping it would overwrite the real credentials.
+      delete cleaned.proxies
+      if (cleaned.proxyStrategy != null && !PROXY_STRATEGIES.includes(cleaned.proxyStrategy)) cleaned.proxyStrategy = "round-robin"
+      if (cleaned.proxyHealthChecks != null) cleaned.proxyHealthChecks = cleaned.proxyHealthChecks === "direct" ? "direct" : "proxy"
+      cleaned.proxyCooldownMs = Math.max(0, num(cleaned.proxyCooldownMs ?? config.proxyCooldownMs, config.proxyCooldownMs))
       if (cleaned.probeAuth != null && !["auto", "key", "anonymous"].includes(String(cleaned.probeAuth))) {
         cleaned.probeAuth = "auto"
       }
@@ -2279,7 +2643,7 @@ async function handleTest(req, res) {
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
     const format = modelFormat(model)
-    const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+    const upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
       method: "POST",
       headers: (() => {
         const h = {
@@ -2298,7 +2662,7 @@ async function handleTest(req, res) {
       // real client would get instead of a gate refusal it never earned.
       body: JSON.stringify(agentProbePayload(model, format)),
       signal: AbortSignal.timeout(config.timeoutMs),
-    })
+    }, { req, health: true })
     if (upstreamRes.ok) {
       try { await upstreamRes.body?.cancel() } catch {}
     }
@@ -2334,6 +2698,64 @@ function handleLogs(req, res) {
   if (!adminAuth(req, res)) return
   const n = Number(new URL(req.url, "http://x").searchParams.get("n") ?? 200)
   json(res, 200, { logs: logLines.slice(-n) })
+}
+
+// GET lists the pool (credentials masked), POST adds one line or a batch,
+// DELETE removes one by id or `{"all": true}`.
+async function handleProxies(req, res) {
+  if (!adminAuth(req, res)) return
+  if (req.method === "GET") return json(res, 200, proxyStatus())
+  let body
+  try {
+    body = JSON.parse((await readBody(req)) || "{}")
+  } catch {
+    return json(res, 400, { error: "invalid JSON body" })
+  }
+  const current = config.proxies ?? []
+  if (req.method === "POST") {
+    const scheme = ["http", "https", "socks5"].includes(body.scheme) ? body.scheme : "http"
+    const { proxies, errors } = parseProxyList(body.text ?? body.proxies ?? "", scheme)
+    const added = proxies.filter((p) => !current.includes(p))
+    if (added.length) saveConfig({ proxies: [...current, ...added] })
+    if (added.length) log(`proxies: added ${added.length} (${config.proxies.length} total)`)
+    return json(res, errors.length && !added.length ? 400 : 200, { added: added.length, duplicates: proxies.length - added.length, errors, ...proxyStatus() })
+  }
+  if (req.method === "DELETE") {
+    const next = body.all === true ? [] : current.filter((u) => proxyId(u) !== body.id)
+    if (next.length === current.length && body.all !== true) return json(res, 404, { error: "no such proxy" })
+    saveConfig({ proxies: next })
+    log(`proxies: removed ${current.length - next.length} (${next.length} left)`)
+    return json(res, 200, { removed: current.length - next.length, ...proxyStatus() })
+  }
+  return json(res, 405, { error: "method not allowed" })
+}
+
+// Reaches upstream /models through one proxy (or all of them). A pass lifts
+// any cooldown, so a recovered proxy rejoins rotation without waiting it out.
+async function handleProxyTest(req, res) {
+  if (!adminAuth(req, res)) return
+  let body
+  try {
+    body = JSON.parse((await readBody(req)) || "{}")
+  } catch {
+    return json(res, 400, { error: "invalid JSON body" })
+  }
+  const targets = (config.proxies ?? []).filter((u) => !body.id || proxyId(u) === body.id)
+  if (body.id && !targets.length) return json(res, 404, { error: "no such proxy" })
+  const results = await Promise.all(
+    targets.map(async (url) => {
+      const t0 = Date.now()
+      try {
+        const r = await upstreamFetch(`${config.upstream}/models`, { headers: { "user-agent": config.ua }, signal: AbortSignal.timeout(15_000) }, { proxy: url })
+        try { await r.body?.cancel() } catch {}
+        if (r.ok) Object.assign(proxyStat(url), { cooldownUntil: 0, lastError: "" })
+        return { id: proxyId(url), ok: r.ok, status: r.status, ms: Date.now() - t0 }
+      } catch (err) {
+        return { id: proxyId(url), ok: false, error: err.message, ms: Date.now() - t0 }
+      }
+    }),
+  )
+  return json(res, 200, { results, ...proxyStatus() })
 }
 
 // Claude Code calls this before a session to size the context window. The real
@@ -2388,6 +2810,8 @@ async function router(req, res) {
     if (p === "/api/status" && req.method === "GET") return handleStatus(req, res)
     if (p === "/api/test" && req.method === "POST") return handleTest(req, res)
     if (p === "/api/logs" && req.method === "GET") return handleLogs(req, res)
+    if (p === "/api/proxies") return handleProxies(req, res)
+    if (p === "/api/proxies/test" && req.method === "POST") return handleProxyTest(req, res)
     if (p === "/api/sync" && req.method === "POST") {
       if (!adminAuth(req, res)) return
       syncModels().then((s) => json(res, 200, { ok: s.ok, ...s }))
@@ -2487,6 +2911,19 @@ if (isMain) {
 
 export {
   isMain,
+  parseProxyLine,
+  parseProxyList,
+  maskProxy,
+  proxyId,
+  pickProxy,
+  proxyStat,
+  proxyState,
+  proxyStatus,
+  upstreamFetch,
+  proxiedFetch,
+  handleProxies,
+  handleProxyTest,
+  PROXY_STRATEGIES,
   config,
   loadConfig,
   loadShippedModels,

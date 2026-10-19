@@ -123,6 +123,7 @@ manage everything, no config files
 
 - **Overview** — upstream health, uptime, request counters, live recent-request feed with status + latency
 - **Models** — add/remove allowed models, pick the default, one-click **Test** per model
+- **Proxies** — add one proxy or paste a batch, pick the rotation strategy and cooldown, choose whether health checks go through the proxies or direct, check or remove each proxy; live uses / fails / cooldown per proxy
 - **Settings** — edit host, port, upstream URL, User-Agent, proxy key, BYOK key, timeout, fallback list, aliases; saved to `zen-proxy.json` and applied instantly
 - **Logs** — live terminal-style log tail
 
@@ -182,8 +183,23 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `trustForwarded` | `false` | Trust `x-forwarded-for`/`x-real-ip` from a reverse proxy |
 | `timeoutMs` | `120000` | Upstream timeout for non-streaming |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
+| `proxies` | `[]` | Outbound proxy URLs (`http://`, `https://`, `socks5://`, optional `user:pass@`) |
+| `proxyStrategy` | `round-robin` | `round-robin`, `random`, `sticky`, `least-used`, `failover` |
+| `proxyCooldownMs` | `60000` | How long a failing or rate-limited proxy sits out |
+| `proxyHealthChecks` | `proxy` | `proxy` or `direct`: route for probes, sync, model test, `/health`, `/v1/models` |
 
-Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `ZEN_PROXY_CONFIG` (custom config path).
+Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `PROXIES` (comma-separated), `PROXY_STRATEGY`, `PROXY_COOLDOWN_MS`, `PROXY_HEALTH_CHECKS`, `ZEN_PROXY_CONFIG` (custom config path).
+
+### outbound proxies
+
+Upstream traffic can leave through a proxy pool instead of your own IP. With no proxies configured nothing changes: requests go direct.
+
+- **Formats** (one per line or comma-separated): `host:port`, `host:port:user:pass`, `user:pass@host:port`, `http://…`, `https://…`, `socks5://…`. Lines without a scheme take the one picked in the dashboard (default `http`). Duplicates are skipped; bad lines are reported and the good ones still get added.
+- **Protocols**: HTTP CONNECT (with `Proxy-Authorization: Basic`), HTTPS (TLS to the proxy, then CONNECT), SOCKS5 with no auth or username/password (RFC 1929). The hostname is sent to the proxy, so DNS resolves there. Built on `net`/`tls`, no dependencies.
+- **Strategies**: `round-robin` takes the next proxy on every request and retry. `random` takes any live proxy. `sticky` keeps one client (its session id) on one proxy and re-pins it when that proxy fails. `least-used` takes the live proxy with the fewest requests. `failover` always takes the first live proxy.
+- **Failures**: a connect error, a handshake timeout (10 s), bad credentials or an upstream `429` benches the proxy for `proxyCooldownMs`; the per-model retry then lands on another proxy. `403` never benches a proxy, because it is the free-tier gate judging the request, not the IP. If every proxy is cooling down the request fails `503` right away, never silently going direct.
+- **Health checks**: `proxyHealthChecks: "proxy"` (default) sends probes, sync, model **Test**, `/health` and `/v1/models` through the pool; `"direct"` sends them straight out, which tells a dead model from a dead proxy. The `autoUA` npm lookup is always direct.
+- **Credentials** are masked in the dashboard, `/api/config`, `/api/proxies` and logs, and stored only in `zen-proxy.json`. `PUT /api/config` never touches the list.
 
 ### bring your own key
 
@@ -205,6 +221,10 @@ Anonymous `public` access rides opencode's shared free pool (per-IP quota, somet
 | `POST` | `/api/test` | Test a model (`{"model":"…"}`) |
 | `GET` | `/api/logs` | Log tail |
 | `POST` | `/api/reset` | Reset request stats |
+| `GET` | `/api/proxies` | Proxy pool + per-proxy stats (credentials masked) |
+| `POST` | `/api/proxies` | Add proxies: `{"text":"…","scheme":"http"}` |
+| `DELETE` | `/api/proxies` | Remove `{"id":"…"}` or `{"all":true}` |
+| `POST` | `/api/proxies/test` | Check one proxy (`{"id":"…"}`) or all (`{}`) against upstream |
 | `GET` | `/assets/*` | Static assets (logo, favicon) |
 
 ---
@@ -262,7 +282,7 @@ plus response headers `x-zen-served-by` and `x-zen-fallback: true`.
 
 ## caveats
 
-- This rides opencode's **anonymous free tier**: per-IP request/daily quotas and a shared pool that's sometimes saturated. Don't rotate/abuse IPs or run heavy workloads anonymously.
+- This rides opencode's **anonymous free tier**: per-IP request/daily quotas and a shared pool that's sometimes saturated. Respect OpenCode's terms and don't run heavy workloads anonymously.
 - opencode keeps **tightening the anonymous free tier** — most `-free` models now answer `403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"`, and that hits the real opencode client too. The proxy detects it and rolls to the next working model, so requests keep succeeding, but the pool is much smaller than it used to be. A Zen API key (BYOK) is the reliable path.
 - The `-free` models are "as-is" free tiers — expect rate limits and occasional provider errors.
 - For anything serious, **BYOK**.

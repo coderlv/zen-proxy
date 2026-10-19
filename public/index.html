@@ -352,6 +352,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
     <div class="nav-indicator" id="navIndicator"></div>
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="models">Models</button>
+    <button data-tab="proxies">Proxies</button>
     <button data-tab="config">Settings</button>
     <button data-tab="logs">Logs</button>
   </nav>
@@ -402,6 +403,49 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
         <input class="grow" id="newModel" placeholder="add a model id, e.g. nemotron-3-ultra-free">
         <button onclick="addModel()">+ Add</button>
       </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-proxies">
+    <div class="panel">
+      <h2><span class="hh">Outbound proxies</span><span class="badge mut" id="proxyCount"></span></h2>
+      <p class="hint" style="margin-bottom:16px">Upstream traffic leaves through these instead of your own IP. A proxy that fails or gets a <code>429</code> sits out the cooldown and the next one takes over. If every proxy is cooling down, requests fail instead of going out directly. Empty list = direct, as before.</p>
+      <div class="formgrid">
+        <div>
+          <label>Rotation strategy</label>
+          <select id="pxStrategy" style="width:100%">
+            <option value="round-robin">Round-robin: next proxy on every request</option>
+            <option value="random">Random: any live proxy</option>
+            <option value="sticky">Sticky: one client stays on one proxy</option>
+            <option value="least-used">Least-used: the proxy with the fewest requests</option>
+            <option value="failover">Failover: first live proxy, the next only on failure</option>
+          </select>
+          <label>Cooldown after a failure (ms)</label><input id="pxCooldown" type="number" min="0">
+        </div>
+        <div>
+          <label>Health checks (probes, sync, model TEST, /health)</label>
+          <select id="pxHealth" style="width:100%">
+            <option value="proxy">Through the proxies</option>
+            <option value="direct">Direct, bypassing the proxies</option>
+          </select>
+          <div class="row" style="margin-top:14px"><button class="primary" onclick="saveProxySettings()">Save settings</button></div>
+        </div>
+      </div>
+      <label>Add proxies: one per line (<code>host:port</code>, <code>host:port:user:pass</code>, <code>user:pass@host:port</code>, <code>socks5://user:pass@host:port</code>)</label>
+      <textarea id="pxText" placeholder="1.2.3.4:8080&#10;5.6.7.8:1080:user:pass&#10;socks5://user:pass@proxy.example:1080"></textarea>
+      <div class="row" style="gap:10px;margin:8px 0 22px">
+        <label style="margin:0">Scheme for lines without one</label>
+        <select id="pxScheme" style="width:auto"><option value="http">http</option><option value="https">https</option><option value="socks5">socks5</option></select>
+        <button class="primary" onclick="addProxies()">+ Add</button>
+      </div>
+      <div class="row" style="margin:0 0 12px;gap:10px">
+        <button onclick="testProxy()">Check all</button>
+        <button onclick="removeProxy()">Remove all</button>
+      </div>
+      <table id="proxyTable">
+        <thead><tr><th>Proxy</th><th>Status</th><th>Uses</th><th>Fails</th><th>Last</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
     </div>
   </section>
 
@@ -745,6 +789,73 @@ async function removeModel(m) {
   refreshModels()
 }
 
+async function refreshProxies(data) {
+  const d = data || (await api("/api/proxies"))
+  if (document.activeElement?.id !== "pxStrategy") $("pxStrategy").value = d.strategy
+  if (document.activeElement?.id !== "pxCooldown") $("pxCooldown").value = d.cooldownMs
+  if (document.activeElement?.id !== "pxHealth") $("pxHealth").value = d.healthChecks
+  const live = d.proxies.filter((p) => !p.coolingMs).length
+  $("proxyCount").textContent = d.proxies.length ? `${live} / ${d.proxies.length} live` : "direct"
+  const tb = $("proxyTable").querySelector("tbody")
+  if (!d.proxies.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">no proxies, so upstream traffic goes direct.</td></tr>'; return }
+  tb.innerHTML = d.proxies.map((p) => {
+    const status = p.coolingMs
+      ? `<span class="badge bad" tabindex="0" data-tip="${escapeAttr(p.lastError)}">cooling ${Math.ceil(p.coolingMs / 1000)}s</span>`
+      : p.lastError ? `<span class="badge warn" tabindex="0" data-tip="${escapeAttr(p.lastError)}">live</span>`
+      : `<span class="badge ok">live</span>`
+    const last = p.lastMs ? `${p.lastStatus || "–"} · ${fmtDur(p.lastMs)}` : "–"
+    return `<tr>
+      <td class="mono">${escapeHtml(p.url)}</td>
+      <td>${status}</td>
+      <td class="mono">${p.uses}</td>
+      <td class="mono">${p.fails}</td>
+      <td class="mono" id="px-${escapeAttr(p.id)}">${last}</td>
+      <td class="row" style="gap:10px"><button onclick='testProxy(${jsStr(p.id)})'>Check</button><button onclick='removeProxy(${jsStr(p.id)})'>✕</button></td>
+    </tr>`
+  }).join("")
+}
+
+async function addProxies() {
+  const text = $("pxText").value
+  if (!text.trim()) return
+  const r = await api("/api/proxies", { method: "POST", body: JSON.stringify({ text, scheme: $("pxScheme").value }) })
+  if (r.added || r.duplicates) $("pxText").value = r.errors?.length ? r.errors.join("\n") : ""
+  const msg = `Added ${r.added || 0}` + (r.duplicates ? `, ${r.duplicates} already there` : "") + (r.errors?.length ? `, ${r.errors.length} invalid (listed in the box)` : "")
+  toast(msg, r.errors?.length ? "bad" : "ok")
+  if (r.proxies) refreshProxies(r)
+}
+
+async function removeProxy(id) {
+  if (!id && !confirm("Remove every proxy? Upstream traffic will go direct.")) return
+  const r = await api("/api/proxies", { method: "DELETE", body: JSON.stringify(id ? { id } : { all: true }) })
+  toast(`Removed ${r.removed || 0}`)
+  if (r.proxies) refreshProxies(r)
+}
+
+async function testProxy(id) {
+  toast(id ? "Checking…" : "Checking every proxy…")
+  const r = await api("/api/proxies/test", { method: "POST", body: JSON.stringify(id ? { id } : {}) })
+  if (!r.results) { toast(r.error || "Check failed", "bad"); return }
+  const ok = r.results.filter((x) => x.ok).length
+  toast(`${ok} / ${r.results.length} reached upstream`, ok === r.results.length ? "ok" : "bad")
+  refreshProxies(r)
+  for (const x of r.results) {
+    const cell = $("px-" + x.id)
+    if (cell && !x.ok) cell.textContent = (x.error || x.status) + " · " + fmtDur(x.ms)
+  }
+}
+
+async function saveProxySettings() {
+  await api("/api/config", { method: "PUT", body: JSON.stringify({
+    proxyStrategy: $("pxStrategy").value,
+    proxyCooldownMs: Number($("pxCooldown").value || 0),
+    proxyHealthChecks: $("pxHealth").value,
+  }) })
+  toast("Proxy settings saved")
+  config = null
+  refreshProxies()
+}
+
 async function populateConfigForm() {
   if (!config) config = (await api("/api/config")).config
   savedZenKeyMasked = config.defaultZenKey || ""
@@ -864,6 +975,7 @@ function switchTab(name) {
   if (name === "config") populateConfigForm()
   if (name === "logs") loadLogs()
   if (name === "models") refreshModels()
+  if (name === "proxies") refreshProxies()
   if (name === "overview") refreshStatus()
 }
 document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)))
@@ -933,6 +1045,10 @@ function jsStr(s) {
   return JSON.stringify(String(s ?? "")).replace(/'/g, "\\x27").replace(/&/g, "\\u0026")
 }
 
+function refreshProxiesIfShown() {
+  if ($("tab-proxies").classList.contains("active")) refreshProxies().catch(() => {})
+}
+
 async function refreshAll() {
   try { await refreshStatus(); await refreshModels() } catch (e) { if (e.message === "unauthorized") showAuth() }
 }
@@ -941,11 +1057,13 @@ if (key) {
   refreshAll()
   setInterval(refreshStatus, 4000)
   setInterval(loadLogs, 8000)
+  setInterval(refreshProxiesIfShown, 4000)
 } else {
   api("/api/status").then(() => {
     refreshAll()
     setInterval(refreshStatus, 4000)
     setInterval(loadLogs, 8000)
+    setInterval(refreshProxiesIfShown, 4000)
   }).catch(() => showAuth())
 }
 </script>
