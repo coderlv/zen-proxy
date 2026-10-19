@@ -42,10 +42,14 @@ if [ "$NODE_MAJOR" -lt 18 ]; then die "Node.js >= 18 is required (found $(node -
 mkdir -p "$INSTALL_DIR"
 info "Installing zen-proxy to $INSTALL_DIR"
 
-# Preserve an existing config across the wipe/copy below.
+# Preserve an existing config and token analytics across the wipe/copy below.
 CFG_BAK="$(mktemp)"
 if [ -f "$INSTALL_DIR/zen-proxy.json" ]; then
   cp "$INSTALL_DIR/zen-proxy.json" "$CFG_BAK"
+fi
+STATS_BAK="$(mktemp)"
+if [ -f "$INSTALL_DIR/zen-proxy-stats.json" ]; then
+  cp "$INSTALL_DIR/zen-proxy-stats.json" "$STATS_BAK"
 fi
 
 if [ -n "$LOCAL_SRC" ]; then
@@ -57,7 +61,7 @@ if [ -n "$LOCAL_SRC" ]; then
   find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name zen-proxy.json -exec rm -rf {} + 2>/dev/null || true
   ( cd "$LOCAL_SRC" && tar -cf - \
       --exclude=./.git --exclude=./node_modules --exclude=./.mimocode \
-      --exclude=./zen-proxy --exclude=./zen-proxy.json . ) \
+      --exclude=./zen-proxy --exclude=./zen-proxy.json --exclude=./zen-proxy-stats.json . ) \
     | ( cd "$INSTALL_DIR" && tar -xf - )
   rm -f "$INSTALL_DIR/zen-proxy.json.tmp"
   info "Copied from local source: $LOCAL_SRC"
@@ -77,6 +81,10 @@ if [ -s "$CFG_BAK" ]; then
   cp "$CFG_BAK" "$INSTALL_DIR/zen-proxy.json"
 fi
 rm -f "$CFG_BAK"
+if [ -s "$STATS_BAK" ]; then
+  cp "$STATS_BAK" "$INSTALL_DIR/zen-proxy-stats.json"
+fi
+rm -f "$STATS_BAK"
 
 if [ ! -f "$INSTALL_DIR/zen-proxy.mjs" ]; then
   die "zen-proxy.mjs not found after install — check ZEN_PROXY_REPO"

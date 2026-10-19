@@ -161,6 +161,25 @@ main { max-width:1120px; margin:28px auto 70px; padding:0 18px }
 .cards .card.hero .label { color:var(--ink) }
 .cards .card.hero .sub { color:var(--ink) }
 
+/* ---------- analytics ---------- */
+.an { --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a }
+.an .cards { grid-template-columns:repeat(4,1fr) }
+@media (max-width:1000px) { .an .cards { grid-template-columns:repeat(2,1fr) } }
+.seg { display:inline-flex; border:var(--line); border-radius:999px; overflow:hidden; background:var(--card) }
+.seg button { border:0; border-radius:0; box-shadow:none; background:transparent; color:var(--ink); padding:7px 15px; font-family:var(--mono); font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; transform:none }
+.seg button:hover { background:var(--paper2); transform:none; box-shadow:none }
+.seg button.on { background:var(--acid) }
+.legend { display:flex; gap:18px; flex-wrap:wrap; font-family:var(--mono); font-size:11px; color:var(--ink2); margin:0 0 8px }
+.legend i { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:6px; vertical-align:-1px }
+.an-chart { width:100%; height:auto; display:block }
+.an-tip { position:fixed; pointer-events:none; background:var(--ink); color:#fff; font-family:var(--mono); font-size:11.5px; line-height:1.55; padding:8px 11px; border-radius:8px; display:none; z-index:50 }
+.an th.sort { cursor:pointer; user-select:none }
+.an th.sort.on { color:var(--ink) }
+.an td.n, .an th.n { text-align:right }
+.an td.n { font-family:var(--mono) }
+.ibar { display:inline-block; height:8px; border-radius:4px; background:var(--ink2); vertical-align:middle; margin-right:8px }
+.an-modes { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px }
+
 /* ---------- panels ---------- */
 .panel {
   position:relative; padding:26px; margin-bottom:24px;
@@ -351,6 +370,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
   <nav class="capsule" id="nav">
     <div class="nav-indicator" id="navIndicator"></div>
     <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="analytics">Analytics</button>
     <button data-tab="models">Models</button>
     <button data-tab="proxies">Proxies</button>
     <button data-tab="config">Settings</button>
@@ -385,6 +405,50 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       </table>
       <div class="pager" id="reqPager"></div>
     </div>
+  </section>
+
+  <section class="tab an" id="tab-analytics">
+    <div class="row" style="margin-bottom:18px">
+      <div class="seg" id="anRange">
+        <button data-r="today">Today</button><button data-r="24h" class="on">24h</button><button data-r="7d">7d</button><button data-r="30d">30d</button><button data-r="all">All</button>
+      </div>
+      <span class="hint" id="anCompare" style="margin:0"></span>
+    </div>
+    <div class="cards">
+      <div class="card hero"><div class="label">Tokens processed</div><div class="value" id="anTokens">–</div><div class="sub" id="anTokensSub">–</div></div>
+      <div class="card"><div class="label">Input · cached</div><div class="value" id="anInput">–</div><div class="sub" id="anInputSub">–</div></div>
+      <div class="card"><div class="label">Output</div><div class="value" id="anOutput">–</div><div class="sub" id="anOutputSub">–</div></div>
+      <div class="card"><div class="label">Upstream calls</div><div class="value" id="anCalls">–</div><div class="sub" id="anCallsSub">–</div></div>
+    </div>
+
+    <div class="panel">
+      <h2><span class="hh" id="anChartTitle">Tokens per hour</span></h2>
+      <div class="legend"><span><i style="background:var(--s1)"></i>input, not cached</span><span><i style="background:var(--s2)"></i>input from cache</span><span><i style="background:var(--s3)"></i>output</span></div>
+      <svg class="an-chart" id="anChart" viewBox="0 0 900 220" role="img" aria-label="Tokens over time"></svg>
+    </div>
+
+    <div class="panel">
+      <h2><span class="hh">Models</span><span class="badge mut">averages over the period</span></h2>
+      <table id="anModels">
+        <thead><tr>
+          <th class="sort" data-k="key">Model</th><th class="sort n" data-k="calls">Calls</th><th class="sort n" data-k="input">Input</th><th class="sort n" data-k="cacheHit">Cache</th><th class="sort n" data-k="output">Output</th><th class="sort n" data-k="ttftMs">TTFT</th><th class="sort" data-k="tokensPerSec">tok/s</th><th class="sort n" data-k="errRate">Err</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint">TTFT: time until the first token (thinking included). tok/s: output tokens over the time spent streaming them. Calls count every upstream attempt, retries included.</p>
+    </div>
+
+    <div class="panel">
+      <h2><span class="hh">Which model is faster</span><span class="badge mut">top left = best</span></h2>
+      <svg class="an-chart" id="anScatter" viewBox="0 0 900 320" role="img" aria-label="Time to first token versus tokens per second, per model"></svg>
+    </div>
+
+    <div class="panel">
+      <h2><span class="hh">Cache by session mode</span></h2>
+      <div class="an-modes" id="anModes"></div>
+      <p class="hint">Switch the mode in the Proxies tab. Every call is tagged with the mode it went out in, so the two can be compared over the same period.</p>
+    </div>
+    <div class="an-tip" id="anTip"></div>
   </section>
 
   <section class="tab" id="tab-models">
@@ -427,6 +491,11 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
           <select id="pxHealth" style="width:100%">
             <option value="proxy">Through the proxies</option>
             <option value="direct">Direct, bypassing the proxies</option>
+          </select>
+          <label>Session id</label>
+          <select id="pxSession" style="width:100%">
+            <option value="per-proxy">Rotates with the proxy (new IP = new session)</option>
+            <option value="per-client">Stays per client (only the IP rotates)</option>
           </select>
           <div class="row" style="margin-top:14px"><button class="primary" onclick="saveProxySettings()">Save settings</button></div>
         </div>
@@ -789,11 +858,187 @@ async function removeModel(m) {
   refreshModels()
 }
 
+// ---- analytics ----
+let anRange = "24h"
+let anSort = { k: "input", dir: -1 }
+let anData = null
+const MODE_LABEL = { "per-proxy": "Session rotates with proxy", "per-client": "Session per client", direct: "Direct (no proxy)" }
+
+function fmtTok(v) {
+  if (v == null) return "–"
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + "B"
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + "M"
+  if (v >= 1e4) return Math.round(v / 1e3) + "K"
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + "K"
+  return String(v)
+}
+function fmtPct(v) { return v == null ? "–" : Math.round(v * 100) + "%" }
+function fmtMs(v) { return v == null ? "–" : fmtDur(v) }
+
+function vsPrev(cur, prev) {
+  if (!anData.prev || !prev) return ""
+  const d = (cur - prev) / prev
+  return (d >= 0 ? "▲ " : "▼ ") + Math.abs(Math.round(d * 100)) + "% vs prev"
+}
+
+async function refreshAnalytics() {
+  anData = await api("/api/analytics?range=" + anRange)
+  renderAnalytics()
+}
+
+function renderAnalytics() {
+  const d = anData, t = d.totals, p = d.prev
+  $("anCompare").textContent = d.prev ? (d.range === "today" ? "compared with yesterday up to the same hour" : "compared with the " + d.range + " before") : "since the first recorded call"
+  $("anTokens").textContent = fmtTok(t.tokens)
+  $("anTokensSub").textContent = vsPrev(t.tokens, p && p.tokens) || (t.tokens ? "input + output" : "no traffic yet")
+  $("anInput").textContent = fmtTok(t.input)
+  $("anInputSub").textContent = t.input ? `${fmtPct(t.cacheHit)} from cache · ${fmtTok(t.cached)}` : "–"
+  $("anOutput").textContent = fmtTok(t.output)
+  $("anOutputSub").textContent = t.output ? `reasoning ${fmtTok(t.reasoning)}` : "–"
+  $("anCalls").textContent = t.calls
+  $("anCallsSub").textContent = t.calls ? `errors ${fmtPct(t.errors / t.calls)} · 429: ${t.e429}` : "–"
+  $("anChartTitle").textContent = d.step === "hour" ? "Tokens per hour" : "Tokens per day"
+  renderTokenChart(d)
+  renderModelTable(d)
+  renderScatter(d)
+  renderModes(d)
+}
+
+function anTip(e, html) {
+  const tip = $("anTip")
+  if (!html) { tip.style.display = "none"; return }
+  tip.innerHTML = html
+  tip.style.display = "block"
+  tip.style.left = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 8) + "px"
+  tip.style.top = e.clientY + 14 + "px"
+}
+
+function renderTokenChart(d) {
+  const svg = $("anChart"), W = 900, H = 220, L = 52, B = 24, T = 10
+  const rows = d.series
+  const total = (r) => r.fresh + r.cached + r.output
+  const max = Math.max(1, ...rows.map(total)) * 1.08
+  const y = (v) => H - B - (v / max) * (H - B - T)
+  const bw = (W - L) / Math.max(1, rows.length)
+  const label = (ts) => {
+    const dt = new Date(ts)
+    return d.step === "hour" ? String(dt.getHours()).padStart(2, "0") + ":00" : dt.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+  }
+  let out = ""
+  for (const f of [0, 0.5, 1]) {
+    const v = (max / 1.08) * f, yy = y(v)
+    out += `<line x1="${L}" x2="${W}" y1="${yy}" y2="${yy}" stroke="rgba(26,22,18,.12)"/><text x="${L - 8}" y="${yy + 4}" text-anchor="end" font-size="10" fill="#7d7461" font-family="ui-monospace,Menlo,monospace">${fmtTok(Math.round(v))}</text>`
+  }
+  const every = Math.ceil(rows.length / 8)
+  rows.forEach((r, i) => {
+    const x = L + i * bw + Math.min(3, bw * 0.15), w = Math.max(1, bw - Math.min(6, bw * 0.3))
+    let base = 0
+    const parts = [[r.fresh, "var(--s1)"], [r.cached, "var(--s2)"], [r.output, "var(--s3)"]].filter(([v]) => v > 0)
+    parts.forEach(([v, c], k) => {
+      const y0 = y(base), y1 = y(base + v)
+      const top = k === parts.length - 1
+      // 2px surface gap between stacked segments; only the top one is rounded.
+      out += `<rect x="${x}" y="${y1}" width="${w}" height="${Math.max(0.5, y0 - y1 - (k ? 2 : 0))}" rx="${top ? Math.min(4, w / 2) : 0}" fill="${c}"/>`
+      base += v
+    })
+    if (i % every === 0) out += `<text x="${x + w / 2}" y="${H - 6}" text-anchor="middle" font-size="10" fill="#7d7461" font-family="ui-monospace,Menlo,monospace">${label(r.t)}</text>`
+    out += `<rect x="${L + i * bw}" y="${T}" width="${bw}" height="${H - B - T}" fill="transparent" data-i="${i}"/>`
+  })
+  svg.innerHTML = out
+  svg.onmousemove = (e) => {
+    const i = e.target.dataset && e.target.dataset.i
+    if (i == null) return anTip(e)
+    const r = rows[i]
+    anTip(e, `<b>${escapeHtml(d.step === "hour" ? new Date(r.t).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }) : new Date(r.t).toLocaleDateString())}</b><br>input: ${fmtTok(r.fresh)}<br>from cache: ${fmtTok(r.cached)}<br>output: ${fmtTok(r.output)}<br>total: ${fmtTok(total(r))}`)
+  }
+  svg.onmouseleave = (e) => anTip(e)
+}
+
+function renderModelTable(d) {
+  const rows = d.models.map((m) => ({ ...m, errRate: m.calls ? m.errors / m.calls : 0 }))
+  const k = anSort.k
+  rows.sort((a, b) => {
+    const av = a[k] ?? -Infinity, bv = b[k] ?? -Infinity
+    return (typeof av === "string" ? av.localeCompare(bv) : av - bv) * anSort.dir
+  })
+  document.querySelectorAll("#anModels th.sort").forEach((th) => th.classList.toggle("on", th.dataset.k === k))
+  const maxTps = Math.max(1, ...rows.map((m) => m.tokensPerSec || 0))
+  $("anModels").querySelector("tbody").innerHTML = rows.length
+    ? rows.map((m) => `<tr>
+        <td class="mono">${escapeHtml(m.key)}</td>
+        <td class="n">${m.calls}</td>
+        <td class="n">${fmtTok(m.input)}</td>
+        <td class="n">${fmtPct(m.cacheHit)}</td>
+        <td class="n">${fmtTok(m.output)}</td>
+        <td class="n">${fmtMs(m.ttftMs)}</td>
+        <td class="mono">${m.tokensPerSec == null ? "–" : `<span class="ibar" style="width:${Math.round((m.tokensPerSec / maxTps) * 120)}px"></span>${m.tokensPerSec}`}</td>
+        <td class="n">${fmtPct(m.errRate)}</td>
+      </tr>`).join("")
+    : '<tr><td colspan="8" class="empty">no calls in this period yet.</td></tr>'
+}
+document.querySelectorAll("#anModels th.sort").forEach((th) => th.addEventListener("click", () => {
+  anSort = { k: th.dataset.k, dir: anSort.k === th.dataset.k ? -anSort.dir : th.dataset.k === "key" || th.dataset.k === "ttftMs" || th.dataset.k === "errRate" ? 1 : -1 }
+  if (anData) renderModelTable(anData)
+}))
+
+function renderScatter(d) {
+  const svg = $("anScatter"), W = 900, H = 320, L = 56, B = 34, T = 16, R = 150
+  const pts = d.models.filter((m) => m.ttftMs != null && m.tokensPerSec != null)
+  if (!pts.length) {
+    svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle" font-size="14" fill="#7d7461" font-family="Iowan Old Style,Georgia,serif" font-style="italic">no timed replies in this period yet.</text>`
+    return
+  }
+  const maxX = Math.max(...pts.map((m) => m.ttftMs)) * 1.1 || 1
+  const maxY = Math.max(...pts.map((m) => m.tokensPerSec)) * 1.15 || 1
+  const x = (v) => L + (v / maxX) * (W - L - R)
+  const y = (v) => H - B - (v / maxY) * (H - B - T)
+  const mono = 'font-family="ui-monospace,Menlo,monospace"'
+  let out = `<line x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}" stroke="rgba(26,22,18,.35)"/><line x1="${L}" y1="${T}" x2="${L}" y2="${H - B}" stroke="rgba(26,22,18,.35)"/>`
+  for (const f of [0.5, 1]) {
+    out += `<text x="${x(maxX / 1.1 * f)}" y="${H - B + 16}" text-anchor="middle" font-size="10" fill="#7d7461" ${mono}>${fmtDur(Math.round(maxX / 1.1 * f))}</text>`
+    out += `<text x="${L - 8}" y="${y(maxY / 1.15 * f) + 4}" text-anchor="end" font-size="10" fill="#7d7461" ${mono}>${Math.round(maxY / 1.15 * f)}</text>`
+  }
+  out += `<text x="${W - R}" y="${H - 4}" text-anchor="end" font-size="10" fill="#7d7461" ${mono}>time to first token → slower</text><text x="${L}" y="${T - 4}" font-size="10" fill="#7d7461" ${mono}>tok/s ↑</text>`
+  pts.forEach((m, i) => {
+    const cx = x(m.ttftMs), cy = y(m.tokensPerSec)
+    out += `<circle cx="${cx}" cy="${cy}" r="6" fill="var(--s1)" stroke="var(--card)" stroke-width="2"/>`
+    out += `<text x="${cx + 10}" y="${cy + 4}" font-size="11" fill="#1a1612" ${mono}>${escapeHtml(m.key.length > 22 ? m.key.slice(0, 21) + "…" : m.key)}</text>`
+    out += `<circle cx="${cx}" cy="${cy}" r="14" fill="transparent" data-i="${i}"/>`
+  })
+  svg.innerHTML = out
+  svg.onmousemove = (e) => {
+    const i = e.target.dataset && e.target.dataset.i
+    if (i == null) return anTip(e)
+    const m = pts[i]
+    anTip(e, `<b>${escapeHtml(m.key)}</b><br>TTFT: ${fmtDur(m.ttftMs)}<br>speed: ${m.tokensPerSec} tok/s<br>calls: ${m.calls}`)
+  }
+  svg.onmouseleave = (e) => anTip(e)
+}
+
+function renderModes(d) {
+  const order = ["per-proxy", "per-client", "direct"]
+  const modes = [...d.modes].sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key))
+  $("anModes").innerHTML = modes.length
+    ? modes.map((m) => `<div class="card"><div class="label">${escapeHtml(MODE_LABEL[m.key] || m.key)}</div><div class="value">${fmtPct(m.cacheHit)}</div><div class="sub">cache hit · ${m.calls} calls · 429: ${m.e429} · TTFT ${fmtMs(m.ttftMs)}</div></div>`).join("")
+    : '<div class="empty">no calls in this period yet.</div>'
+}
+
+document.querySelectorAll("#anRange button").forEach((b) => b.addEventListener("click", () => {
+  anRange = b.dataset.r
+  document.querySelectorAll("#anRange button").forEach((x) => x.classList.toggle("on", x === b))
+  refreshAnalytics().catch(() => {})
+}))
+
+function refreshAnalyticsIfShown() {
+  if ($("tab-analytics").classList.contains("active")) refreshAnalytics().catch(() => {})
+}
+
 async function refreshProxies(data) {
   const d = data || (await api("/api/proxies"))
   if (document.activeElement?.id !== "pxStrategy") $("pxStrategy").value = d.strategy
   if (document.activeElement?.id !== "pxCooldown") $("pxCooldown").value = d.cooldownMs
   if (document.activeElement?.id !== "pxHealth") $("pxHealth").value = d.healthChecks
+  if (document.activeElement?.id !== "pxSession") $("pxSession").value = d.sessionMode
   const live = d.proxies.filter((p) => p.enabled && !p.coolingMs).length
   const off = d.proxies.filter((p) => !p.enabled).length
   $("proxyCount").textContent = d.proxies.length ? `${live} / ${d.proxies.length} live` + (off ? ` · ${off} off` : "") : "direct"
@@ -860,6 +1105,7 @@ async function saveProxySettings() {
     proxyStrategy: $("pxStrategy").value,
     proxyCooldownMs: Number($("pxCooldown").value || 0),
     proxyHealthChecks: $("pxHealth").value,
+    proxySessionMode: $("pxSession").value,
   }) })
   toast("Proxy settings saved")
   config = null
@@ -986,6 +1232,7 @@ function switchTab(name) {
   if (name === "logs") loadLogs()
   if (name === "models") refreshModels()
   if (name === "proxies") refreshProxies()
+  if (name === "analytics") refreshAnalytics()
   if (name === "overview") refreshStatus()
 }
 document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)))
@@ -1068,12 +1315,14 @@ if (key) {
   setInterval(refreshStatus, 4000)
   setInterval(loadLogs, 8000)
   setInterval(refreshProxiesIfShown, 4000)
+  setInterval(refreshAnalyticsIfShown, 10000)
 } else {
   api("/api/status").then(() => {
     refreshAll()
     setInterval(refreshStatus, 4000)
     setInterval(loadLogs, 8000)
     setInterval(refreshProxiesIfShown, 4000)
+    setInterval(refreshAnalyticsIfShown, 10000)
   }).catch(() => showAuth())
 }
 </script>

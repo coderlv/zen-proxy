@@ -2939,6 +2939,18 @@ describe("install.sh config preservation", () => {
     assert.deepEqual(cfg, { user: true, port: 7777 }, "user config must survive reinstall")
   })
 
+  test("reinstall preserves token analytics", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
+    const src = path.join(tmp, "src")
+    fs.mkdirSync(src, { recursive: true })
+    fs.writeFileSync(path.join(src, "zen-proxy.mjs"), "console.log('zen-proxy')\n")
+    fs.writeFileSync(path.join(src, "zen-proxy-stats.json"), '{"from":"src"}')
+    const env = runInstall(tmp, 8899)
+    fs.writeFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy-stats.json"), '{"buckets":[1]}')
+    execFileSync("bash", ["install.sh", "--local", toPosix(path.join(tmp, "src"))], { env, cwd: REPO_ROOT })
+    assert.equal(fs.readFileSync(path.join(env.ZEN_PROXY_DIR, "zen-proxy-stats.json"), "utf8"), '{"buckets":[1]}')
+  })
+
   test("refuses to install into /", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zp-install-"))
     const src = path.join(tmp, "src")
@@ -3278,6 +3290,21 @@ describe("proxy transport", () => {
     assert.equal((await sent(own)).session, "ses_client_owned")
   })
 
+  test("per-client session mode keeps one session across proxies", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "round-robin", injectSession: true, proxySessionMode: "per-client" })
+    const req = mockReq({ remoteAddress: "127.0.0.1" })
+    const sessions = []
+    for (let i = 0; i < 2; i++) {
+      const before = rig.seen.upstream.length
+      const r = await zp.upstreamFetch(`${rig.upstreamUrl}/chat`, { method: "POST", headers: zp.zenHeaders(req, "Bearer public"), body: "{}" }, { req })
+      await r.text()
+      sessions.push(rig.seen.upstream.slice(before).at(-1).session)
+    }
+    assert.equal(sessions[0], sessions[1])
+    assert.equal(sessions[0], zp.sessionFor(req).value)
+    zp.saveConfig({ proxySessionMode: "per-proxy" })
+  })
+
   test("chat answers 503 at once when every proxy is cooling down", async () => {
     zp.saveConfig({ proxies: [rig.httpProxy] })
     zp.proxyStat(rig.httpProxy).cooldownUntil = Date.now() + 60_000
@@ -3329,5 +3356,135 @@ describe("streamed requests on Node 24", () => {
     await res.done
     assert.equal(res.state.status, 200)
     assert.ok(!sentSignal?.aborted)
+  })
+})
+
+// ---- token analytics ----
+
+function usageSse(chunks, usage, { gapMs = 0 } = {}) {
+  const enc = new TextEncoder()
+  return new Response(
+    new ReadableStream({
+      async start(c) {
+        for (const ch of chunks) {
+          c.enqueue(enc.encode(`data: ${JSON.stringify(ch)}\n\n`))
+          if (gapMs) await new Promise((r) => setTimeout(r, gapMs))
+        }
+        if (usage) c.enqueue(enc.encode(`data: ${JSON.stringify(usage)}\n\n`))
+        c.enqueue(enc.encode("data: [DONE]\n\n"))
+        c.close()
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )
+}
+
+describe("token analytics", () => {
+  beforeEach(() => zp.usageBuckets.clear())
+
+  test("normalizes chat and Responses usage, cache and reasoning included", () => {
+    assert.deepEqual(
+      zp.normalizeUsage({ prompt_tokens: 3138, completion_tokens: 90, prompt_tokens_details: { cached_tokens: 3072 }, completion_tokens_details: { reasoning_tokens: 18 } }),
+      { input: 3138, output: 90, cached: 3072, reasoning: 18 },
+    )
+    assert.deepEqual(
+      zp.normalizeUsage({ input_tokens: 50, output_tokens: 7, input_tokens_details: { cached_tokens: 10 }, output_tokens_details: { reasoning_tokens: 2 } }),
+      { input: 50, output: 7, cached: 10, reasoning: 2 },
+    )
+    assert.equal(zp.normalizeUsage(null), null)
+  })
+
+  test("the meter measures TTFT and speed while passing bytes through untouched", async () => {
+    const start = Date.now()
+    await new Promise((r) => setTimeout(r, 30))
+    const src = usageSse(
+      [{ choices: [{ delta: { role: "assistant", content: "" } }] }, { choices: [{ delta: { content: "Hel" } }] }, { choices: [{ delta: { content: "lo" } }] }],
+      { choices: [], usage: { prompt_tokens: 100, completion_tokens: 40, prompt_tokens_details: { cached_tokens: 80 } } },
+      { gapMs: 60 },
+    )
+    const r = zp.meterResponse(src, { model: "m1", mode: "direct" }, start)
+    const text = await r.text()
+    assert.match(text, /Hel/)
+    assert.match(text, /\[DONE\]/)
+    const a = zp.analytics("24h")
+    assert.equal(a.totals.calls, 1)
+    assert.equal(a.totals.input, 100)
+    assert.equal(a.totals.cached, 80)
+    assert.equal(a.totals.output, 40)
+    assert.equal(a.totals.cacheHit, 0.8)
+    // the empty role chunk is not a token: TTFT starts at "Hel", after one gap
+    assert.ok(a.totals.ttftMs >= 80, `ttft ${a.totals.ttftMs}`)
+    assert.ok(a.totals.tokensPerSec > 0)
+  })
+
+  test("Responses-style deltas count as the first token too", async () => {
+    const src = usageSse(
+      [{ type: "response.output_text.delta", delta: "Hi" }],
+      { type: "response.completed", response: { usage: { input_tokens: 9, output_tokens: 3 } } },
+    )
+    await zp.meterResponse(src, { model: "gpt-5-nano", mode: "per-proxy" }, Date.now()).text()
+    const m = zp.analytics("24h").models.find((x) => x.key === "gpt-5-nano")
+    assert.equal(m.output, 3)
+    assert.ok(m.ttftMs != null)
+  })
+
+  test("chat traffic is metered end to end; failed calls count as errors per model", async () => {
+    zp.saveConfig({ proxies: [] })
+    let n = 0
+    globalThis.fetch = async () =>
+      ++n === 1
+        ? jsonResponse({ error: { type: "rate_limit" } }, 429)
+        : usageSse([{ choices: [{ delta: { content: "ok" } }] }], { usage: { prompt_tokens: 12, completion_tokens: 3 } })
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: DEFAULT_MODEL, stream: true, messages: [{ role: "user", content: "x" }] }) }), res)
+    await res.done
+    const m = zp.analytics("24h").models.find((x) => x.key === DEFAULT_MODEL)
+    assert.equal(m.calls, 2)
+    assert.equal(m.errors, 1)
+    assert.equal(m.e429, 1)
+    assert.equal(m.input, 12)
+    assert.deepEqual(zp.analytics("24h").modes.map((x) => x.key), ["direct"])
+  })
+
+  test("health checks and model tests are never metered", async () => {
+    globalThis.fetch = async () => usageSse([{ choices: [{ delta: { content: "x" } }] }], { usage: { prompt_tokens: 5, completion_tokens: 1 } })
+    const r = await zp.upstreamFetch("http://x/chat/completions", {}, { req: mockReq(), model: "m", health: true })
+    await r.text()
+    assert.equal(zp.usageBuckets.size, 0)
+  })
+
+  test("ranges, the previous window and the series shape", () => {
+    const now = Date.now()
+    zp.recordUsage({ model: "a", mode: "direct", status: 200, at: now - 2 * 3_600_000, usage: { input: 100, cached: 50, output: 10, reasoning: 0 } })
+    zp.recordUsage({ model: "a", mode: "direct", status: 200, at: now - 30 * 3_600_000, usage: { input: 40, cached: 0, output: 4, reasoning: 0 } })
+    zp.recordUsage({ model: "b", mode: "per-proxy", status: 200, at: now - 10 * 86_400_000, usage: { input: 7, cached: 7, output: 1, reasoning: 0 } })
+    const d = zp.analytics("24h", now)
+    assert.equal(d.step, "hour")
+    assert.equal(d.series.length, 24)
+    assert.equal(d.totals.input, 100)
+    assert.equal(d.prev.input, 40)
+    const w = zp.analytics("7d", now)
+    assert.equal(w.step, "day")
+    assert.equal(w.series.length, 7)
+    assert.equal(w.totals.tokens, 154)
+    assert.equal(zp.analytics("30d", now).totals.input, 147)
+    const all = zp.analytics("all", now)
+    assert.equal(all.prev, null)
+    assert.equal(all.series.reduce((s, x) => s + x.fresh + x.cached + x.output, 0), 162)
+    assert.deepEqual(new Set(all.modes.map((m) => m.key)), new Set(["direct", "per-proxy"]))
+  })
+
+  test("survives a restart, and old hours fold into days without losing totals", () => {
+    const now = Date.now()
+    const old = now - 40 * 86_400_000
+    for (let i = 0; i < 5; i++) zp.recordUsage({ model: "a", mode: "direct", status: 200, at: old + i * 3_600_000, usage: { input: 10, cached: 5, output: 2, reasoning: 0 } })
+    zp.recordUsage({ model: "a", mode: "direct", status: 200, at: now, usage: { input: 1, cached: 0, output: 1, reasoning: 0 } })
+    zp.saveUsage(true)
+    zp.usageBuckets.clear()
+    zp.loadUsage()
+    const all = zp.analytics("all", now)
+    assert.equal(all.totals.input, 51)
+    assert.equal(all.totals.calls, 6)
+    assert.ok(zp.usageBuckets.size <= 3, `old hours should have folded into a day, got ${zp.usageBuckets.size} buckets`)
   })
 })

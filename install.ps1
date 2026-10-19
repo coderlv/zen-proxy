@@ -41,6 +41,13 @@ if (Test-Path $ConfigPath) {
   $CfgBak = Join-Path $env:TEMP ("zen-proxy-config-" + [guid]::NewGuid().ToString() + ".json")
   Copy-Item $ConfigPath $CfgBak -Force
 }
+# Token analytics survive a reinstall the same way the config does.
+$StatsPath = Join-Path $InstallDir "zen-proxy-stats.json"
+$StatsBak = $null
+if (Test-Path $StatsPath) {
+  $StatsBak = Join-Path $env:TEMP ("zen-proxy-stats-" + [guid]::NewGuid().ToString() + ".json")
+  Copy-Item $StatsPath $StatsBak -Force
+}
 
 if ($LocalSrc) {
   if (-not (Test-Path $LocalSrc)) { Die "Local source not found: $LocalSrc" }
@@ -64,6 +71,10 @@ else {
 if ($CfgBak -and (Test-Path $CfgBak)) {
   Copy-Item $CfgBak $ConfigPath -Force
   Remove-Item $CfgBak -Force
+}
+if ($StatsBak -and (Test-Path $StatsBak)) {
+  Copy-Item $StatsBak $StatsPath -Force
+  Remove-Item $StatsBak -Force
 }
 
 if (-not (Test-Path (Join-Path $InstallDir "zen-proxy.mjs"))) {

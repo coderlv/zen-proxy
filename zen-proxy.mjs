@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url"
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 const CONFIG_PATH = process.env.ZEN_PROXY_CONFIG || path.join(__dirname, "zen-proxy.json")
+// Token analytics live next to the config so a reinstall keeps both.
+const STATS_PATH = process.env.ZEN_PROXY_STATS || path.join(path.dirname(CONFIG_PATH), "zen-proxy-stats.json")
 const UI_PATH = path.join(__dirname, "public", "index.html")
 const ENV = process.env
 
@@ -482,12 +484,35 @@ function pickProxy(key = "server", now = Date.now()) {
 // A network failure or a 429 benches the proxy for proxyCooldownMs; the caller's
 // retry loop then naturally lands on the next one. 403s are request-shape
 // verdicts from the gate, not the IP's fault, so they never cool a proxy.
-async function upstreamFetch(url, init = {}, { req, health = false, proxy } = {}) {
+//
+// Client traffic (a `req` and a `model`, not a health check) is also metered for
+// the Analytics tab: failures are counted here, successes on their way through.
+async function upstreamFetch(url, init = {}, opts = {}) {
+  if (!opts.req || !opts.model || opts.health) return routeUpstream(url, init, opts)
+  const ev = { model: opts.model, mode: "direct" }
+  const start = Date.now()
+  let r
+  try {
+    r = await routeUpstream(url, init, opts, ev)
+  } catch (err) {
+    // NO_PROXY never reached a model, and an abort is the client leaving.
+    if (err?.code !== "NO_PROXY" && !init.signal?.aborted) recordUsage({ ...ev, status: 0 })
+    throw err
+  }
+  if (!r.ok) {
+    recordUsage({ ...ev, status: r.status })
+    return r
+  }
+  return meterResponse(r, ev, start)
+}
+
+async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev) {
   const list = config.proxies ?? []
   if (!proxy && (!list.length || (health && config.proxyHealthChecks === "direct"))) return fetch(url, init)
   const chosen = proxy ?? pickProxy(req ? sessionFor(req).value : "server")
+  if (ev) ev.mode = config.proxySessionMode
   // Swap a minted session for this proxy's own; one the client brought is theirs.
-  if (init.headers?.[SESSION_HEADERS[0]]) {
+  if (config.proxySessionMode !== "per-client" && init.headers?.[SESSION_HEADERS[0]]) {
     const sess = sessionFor(req, chosen)
     if (sess.injected) {
       const headers = { ...init.headers }
@@ -514,6 +539,7 @@ function proxyStatus(now = Date.now()) {
   const off = new Set(config.disabledProxies ?? [])
   return {
     strategy: config.proxyStrategy,
+    sessionMode: config.proxySessionMode,
     cooldownMs: config.proxyCooldownMs,
     healthChecks: config.proxyHealthChecks,
     strategies: PROXY_STRATEGIES,
@@ -602,6 +628,10 @@ const DEFAULT_CONFIG = {
   // "proxy" = model probes, sync, /health and dashboard tests use the pool too;
   // "direct" = they go straight out, so you can tell a dead model from a dead proxy.
   proxyHealthChecks: ENV.PROXY_HEALTH_CHECKS === "direct" ? "direct" : "proxy",
+  // "per-proxy" = each proxy gets its own minted session; "per-client" = one
+  // session per client whichever proxy it leaves through. Kept as a switch so
+  // the Analytics tab can compare what each does to the prompt cache.
+  proxySessionMode: ENV.PROXY_SESSION_MODE === "per-client" ? "per-client" : "per-proxy",
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -1259,6 +1289,252 @@ function log(message) {
   console.log(line.msg)
 }
 
+// ---- token analytics ---------------------------------------------------------
+// Hourly buckets per (hour, model, session mode), persisted to STATS_PATH. Each
+// holds sums only, so averages are exact and the file stays small: buckets older
+// than STATS_HOURLY_DAYS fold into one per local day, which is all the 7d/30d/All
+// views need. Counts are upstream calls, retries included, so a model's error
+// rate reflects what it actually did.
+const STATS_HOURLY_DAYS = 31
+const HOUR = 3_600_000
+const DAY = 24 * HOUR
+const usageBuckets = new Map()
+let usageDirty = false
+
+function emptyBucket(h, model, mode) {
+  return { h, model, mode, calls: 0, errors: 0, e429: 0, input: 0, cached: 0, output: 0, reasoning: 0, ttftSum: 0, ttftN: 0, speedOut: 0, speedMs: 0 }
+}
+
+function localMidnight(t) {
+  const d = new Date(t)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+function addToBucket(b, src) {
+  for (const k of ["calls", "errors", "e429", "input", "cached", "output", "reasoning", "ttftSum", "ttftN", "speedOut", "speedMs"]) b[k] += src[k] ?? 0
+}
+
+// Chat and Responses report usage in different shapes; both carry the cached
+// share of the prompt and the reasoning share of the output.
+function normalizeUsage(u) {
+  if (!u || typeof u !== "object") return null
+  const input = u.prompt_tokens ?? u.input_tokens ?? 0
+  const output = u.completion_tokens ?? u.output_tokens ?? 0
+  const cached = u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0
+  const reasoning = u.completion_tokens_details?.reasoning_tokens ?? u.output_tokens_details?.reasoning_tokens ?? 0
+  return { input: +input || 0, output: +output || 0, cached: +cached || 0, reasoning: +reasoning || 0 }
+}
+
+// `ev`: { model, mode, status, at?, usage?, ttftMs?, genMs? }. A status other
+// than 200 is a failed call.
+function recordUsage(ev) {
+  const at = ev.at ?? Date.now()
+  const h = Math.floor(at / HOUR) * HOUR
+  const key = `${h}|${ev.model}|${ev.mode}`
+  let b = usageBuckets.get(key)
+  if (!b) usageBuckets.set(key, (b = emptyBucket(h, ev.model, ev.mode)))
+  b.calls++
+  if (ev.status !== 200) {
+    b.errors++
+    if (ev.status === 429) b.e429++
+  }
+  const u = ev.usage
+  if (u) {
+    b.input += u.input
+    b.cached += u.cached
+    b.output += u.output
+    b.reasoning += u.reasoning
+  }
+  if (ev.ttftMs != null && ev.ttftMs >= 0) {
+    b.ttftSum += ev.ttftMs
+    b.ttftN++
+  }
+  // Speed is output over the time spent generating it (first token → end). Very
+  // short windows are dropped: a reply that arrives in one chunk has no
+  // measurable rate and would report absurd tokens/s.
+  if (u?.output > 0 && ev.genMs >= 100) {
+    b.speedOut += u.output
+    b.speedMs += ev.genMs
+  }
+  usageDirty = true
+}
+
+// Taps a successful upstream SSE body on its way to whichever relay reads it:
+// the first non-empty delta marks time-to-first-token, the last usage block
+// gives the token counts. Bytes pass through untouched and pipeThrough keeps
+// backpressure and cancellation intact.
+function meterResponse(r, ev, start) {
+  if (!r.body || !/text\/event-stream/i.test(r.headers.get("content-type") ?? "")) {
+    recordUsage({ ...ev, status: 200 })
+    return r
+  }
+  const decoder = new TextDecoder()
+  let buf = ""
+  let first = 0
+  let usage = null
+  const onLine = (line) => {
+    if (!line.startsWith("data:")) return
+    const raw = line.slice(5).trim()
+    if (!raw || raw === "[DONE]") return
+    let d
+    try {
+      d = JSON.parse(raw)
+    } catch {
+      return
+    }
+    if (!first) {
+      const delta = d?.choices?.[0]?.delta
+      const visible = delta
+        ? !!(delta.content || delta.reasoning_content || delta.reasoning || delta.tool_calls?.length)
+        : typeof d?.type === "string" && d.type.endsWith(".delta") && !!d.delta
+      if (visible) first = Date.now()
+    }
+    const u = normalizeUsage(d?.usage ?? d?.response?.usage)
+    if (u) usage = u
+  }
+  const tap = new TransformStream({
+    transform(chunk, c) {
+      c.enqueue(chunk)
+      buf += decoder.decode(chunk, { stream: true })
+      let i
+      while ((i = buf.indexOf("\n")) !== -1) {
+        onLine(buf.slice(0, i).trimEnd())
+        buf = buf.slice(i + 1)
+      }
+    },
+    flush() {
+      if (buf) onLine(buf.trimEnd())
+      const end = Date.now()
+      recordUsage({ ...ev, status: 200, usage, ttftMs: first ? first - start : null, genMs: first ? end - first : 0 })
+    },
+  })
+  return new Response(r.body.pipeThrough(tap), { status: r.status, statusText: r.statusText, headers: r.headers })
+}
+
+function loadUsage() {
+  usageBuckets.clear()
+  try {
+    const rows = JSON.parse(fs.readFileSync(STATS_PATH, "utf8")).buckets ?? []
+    for (const row of rows) {
+      if (!row || typeof row.h !== "number" || typeof row.model !== "string") continue
+      const b = emptyBucket(row.h, row.model, String(row.mode ?? "direct"))
+      addToBucket(b, row)
+      usageBuckets.set(`${b.h}|${b.model}|${b.mode}`, b)
+    }
+  } catch {}
+}
+
+// Folds hourly buckets past the hourly window into local-day buckets.
+function compactUsage(now = Date.now()) {
+  const cutoff = now - STATS_HOURLY_DAYS * DAY
+  for (const [key, b] of [...usageBuckets]) {
+    if (b.h >= cutoff) continue
+    const day = localMidnight(b.h)
+    if (day === b.h) continue
+    usageBuckets.delete(key)
+    const dkey = `${day}|${b.model}|${b.mode}`
+    let d = usageBuckets.get(dkey)
+    if (!d) usageBuckets.set(dkey, (d = emptyBucket(day, b.model, b.mode)))
+    addToBucket(d, b)
+  }
+}
+
+function saveUsage(force = false) {
+  if (!usageDirty && !force) return
+  compactUsage()
+  try {
+    fs.writeFileSync(STATS_PATH + ".tmp", JSON.stringify({ version: 1, buckets: [...usageBuckets.values()] }))
+    fs.renameSync(STATS_PATH + ".tmp", STATS_PATH)
+    usageDirty = false
+  } catch (err) {
+    log(`analytics: could not save ${STATS_PATH}: ${err.message}`)
+  }
+}
+
+function sumBuckets(list) {
+  const t = emptyBucket(0, "", "")
+  for (const b of list) addToBucket(t, b)
+  return {
+    calls: t.calls,
+    errors: t.errors,
+    e429: t.e429,
+    input: t.input,
+    cached: t.cached,
+    output: t.output,
+    reasoning: t.reasoning,
+    tokens: t.input + t.output,
+    cacheHit: t.input ? t.cached / t.input : null,
+    ttftMs: t.ttftN ? Math.round(t.ttftSum / t.ttftN) : null,
+    tokensPerSec: t.speedMs ? Math.round((t.speedOut / t.speedMs) * 10_000) / 10 : null,
+  }
+}
+
+const ANALYTICS_RANGES = ["today", "24h", "7d", "30d", "all"]
+function analytics(range = "24h", now = Date.now()) {
+  if (!ANALYTICS_RANGES.includes(range)) range = "24h"
+  const all = [...usageBuckets.values()]
+  const earliest = all.reduce((m, b) => Math.min(m, b.h), now)
+  const from =
+    range === "today" ? localMidnight(now)
+    : range === "24h" ? Math.floor((now - DAY) / HOUR) * HOUR + HOUR
+    : range === "7d" ? localMidnight(now - 6 * DAY)
+    : range === "30d" ? localMidnight(now - 29 * DAY)
+    : localMidnight(earliest)
+  const inRange = all.filter((b) => b.h >= from && b.h <= now)
+  // "Today" is compared with yesterday up to the same hour, the rest with the
+  // equally long window just before.
+  const prevSpan = range === "all" ? null : range === "today" ? [from - DAY, now - DAY] : [from - (now - from), from]
+  const prev = prevSpan && sumBuckets(all.filter((b) => b.h >= prevSpan[0] && b.h < prevSpan[1]))
+
+  const step = range === "today" || range === "24h" ? "hour" : "day"
+  const slots = new Map()
+  for (let t = from; t <= now; t = step === "hour" ? t + HOUR : localMidnight(t + DAY + HOUR)) {
+    slots.set(t, { t, fresh: 0, cached: 0, output: 0 })
+  }
+  for (const b of inRange) {
+    const slot = slots.get(step === "hour" ? b.h : localMidnight(b.h))
+    if (!slot) continue
+    slot.fresh += b.input - b.cached
+    slot.cached += b.cached
+    slot.output += b.output
+  }
+
+  const group = (keyOf) => {
+    const m = new Map()
+    for (const b of inRange) {
+      const k = keyOf(b)
+      if (!m.has(k)) m.set(k, [])
+      m.get(k).push(b)
+    }
+    return [...m].map(([k, list]) => ({ key: k, ...sumBuckets(list) }))
+  }
+  return {
+    range,
+    from,
+    to: now,
+    step,
+    totals: sumBuckets(inRange),
+    prev,
+    series: [...slots.values()],
+    models: group((b) => b.model).sort((a, b) => b.tokens - a.tokens),
+    modes: group((b) => b.mode),
+  }
+}
+
+function handleAnalytics(req, res) {
+  if (!adminAuth(req, res)) return
+  const range = new URL(req.url, "http://x").searchParams.get("range") ?? "24h"
+  json(res, 200, analytics(range))
+}
+
+loadUsage()
+if (isMain) {
+  setInterval(() => saveUsage(), 30_000).unref()
+  process.on("exit", () => saveUsage())
+  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0))
+}
+
 function recordReq(req, model, ms, status, at = Date.now()) {
   const entry = { at, ip: clientIp(req), model, status, ms }
   const key = `${entry.at}|${entry.model}|${entry.status}`
@@ -1483,7 +1759,7 @@ async function handleMessages(req, res) {
           // which killed every streamed request. Node 18-22 have none, so streams
           // never carried a signal there either.
           signal: isStream ? undefined : AbortSignal.timeout(config.timeoutMs),
-        }, { req })
+        }, { req, model })
       } catch (err) {
         // Walking the rest of the chain cannot help when no proxy is usable.
         if (err?.code === "NO_PROXY") {
@@ -1637,7 +1913,7 @@ async function handleChat(req, res) {
           // which killed every streamed request. Node 18-22 have none, so streams
           // never carried a signal there either.
           signal: isStream ? undefined : AbortSignal.timeout(config.timeoutMs),
-        }, { req })
+        }, { req, model })
       } catch (err) {
         if (err?.code === "NO_PROXY") {
           recordReq(req, requested, Date.now() - start, 503)
@@ -2582,6 +2858,7 @@ async function handleApiConfig(req, res) {
       delete cleaned.disabledProxies
       if (cleaned.proxyStrategy != null && !PROXY_STRATEGIES.includes(cleaned.proxyStrategy)) cleaned.proxyStrategy = "round-robin"
       if (cleaned.proxyHealthChecks != null) cleaned.proxyHealthChecks = cleaned.proxyHealthChecks === "direct" ? "direct" : "proxy"
+      if (cleaned.proxySessionMode != null) cleaned.proxySessionMode = cleaned.proxySessionMode === "per-client" ? "per-client" : "per-proxy"
       cleaned.proxyCooldownMs = Math.max(0, num(cleaned.proxyCooldownMs ?? config.proxyCooldownMs, config.proxyCooldownMs))
       if (cleaned.probeAuth != null && !["auto", "key", "anonymous"].includes(String(cleaned.probeAuth))) {
         cleaned.probeAuth = "auto"
@@ -2862,6 +3139,7 @@ async function router(req, res) {
     if (p === "/api/test" && req.method === "POST") return handleTest(req, res)
     if (p === "/api/logs" && req.method === "GET") return handleLogs(req, res)
     if (p === "/api/proxies") return handleProxies(req, res)
+    if (p === "/api/analytics" && req.method === "GET") return handleAnalytics(req, res)
     if (p === "/api/proxies/test" && req.method === "POST") return handleProxyTest(req, res)
     if (p === "/api/sync" && req.method === "POST") {
       if (!adminAuth(req, res)) return
@@ -2962,6 +3240,16 @@ if (isMain) {
 
 export {
   isMain,
+  recordUsage,
+  normalizeUsage,
+  meterResponse,
+  analytics,
+  usageBuckets,
+  loadUsage,
+  saveUsage,
+  compactUsage,
+  handleAnalytics,
+  STATS_PATH,
   parseProxyLine,
   parseProxyList,
   maskProxy,

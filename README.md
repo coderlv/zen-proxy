@@ -90,6 +90,7 @@ It stays up until you stop it, so you point your agent at it once and keep using
 | Model aliases | Call it `gpt-4o`, get a free model back |
 | Auth | Anonymous `Bearer public`, or bring your own Zen key |
 | Outbound proxies | HTTP / HTTPS / SOCKS5 pool with round-robin, random, sticky, least-used or failover rotation |
+| Token analytics | Input / cached / output / reasoning tokens per period, TTFT and tokens/s per model, cache hit per session mode |
 | Dashboard | `http://127.0.0.1:8787/` |
 
 The free-model catalog in [`models.json`](models.json) is refreshed from OpenCode's public catalog by a GitHub Action every 6 hours.
@@ -163,8 +164,9 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 | `proxyStrategy` | `round-robin` | `round-robin`, `random`, `sticky`, `least-used` or `failover` |
 | `proxyCooldownMs` | `60000` | How long a failing or rate-limited proxy sits out |
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: how probes, sync, model TEST, `/health` and `/v1/models` reach upstream |
+| `proxySessionMode` | `per-proxy` | `per-proxy`: each proxy gets its own session id. `per-client`: one session per client, only the IP rotates |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_HEALTH_CHECKS=direct` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_HEALTH_CHECKS=direct` `PROXY_SESSION_MODE=per-client` `ZEN_PROXY_CONFIG` `ZEN_PROXY_STATS` (analytics file path)
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service.
 </details>
@@ -196,7 +198,7 @@ HTTP, HTTPS (TLS to the proxy) and SOCKS5 with username/password are supported. 
 
 A proxy that fails to connect, rejects its credentials, or gets a `429` from upstream sits out `proxyCooldownMs`, and the normal retry loop moves on to the next one. `403` responses do not bench a proxy: they come from the free-tier gate, not from the IP. When every proxy is cooling down, requests fail with `503` instead of quietly going out from your own IP. A successful **Check** brings a proxy back early.
 
-Each proxy gets its own `x-opencode-session` id, so a new exit IP also looks like a new session upstream rather than the same client on a different address. A session the client sends itself is left untouched.
+By default each proxy gets its own `x-opencode-session` id, so a new exit IP also looks like a new session upstream rather than the same client on a different address. Set `proxySessionMode` to `per-client` to keep one session per client and rotate only the IP; the Analytics tab compares what each mode does to the prompt cache. A session the client sends itself is left untouched either way.
 
 Proxied response bodies are read with backpressure: when the reader falls behind, the tunnel stops reading and upstream is held back over TCP, so a large body is not buffered in memory.
 
@@ -206,9 +208,24 @@ Passwords are masked everywhere they are shown (dashboard, `/api/config`, `/api/
 </details>
 
 <details>
+<summary>Token analytics</summary>
+
+The dashboard's **Analytics** tab answers two questions: how many tokens went through, and which model answers faster.
+
+- **Periods**: Today, 24h, 7d, 30d, All. Each figure is compared with the window just before it ("Today" with yesterday up to the same hour).
+- **Tokens**: input, how much of it came from the provider's prompt cache, output, and the reasoning share of the output. A stacked chart shows them per hour (Today, 24h) or per day (7d, 30d, All).
+- **Models**: calls, tokens, cache hit, average **time to first token** (thinking included) and average **tokens/s** (output tokens over the time spent streaming them), plus the error rate, sortable. A scatter of TTFT against tok/s puts the fastest models top left.
+- **Cache by session mode**: every call is tagged with the session mode it went out in (`proxySessionMode`, or `direct` without proxies). The cache hit, 429s and TTFT of each mode sit side by side, so you can see whether rotating the session with the proxy costs you the prompt cache.
+
+Counts come from the `usage` the upstream stream reports; nothing is estimated. Only client traffic is metered, not probes or model tests. "Calls" are upstream attempts, retries included. Note that tool-less requests carry OpenCode's tool manifest (see below), which shows up as input tokens, mostly cached.
+
+Data is kept in `zen-proxy-stats.json` next to the config, saved every 30 seconds and on shutdown, and preserved by the installers. Hourly detail is kept for 31 days; older hours fold into one bucket per day, so the file stays small. `GET /api/analytics?range=today|24h|7d|30d|all` returns the same numbers as JSON.
+</details>
+
+<details>
 <summary>Dashboard</summary>
 
-`http://127.0.0.1:8787/` — upstream health and uptime, a live request feed, one-click model testing, the outbound proxy pool, instant config editing, and a log tail.
+`http://127.0.0.1:8787/` — upstream health and uptime, a live request feed, token analytics, one-click model testing, the outbound proxy pool, instant config editing, and a log tail.
 
 ![zen-proxy dashboard](assets/dashboard.png)
 </details>
@@ -231,6 +248,7 @@ Passwords are masked everywhere they are shown (dashboard, `/api/config`, `/api/
 | `GET` | `/api/logs` | Log tail |
 | `POST` | `/api/sync` | Re-run model discovery |
 | `POST` | `/api/reset` | Reset request statistics |
+| `GET` | `/api/analytics` | Token and speed analytics — `?range=today\|24h\|7d\|30d\|all` |
 | `GET` | `/api/proxies` | Proxy pool with per-proxy stats (credentials masked) |
 | `POST` | `/api/proxies` | Add proxies — `{"text":"one or many lines","scheme":"http\|https\|socks5"}` |
 | `PATCH` | `/api/proxies` | Take one in or out of rotation — `{"id":"...","enabled":false}` |
