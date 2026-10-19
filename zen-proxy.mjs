@@ -1447,7 +1447,10 @@ async function handleMessages(req, res) {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
-          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+          // Not req.signal: Node 24 aborts it as soon as the request body is read,
+          // which killed every streamed request. Node 18-22 have none, so streams
+          // never carried a signal there either.
+          signal: isStream ? undefined : AbortSignal.timeout(config.timeoutMs),
         }, { req })
       } catch (err) {
         // Walking the rest of the chain cannot help when no proxy is usable.
@@ -1598,7 +1601,10 @@ async function handleChat(req, res) {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
-          signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+          // Not req.signal: Node 24 aborts it as soon as the request body is read,
+          // which killed every streamed request. Node 18-22 have none, so streams
+          // never carried a signal there either.
+          signal: isStream ? undefined : AbortSignal.timeout(config.timeoutMs),
         }, { req })
       } catch (err) {
         if (err?.code === "NO_PROXY") {

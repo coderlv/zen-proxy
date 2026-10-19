@@ -3254,3 +3254,19 @@ describe("proxy transport", () => {
     assert.deepEqual(zp.config.proxies, [rig.httpProxy])
   })
 })
+
+describe("streamed requests on Node 24", () => {
+  // Node 24's IncomingMessage.signal is already aborted once the body is read;
+  // forwarding it upstream turned every streamed request into a 502.
+  test("an aborted request signal is not forwarded upstream", async () => {
+    const ctrl = new AbortController()
+    ctrl.abort()
+    let sentSignal = "unset"
+    globalThis.fetch = async (_u, opts) => ((sentSignal = opts.signal), sseResponse(["hi"]))
+    const res = mockRes()
+    await zp.handleChat(mockReq({ signal: ctrl.signal, _body: JSON.stringify({ model: DEFAULT_MODEL, stream: true, messages: [{ role: "user", content: "x" }] }) }), res)
+    await res.done
+    assert.equal(res.state.status, 200)
+    assert.ok(!sentSignal?.aborted)
+  })
+})
