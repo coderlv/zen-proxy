@@ -123,7 +123,7 @@ manage everything, no config files
 
 - **Overview** — upstream health, uptime, request counters, live recent-request feed with status + latency
 - **Models** — add/remove allowed models, pick the default, one-click **Test** per model
-- **Proxies** — add one proxy or paste a batch, pick the rotation strategy and cooldown, choose whether health checks go through the proxies or direct, check or remove each proxy; live uses / fails / cooldown per proxy
+- **Proxies** — add one proxy or paste a batch, pick the rotation strategy and cooldown, choose whether health checks go through the proxies or direct, check, disable / enable or remove each proxy; live uses / fails / cooldown per proxy
 - **Settings** — edit host, port, upstream URL, User-Agent, proxy key, BYOK key, timeout, fallback list, aliases; saved to `zen-proxy.json` and applied instantly
 - **Logs** — live terminal-style log tail
 
@@ -184,6 +184,7 @@ Config lives in **`zen-proxy.json`** (auto-created on first run, hot-reloaded wh
 | `timeoutMs` | `120000` | Upstream timeout for non-streaming |
 | `cacheMs` | `30000` | `/v1/models` cache TTL |
 | `proxies` | `[]` | Outbound proxy URLs (`http://`, `https://`, `socks5://`, optional `user:pass@`) |
+| `disabledProxies` | `[]` | Ids of proxies kept in the list but out of rotation |
 | `proxyStrategy` | `round-robin` | `round-robin`, `random`, `sticky`, `least-used`, `failover` |
 | `proxyCooldownMs` | `60000` | How long a failing or rate-limited proxy sits out |
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: route for probes, sync, model test, `/health`, `/v1/models` |
@@ -198,6 +199,9 @@ Upstream traffic can leave through a proxy pool instead of your own IP. With no 
 - **Protocols**: HTTP CONNECT (with `Proxy-Authorization: Basic`), HTTPS (TLS to the proxy, then CONNECT), SOCKS5 with no auth or username/password (RFC 1929). The hostname is sent to the proxy, so DNS resolves there. Built on `net`/`tls`, no dependencies.
 - **Strategies**: `round-robin` takes the next proxy on every request and retry. `random` takes any live proxy. `sticky` keeps one client (its session id) on one proxy and re-pins it when that proxy fails. `least-used` takes the live proxy with the fewest requests. `failover` always takes the first live proxy.
 - **Failures**: a connect error, a handshake timeout (10 s), bad credentials or an upstream `429` benches the proxy for `proxyCooldownMs`; the per-model retry then lands on another proxy. `403` never benches a proxy, because it is the free-tier gate judging the request, not the IP. If every proxy is cooling down the request fails `503` right away, never silently going direct.
+- **Enable / disable**: a disabled proxy stays in the list (and can still be checked) but never takes traffic. Its id is kept in `disabledProxies`; removing the proxy drops it. Disabling every proxy fails requests with `503`; it never falls back to direct.
+- **Sessions**: the minted `x-opencode-session` pair is per client *and* per proxy, so rotating the exit IP rotates the session with it. A session the client sends itself is passed through unchanged.
+- **Backpressure**: proxied bodies are pull-driven. The tunnel socket pauses while the reader is behind, so upstream is held back over TCP instead of the body piling up in memory.
 - **Health checks**: `proxyHealthChecks: "proxy"` (default) sends probes, sync, model **Test**, `/health` and `/v1/models` through the pool; `"direct"` sends them straight out, which tells a dead model from a dead proxy. The `autoUA` npm lookup is always direct.
 - **Credentials** are masked in the dashboard, `/api/config`, `/api/proxies` and logs, and stored only in `zen-proxy.json`. `PUT /api/config` never touches the list.
 
@@ -223,6 +227,7 @@ Anonymous `public` access rides opencode's shared free pool (per-IP quota, somet
 | `POST` | `/api/reset` | Reset request stats |
 | `GET` | `/api/proxies` | Proxy pool + per-proxy stats (credentials masked) |
 | `POST` | `/api/proxies` | Add proxies: `{"text":"…","scheme":"http"}` |
+| `PATCH` | `/api/proxies` | Enable / disable `{"id":"…","enabled":false}` |
 | `DELETE` | `/api/proxies` | Remove `{"id":"…"}` or `{"all":true}` |
 | `POST` | `/api/proxies/test` | Check one proxy (`{"id":"…"}`) or all (`{}`) against upstream |
 | `GET` | `/assets/*` | Static assets (logo, favicon) |

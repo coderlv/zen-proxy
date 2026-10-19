@@ -386,16 +386,29 @@ async function proxiedFetch(proxy, url, init = {}) {
       for (const [k, v] of Object.entries(res.headers)) out.set(k, Array.isArray(v) ? v.join(", ") : v)
       const noBody = [204, 205, 304].includes(res.statusCode) || req.method === "HEAD"
       // Hand-built rather than Readable.toWeb so cancel() reliably hangs up the
-      // tunnel on every supported Node — probes rely on that.
+      // tunnel on every supported Node — probes rely on that. Pull-driven: the
+      // socket is paused whenever the queue is full, so a slow reader pushes back
+      // on upstream over TCP instead of the whole body piling up in memory.
+      let cancelled = false
       const body = noBody
         ? null
         : new ReadableStream({
             start(c) {
-              res.on("data", (d) => c.enqueue(new Uint8Array(d)))
+              res.pause()
+              res.on("data", (d) => {
+                // A chunk already in flight can still land after cancel().
+                if (cancelled) return
+                c.enqueue(new Uint8Array(d))
+                if (c.desiredSize <= 0) res.pause()
+              })
               res.on("end", () => { try { c.close() } catch {} })
               res.on("error", (e) => { try { c.error(e) } catch {} })
             },
+            pull() {
+              res.resume()
+            },
             cancel() {
+              cancelled = true
               res.destroy()
               sock.destroy()
             },
@@ -436,10 +449,12 @@ function nextRoundRobin(list, live) {
 }
 
 function pickProxy(key = "server", now = Date.now()) {
-  const list = config.proxies ?? []
+  const off = new Set(config.disabledProxies ?? [])
+  const list = (config.proxies ?? []).filter((u) => !off.has(proxyId(u)))
   const live = list.filter((u) => proxyStat(u).cooldownUntil <= now)
   if (!live.length) {
-    const err = new Error(`all ${list.length} proxies are cooling down`)
+    // Disabling every proxy is not a way back to direct: that is "Remove all".
+    const err = new Error(list.length ? `all ${list.length} enabled proxies are cooling down` : "every proxy is disabled")
     err.code = "NO_PROXY"
     throw err
   }
@@ -471,6 +486,15 @@ async function upstreamFetch(url, init = {}, { req, health = false, proxy } = {}
   const list = config.proxies ?? []
   if (!proxy && (!list.length || (health && config.proxyHealthChecks === "direct"))) return fetch(url, init)
   const chosen = proxy ?? pickProxy(req ? sessionFor(req).value : "server")
+  // Swap a minted session for this proxy's own; one the client brought is theirs.
+  if (init.headers?.[SESSION_HEADERS[0]]) {
+    const sess = sessionFor(req, chosen)
+    if (sess.injected) {
+      const headers = { ...init.headers }
+      for (const h of SESSION_HEADERS) headers[h] = sess.value
+      init = { ...init, headers }
+    }
+  }
   const st = proxyStat(chosen)
   st.uses++
   const t0 = Date.now()
@@ -487,6 +511,7 @@ async function upstreamFetch(url, init = {}, { req, health = false, proxy } = {}
 }
 
 function proxyStatus(now = Date.now()) {
+  const off = new Set(config.disabledProxies ?? [])
   return {
     strategy: config.proxyStrategy,
     cooldownMs: config.proxyCooldownMs,
@@ -497,6 +522,7 @@ function proxyStatus(now = Date.now()) {
       return {
         id: proxyId(url),
         url: maskProxy(url),
+        enabled: !off.has(proxyId(url)),
         uses: st.uses,
         fails: st.fails,
         lastMs: st.lastMs,
@@ -569,6 +595,8 @@ const DEFAULT_CONFIG = {
   // Outbound proxy pool for upstream traffic (see upstreamFetch). Managed from
   // the dashboard's Proxies tab or /api/proxies; PROXIES takes a comma list.
   proxies: parseProxyList(ENV.PROXIES ?? "").proxies,
+  // Ids (see proxyId) of proxies kept in the list but out of rotation.
+  disabledProxies: [],
   proxyStrategy: PROXY_STRATEGIES.includes(ENV.PROXY_STRATEGY) ? ENV.PROXY_STRATEGY : "round-robin",
   proxyCooldownMs: Number(ENV.PROXY_COOLDOWN_MS ?? 60_000),
   // "proxy" = model probes, sync, /health and dashboard tests use the pool too;
@@ -615,6 +643,7 @@ function loadConfig() {
     // existing config file keeps working after an update.
     const parsedProxies = parseProxyList(merged.proxies)
     merged.proxies = parsedProxies.proxies
+    if (!Array.isArray(merged.disabledProxies)) merged.disabledProxies = []
     for (const e of parsedProxies.errors) log(`config: ignoring proxy — ${e}`)
     const upstream = normalizeUpstream(merged.upstream)
     if (upstream !== merged.upstream) {
@@ -736,10 +765,13 @@ function genSessionId(now = Date.now()) {
   const tail = Array.from(randomBytes(14), (b) => SESSION_ALPHABET[b % 62]).join("")
   return { value: "ses_" + hex + tail, at: now }
 }
-function sessionFor(req) {
+// With a proxy, the minted id is per client *and* per proxy: a new exit IP
+// that kept the old session would still read as the same client upstream.
+function sessionFor(req, proxy) {
   const incoming = req?.headers?.["x-opencode-session"]
   if (typeof incoming === "string" && incoming.trim()) return { value: incoming.trim(), injected: false }
-  const key = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
+  let key = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
+  if (proxy) key += "@" + proxyId(proxy)
   let hit = sessionPool.get(key)
   if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS) {
     hit = genSessionId()
@@ -2547,6 +2579,7 @@ async function handleApiConfig(req, res) {
       // The list is only ever edited through /api/proxies: what GET returns here
       // is masked, and round-tripping it would overwrite the real credentials.
       delete cleaned.proxies
+      delete cleaned.disabledProxies
       if (cleaned.proxyStrategy != null && !PROXY_STRATEGIES.includes(cleaned.proxyStrategy)) cleaned.proxyStrategy = "round-robin"
       if (cleaned.proxyHealthChecks != null) cleaned.proxyHealthChecks = cleaned.proxyHealthChecks === "direct" ? "direct" : "proxy"
       cleaned.proxyCooldownMs = Math.max(0, num(cleaned.proxyCooldownMs ?? config.proxyCooldownMs, config.proxyCooldownMs))
@@ -2707,7 +2740,8 @@ function handleLogs(req, res) {
 }
 
 // GET lists the pool (credentials masked), POST adds one line or a batch,
-// DELETE removes one by id or `{"all": true}`.
+// PATCH `{"id","enabled"}` toggles one in or out of rotation, DELETE removes
+// one by id or `{"all": true}`.
 async function handleProxies(req, res) {
   if (!adminAuth(req, res)) return
   if (req.method === "GET") return json(res, 200, proxyStatus())
@@ -2726,10 +2760,21 @@ async function handleProxies(req, res) {
     if (added.length) log(`proxies: added ${added.length} (${config.proxies.length} total)`)
     return json(res, errors.length && !added.length ? 400 : 200, { added: added.length, duplicates: proxies.length - added.length, errors, ...proxyStatus() })
   }
+  if (req.method === "PATCH") {
+    const url = current.find((u) => proxyId(u) === body.id)
+    if (!url) return json(res, 404, { error: "no such proxy" })
+    if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be true or false" })
+    const off = (config.disabledProxies ?? []).filter((id) => id !== body.id)
+    if (!body.enabled) off.push(body.id)
+    saveConfig({ disabledProxies: off })
+    log(`proxies: ${maskProxy(url)} ${body.enabled ? "enabled" : "disabled"}`)
+    return json(res, 200, proxyStatus())
+  }
   if (req.method === "DELETE") {
     const next = body.all === true ? [] : current.filter((u) => proxyId(u) !== body.id)
     if (next.length === current.length && body.all !== true) return json(res, 404, { error: "no such proxy" })
-    saveConfig({ proxies: next })
+    const kept = new Set(next.map(proxyId))
+    saveConfig({ proxies: next, disabledProxies: (config.disabledProxies ?? []).filter((id) => kept.has(id)) })
     log(`proxies: removed ${current.length - next.length} (${next.length} left)`)
     return json(res, 200, { removed: current.length - next.length, ...proxyStatus() })
   }

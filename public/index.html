@@ -794,23 +794,26 @@ async function refreshProxies(data) {
   if (document.activeElement?.id !== "pxStrategy") $("pxStrategy").value = d.strategy
   if (document.activeElement?.id !== "pxCooldown") $("pxCooldown").value = d.cooldownMs
   if (document.activeElement?.id !== "pxHealth") $("pxHealth").value = d.healthChecks
-  const live = d.proxies.filter((p) => !p.coolingMs).length
-  $("proxyCount").textContent = d.proxies.length ? `${live} / ${d.proxies.length} live` : "direct"
+  const live = d.proxies.filter((p) => p.enabled && !p.coolingMs).length
+  const off = d.proxies.filter((p) => !p.enabled).length
+  $("proxyCount").textContent = d.proxies.length ? `${live} / ${d.proxies.length} live` + (off ? ` · ${off} off` : "") : "direct"
   const tb = $("proxyTable").querySelector("tbody")
   if (!d.proxies.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">no proxies, so upstream traffic goes direct.</td></tr>'; return }
   tb.innerHTML = d.proxies.map((p) => {
-    const status = p.coolingMs
+    const status = !p.enabled
+      ? `<span class="badge mut">off</span>`
+      : p.coolingMs
       ? `<span class="badge bad" tabindex="0" data-tip="${escapeAttr(p.lastError)}">cooling ${Math.ceil(p.coolingMs / 1000)}s</span>`
       : p.lastError ? `<span class="badge warn" tabindex="0" data-tip="${escapeAttr(p.lastError)}">live</span>`
       : `<span class="badge ok">live</span>`
     const last = p.lastMs ? `${p.lastStatus || "–"} · ${fmtDur(p.lastMs)}` : "–"
-    return `<tr>
+    return `<tr${p.enabled ? "" : ' style="opacity:.55"'}>
       <td class="mono">${escapeHtml(p.url)}</td>
       <td>${status}</td>
       <td class="mono">${p.uses}</td>
       <td class="mono">${p.fails}</td>
       <td class="mono" id="px-${escapeAttr(p.id)}">${last}</td>
-      <td class="row" style="gap:10px"><button onclick='testProxy(${jsStr(p.id)})'>Check</button><button onclick='removeProxy(${jsStr(p.id)})'>✕</button></td>
+      <td class="row" style="gap:10px"><button onclick='testProxy(${jsStr(p.id)})'>Check</button><button onclick='toggleProxy(${jsStr(p.id)}, ${!p.enabled})'>${p.enabled ? "Disable" : "Enable"}</button><button onclick='removeProxy(${jsStr(p.id)})'>✕</button></td>
     </tr>`
   }).join("")
 }
@@ -823,6 +826,13 @@ async function addProxies() {
   const msg = `Added ${r.added || 0}` + (r.duplicates ? `, ${r.duplicates} already there` : "") + (r.errors?.length ? `, ${r.errors.length} invalid (listed in the box)` : "")
   toast(msg, r.errors?.length ? "bad" : "ok")
   if (r.proxies) refreshProxies(r)
+}
+
+async function toggleProxy(id, enabled) {
+  const r = await api("/api/proxies", { method: "PATCH", body: JSON.stringify({ id, enabled }) })
+  if (!r.proxies) { toast(r.error || "Toggle failed", "bad"); return }
+  toast(enabled ? "Proxy enabled" : "Proxy disabled: out of rotation")
+  refreshProxies(r)
 }
 
 async function removeProxy(id) {

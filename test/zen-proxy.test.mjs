@@ -2997,7 +2997,23 @@ function listen(server) {
 async function startProxyRig() {
   const seen = { upstream: [], connect: 0, socks: 0 }
   const upstream = http.createServer((req, res) => {
-    seen.upstream.push({ url: req.url, method: req.method, host: req.headers.host })
+    seen.upstream.push({ url: req.url, method: req.method, host: req.headers.host, session: req.headers["x-opencode-session"], sessionId: req.headers["x-opencode-session-id"] })
+    if (req.url.startsWith("/big")) {
+      // 256MB, written only as fast as the socket drains, so `bigWritten` shows
+      // how far ahead of the reader upstream was allowed to get.
+      res.writeHead(200, { "content-type": "application/octet-stream" })
+      res.on("error", () => {})
+      const chunk = Buffer.alloc(64 * 1024, 120)
+      seen.bigWritten = 0
+      const pump = () => {
+        while (seen.bigWritten < 256 * 1024 * 1024) {
+          seen.bigWritten += chunk.length
+          if (!res.write(chunk)) return res.once("drain", pump)
+        }
+        res.end()
+      }
+      return pump()
+    }
     if (req.url.startsWith("/limited")) {
       res.writeHead(429, { "content-type": "application/json" })
       return res.end('{"error":{"type":"rate_limit"}}')
@@ -3163,6 +3179,13 @@ describe("proxy rotation", () => {
     for (let i = 0; i < 30; i++) assert.notEqual(zp.pickProxy(), A)
   })
 
+  test("a disabled proxy is skipped, and disabling all is an error, not direct", () => {
+    zp.saveConfig({ proxyStrategy: "failover", disabledProxies: [zp.proxyId(A)] })
+    assert.equal(zp.pickProxy(), B)
+    zp.saveConfig({ disabledProxies: [A, B, C].map(zp.proxyId) })
+    assert.throws(() => zp.pickProxy(), (e) => e.code === "NO_PROXY" && /disabled/.test(e.message))
+  })
+
   test("all proxies cooling down is an error, never a silent direct call", () => {
     for (const p of [A, B, C]) zp.proxyStat(p).cooldownUntil = Date.now() + 60_000
     assert.throws(() => zp.pickProxy(), (e) => e.code === "NO_PROXY")
@@ -3226,6 +3249,35 @@ describe("proxy transport", () => {
     assert.ok(direct)
   })
 
+  test("a slow reader pushes back instead of buffering the whole body", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy] })
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/big`, {})
+    const reader = r.body.getReader()
+    await reader.read()
+    // Unthrottled, a local upstream gets >100MB ahead in this window.
+    await new Promise((res) => setTimeout(res, 1000))
+    assert.ok(rig.seen.bigWritten < 16 * 1024 * 1024, `upstream got ${rig.seen.bigWritten} bytes ahead of a reader that took one chunk`)
+    await reader.cancel()
+  })
+
+  test("each proxy gets its own minted session; a client's own session is kept", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "round-robin", injectSession: true })
+    const req = mockReq({ remoteAddress: "127.0.0.1" })
+    const sent = async (r) => {
+      const before = rig.seen.upstream.length
+      const res = await zp.upstreamFetch(`${rig.upstreamUrl}/chat`, { method: "POST", headers: zp.zenHeaders(r, "Bearer public"), body: "{}" }, { req: r })
+      await res.text()
+      return rig.seen.upstream.slice(before).at(-1)
+    }
+    const [a, b, a2] = [await sent(req), await sent(req), await sent(req)]
+    assert.notEqual(a.session, b.session, "a new exit IP gets a new session")
+    assert.equal(a.session, a2.session, "the same proxy keeps its session")
+    assert.equal(a.session, a.sessionId, "the header pair stays matched")
+    const own = mockReq({ headers: { "x-opencode-session": "ses_client_owned" } })
+    assert.equal((await sent(own)).session, "ses_client_owned")
+    assert.equal((await sent(own)).session, "ses_client_owned")
+  })
+
   test("chat answers 503 at once when every proxy is cooling down", async () => {
     zp.saveConfig({ proxies: [rig.httpProxy] })
     zp.proxyStat(rig.httpProxy).cooldownUntil = Date.now() + 60_000
@@ -3249,9 +3301,18 @@ describe("proxy transport", () => {
     await zp.handleProxyTest(mockReq({ _body: "{}" }), res)
     out = JSON.parse(res.body)
     assert.deepEqual(out.results.map((r) => r.ok), [true, false])
+    const badId = out.proxies[1].id
     res = mockRes()
-    await zp.handleProxies(mockReq({ method: "DELETE", _body: JSON.stringify({ id: out.proxies[1].id }) }), res)
+    await zp.handleProxies(mockReq({ method: "PATCH", _body: JSON.stringify({ id: badId, enabled: false }) }), res)
+    assert.equal(JSON.parse(res.body).proxies[1].enabled, false)
+    assert.deepEqual(zp.config.disabledProxies, [badId])
+    res = mockRes()
+    await zp.handleApiConfig(mockReq({ method: "PUT", _body: JSON.stringify({ disabledProxies: [] }) }), res)
+    assert.deepEqual(zp.config.disabledProxies, [badId], "PUT /api/config cannot re-enable it")
+    res = mockRes()
+    await zp.handleProxies(mockReq({ method: "DELETE", _body: JSON.stringify({ id: badId }) }), res)
     assert.deepEqual(zp.config.proxies, [rig.httpProxy])
+    assert.deepEqual(zp.config.disabledProxies, [], "a removed proxy leaves no disabled id behind")
   })
 })
 

@@ -159,6 +159,7 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 | `autoSync` / `autoSyncIntervalMs` | `true` / `3600000` | Runtime discovery of newly-offered free models |
 | `trustForwarded` | `false` | Honour `x-forwarded-for` behind a reverse proxy |
 | `proxies` | `[]` | Outbound proxy URLs; manage them in the dashboard's Proxies tab or via `/api/proxies` |
+| `disabledProxies` | `[]` | Ids of proxies kept in the list but out of rotation; toggled from the dashboard or `PATCH /api/proxies` |
 | `proxyStrategy` | `round-robin` | `round-robin`, `random`, `sticky`, `least-used` or `failover` |
 | `proxyCooldownMs` | `60000` | How long a failing or rate-limited proxy sits out |
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: how probes, sync, model TEST, `/health` and `/v1/models` reach upstream |
@@ -171,7 +172,7 @@ Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set
 <details>
 <summary>Outbound proxies and rotation</summary>
 
-Upstream traffic can leave through a pool of proxies instead of your own IP. Manage it from the dashboard's **Proxies** tab: paste one proxy or a whole batch, pick a rotation strategy, and check each proxy with one click. No proxies configured means traffic goes direct, exactly as before.
+Upstream traffic can leave through a pool of proxies instead of your own IP. Manage it from the dashboard's **Proxies** tab: paste one proxy or a whole batch, pick a rotation strategy, check each proxy with one click, and **Disable** / **Enable** one to take it out of rotation without deleting it. No proxies configured means traffic goes direct, exactly as before. Disabling every proxy does not go direct: requests fail until one is enabled again, and only **Remove all** means direct.
 
 Accepted lines (one per line, or comma-separated):
 
@@ -194,6 +195,10 @@ HTTP, HTTPS (TLS to the proxy) and SOCKS5 with username/password are supported. 
 | `failover` | always the first live proxy, the next one only after a failure |
 
 A proxy that fails to connect, rejects its credentials, or gets a `429` from upstream sits out `proxyCooldownMs`, and the normal retry loop moves on to the next one. `403` responses do not bench a proxy: they come from the free-tier gate, not from the IP. When every proxy is cooling down, requests fail with `503` instead of quietly going out from your own IP. A successful **Check** brings a proxy back early.
+
+Each proxy gets its own `x-opencode-session` id, so a new exit IP also looks like a new session upstream rather than the same client on a different address. A session the client sends itself is left untouched.
+
+Proxied response bodies are read with backpressure: when the reader falls behind, the tunnel stops reading and upstream is held back over TCP, so a large body is not buffered in memory.
 
 `proxyHealthChecks` decides how model probes, sync, the model **TEST** button, `/health` and `/v1/models` reach upstream: `proxy` (through the pool) or `direct`. Use `direct` to tell a dead model from a dead proxy. The npm lookup behind `autoUA` always goes direct.
 
@@ -228,6 +233,7 @@ Passwords are masked everywhere they are shown (dashboard, `/api/config`, `/api/
 | `POST` | `/api/reset` | Reset request statistics |
 | `GET` | `/api/proxies` | Proxy pool with per-proxy stats (credentials masked) |
 | `POST` | `/api/proxies` | Add proxies — `{"text":"one or many lines","scheme":"http\|https\|socks5"}` |
+| `PATCH` | `/api/proxies` | Take one in or out of rotation — `{"id":"...","enabled":false}` |
 | `DELETE` | `/api/proxies` | Remove one — `{"id":"..."}` — or all — `{"all":true}` |
 | `POST` | `/api/proxies/test` | Reach upstream through one proxy (`{"id":"..."}`) or all of them (`{}`) |
 </details>
