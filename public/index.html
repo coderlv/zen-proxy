@@ -257,6 +257,7 @@ tbody tr:last-child td { border-bottom:none }
 
 .empty { font-family:var(--serif); font-style:italic; color:var(--muted); text-align:center; padding:38px; font-size:15px }
 tr.has-detail { cursor:pointer }
+tr.has-detail td:first-child { white-space:nowrap }
 tr.has-detail td:first-child::before { content:"▸ "; color:var(--muted) }
 tr.has-detail.open td:first-child::before { content:"▾ " }
 tr.detail td { background:var(--paper2); font-family:var(--mono); font-size:11.5px; line-height:1.8; white-space:normal; word-break:break-word }
@@ -405,7 +406,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <h2><span class="hh">Recent requests</span><span class="sticker grape" style="transform:none">live feed</span></h2>
       <div class="row" style="margin-bottom:12px">
         <div class="seg" id="reqShow"><button data-f="" class="on">All</button><button data-f="errors">Errors only</button></div>
-        <select id="reqModel" onchange="tablePage = 1; refreshStatus()"><option value="">all models</option></select>
+        <select id="reqModel" style="width:auto" onchange="tablePage = 1; refreshStatus()"><option value="">all models</option></select>
       </div>
       <table id="reqTable">
         <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>TTFT</th><th>tok/s</th><th>In</th><th>Cache</th><th>Out</th><th>Reasoning</th><th>Count</th></tr></thead>
