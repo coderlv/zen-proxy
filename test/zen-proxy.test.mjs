@@ -3629,6 +3629,26 @@ describe("token analytics", () => {
     assert.ok(a.totals.tokensPerSec > 0)
   })
 
+  test("failed calls are filed by cause, per period and per hour", async () => {
+    const ev = { model: "m1", mode: "direct" }
+    for (const status of [429, 400, 502, 0]) zp.recordUsage({ ...ev, status })
+    zp.recordUsage({ ...ev, status: 503, reason: "noproxy" })
+    // a pre-cause bucket: errors it cannot explain show up as unknown
+    zp.recordUsage({ ...ev, status: 200 })
+    for (const b of zp.usageBuckets.values()) b.errors += 2
+    // the reader hanging up is its own count, not an error; a cut body is the network
+    const hangUp = zp.meterResponse(usageSse([{ choices: [{ delta: { content: "x" } }] }], null, { gapMs: 50 }), ev, Date.now())
+    const rd = hangUp.body.getReader()
+    await rd.read()
+    await rd.cancel()
+    const cut = zp.meterResponse(new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array([100])); setTimeout(() => c.error(new Error("aborted")), 5) } }), { headers: { "content-type": "text/event-stream" } }), ev, Date.now())
+    await assert.rejects(cut.text())
+    const a = zp.analytics("24h")
+    assert.deepEqual(a.totals.byCause, { e429: 1, e4xx: 1, e5xx: 1, eNet: 2, eNoProxy: 1, eAbort: 1, unknown: 2 })
+    assert.equal(a.totals.errors, 8)
+    assert.equal(a.series.at(-1).errors.e5xx, 1, "the chart gets the same split per slot")
+  })
+
   test("Responses-style deltas count as the first token too", async () => {
     const src = usageSse(
       [{ type: "response.output_text.delta", delta: "Hi" }],

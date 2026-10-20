@@ -562,8 +562,8 @@ async function upstreamFetch(url, init = {}, opts = {}) {
   try {
     r = await routeUpstream(url, init, opts, ev)
   } catch (err) {
-    // NO_PROXY never reached a model, and an abort is the client leaving.
-    if (err?.code !== "NO_PROXY" && !init.signal?.aborted) recordUsage({ ...ev, status: 0 })
+    // A thrown abort here is our own non-stream timeout: clients that leave do not abort it.
+    recordUsage(err?.code === "NO_PROXY" ? { ...ev, status: 503, reason: "noproxy" } : { ...ev, status: 0 })
     throw err
   }
   if (!r.ok) {
@@ -1477,7 +1477,7 @@ const usageBuckets = new Map()
 let usageDirty = false
 
 function emptyBucket(h, model, mode) {
-  return { h, model, mode, calls: 0, errors: 0, e429: 0, input: 0, cached: 0, output: 0, reasoning: 0, ttftSum: 0, ttftN: 0, speedOut: 0, speedMs: 0 }
+  return { h, model, mode, calls: 0, errors: 0, e429: 0, e4xx: 0, e5xx: 0, eNet: 0, eNoProxy: 0, eAbort: 0, input: 0, cached: 0, output: 0, reasoning: 0, ttftSum: 0, ttftN: 0, speedOut: 0, speedMs: 0 }
 }
 
 function localMidnight(t) {
@@ -1487,7 +1487,7 @@ function localMidnight(t) {
 }
 
 function addToBucket(b, src) {
-  for (const k of ["calls", "errors", "e429", "input", "cached", "output", "reasoning", "ttftSum", "ttftN", "speedOut", "speedMs"]) b[k] += src[k] ?? 0
+  for (const k of ["calls", "errors", "e429", "e4xx", "e5xx", "eNet", "eNoProxy", "eAbort", "input", "cached", "output", "reasoning", "ttftSum", "ttftN", "speedOut", "speedMs"]) b[k] += src[k] ?? 0
 }
 
 // Chat and Responses report usage in different shapes; both carry the cached
@@ -1501,8 +1501,10 @@ function normalizeUsage(u) {
   return { input: +input || 0, output: +output || 0, cached: +cached || 0, reasoning: +reasoning || 0 }
 }
 
-// `ev`: { model, mode, status, at?, usage?, ttftMs?, genMs? }. A status other
-// than 200 is a failed call.
+// `ev`: { model, mode, status, at?, usage?, ttftMs?, genMs?, reason? }. A status
+// other than 200 is a failed call, filed by cause: status 0 is the network or
+// proxy, reason "noproxy" is an empty pool. Reason "abort" (the client left or
+// the relay timed out) is counted on its own, not as an error.
 function recordUsage(ev) {
   const at = ev.at ?? Date.now()
   const h = Math.floor(at / HOUR) * HOUR
@@ -1510,9 +1512,14 @@ function recordUsage(ev) {
   let b = usageBuckets.get(key)
   if (!b) usageBuckets.set(key, (b = emptyBucket(h, ev.model, ev.mode)))
   b.calls++
-  if (ev.status !== 200) {
+  if (ev.reason === "abort") b.eAbort++
+  else if (ev.status !== 200) {
     b.errors++
-    if (ev.status === 429) b.e429++
+    if (ev.reason === "noproxy") b.eNoProxy++
+    else if (ev.status === 429) b.e429++
+    else if (ev.status >= 500) b.e5xx++
+    else if (ev.status >= 400) b.e4xx++
+    else b.eNet++
   }
   const u = ev.usage
   if (u) {
@@ -1586,6 +1593,12 @@ function meterResponse(r, ev, start, req) {
       if (req && usage) req.zenUsage = usage
       if (req && first) req.zenSpeed = { ttftMs: first - start, tps: usage?.output > 0 && end - first >= 100 ? Math.round((usage.output / (end - first)) * 10_000) / 10 : null }
     },
+    // A body that never finished: an Error is the upstream or proxy cutting it,
+    // anything else is the reader (client gone, relay timeout) hanging up.
+    // shortcut: transformer cancel needs Node 22+; older Node just misses these calls.
+    cancel(why) {
+      recordUsage(why instanceof Error ? { ...ev, status: 0 } : { ...ev, status: 0, reason: "abort" })
+    },
   })
   return new Response(r.body.pipeThrough(tap), { status: r.status, statusText: r.statusText, headers: r.headers })
 }
@@ -1637,6 +1650,8 @@ function sumBuckets(list) {
     calls: t.calls,
     errors: t.errors,
     e429: t.e429,
+    // Buckets written before causes were tracked only know "errors" and "e429".
+    byCause: { e429: t.e429, e4xx: t.e4xx, e5xx: t.e5xx, eNet: t.eNet, eNoProxy: t.eNoProxy, eAbort: t.eAbort, unknown: t.errors - t.e429 - t.e4xx - t.e5xx - t.eNet - t.eNoProxy },
     input: t.input,
     cached: t.cached,
     output: t.output,
@@ -1668,7 +1683,7 @@ function analytics(range = "24h", now = Date.now()) {
   const step = range === "today" || range === "24h" ? "hour" : "day"
   const slots = new Map()
   for (let t = from; t <= now; t = step === "hour" ? t + HOUR : localMidnight(t + DAY + HOUR)) {
-    slots.set(t, { t, fresh: 0, cached: 0, output: 0 })
+    slots.set(t, { t, fresh: 0, cached: 0, output: 0, errors: emptyBucket(t, "", "") })
   }
   for (const b of inRange) {
     const slot = slots.get(step === "hour" ? b.h : localMidnight(b.h))
@@ -1676,6 +1691,7 @@ function analytics(range = "24h", now = Date.now()) {
     slot.fresh += b.input - b.cached
     slot.cached += b.cached
     slot.output += b.output
+    addToBucket(slot.errors, b)
   }
 
   const group = (keyOf) => {
@@ -1694,7 +1710,7 @@ function analytics(range = "24h", now = Date.now()) {
     step,
     totals: sumBuckets(inRange),
     prev,
-    series: [...slots.values()],
+    series: [...slots.values()].map(({ errors, ...s }) => ({ ...s, errors: sumBuckets([errors]).byCause })),
     models: group((b) => b.model).sort((a, b) => b.tokens - a.tokens),
     modes: group((b) => b.mode),
   }

@@ -162,7 +162,7 @@ main { max-width:1120px; margin:28px auto 70px; padding:0 18px }
 .cards .card.hero .sub { color:var(--ink) }
 
 /* ---------- analytics ---------- */
-.an { --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a }
+.an { --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#008300; --s0:#b5ad9c }
 .an .cards { grid-template-columns:repeat(4,1fr) }
 @media (max-width:1000px) { .an .cards { grid-template-columns:repeat(2,1fr) } }
 .seg { display:inline-flex; border:var(--line); border-radius:999px; overflow:hidden; background:var(--card) }
@@ -433,6 +433,13 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <h2><span class="hh" id="anChartTitle">Tokens per hour</span></h2>
       <div class="legend"><span><i style="background:var(--s1)"></i>input, not cached</span><span><i style="background:var(--s2)"></i>input from cache</span><span><i style="background:var(--s3)"></i>output</span></div>
       <svg class="an-chart" id="anChart" viewBox="0 0 900 220" role="img" aria-label="Tokens over time"></svg>
+    </div>
+
+    <div class="panel">
+      <h2><span class="hh" id="anErrTitle">Failed calls per hour</span></h2>
+      <div class="legend" id="anErrLegend"></div>
+      <svg class="an-chart" id="anErrChart" viewBox="0 0 900 180" role="img" aria-label="Failed calls over time, by cause"></svg>
+      <p class="hint">Upstream 4xx / 5xx: the provider refused or broke. Network / proxy: the connection failed, timed out or the stream was cut. No live proxy: every proxy was cooling down. Aborted: the client hung up or the stream timed out; not counted as an error. Unknown: calls recorded before causes were tracked.</p>
     </div>
 
     <div class="panel">
@@ -964,6 +971,7 @@ function renderAnalytics() {
   $("anCallsSub").textContent = t.calls ? `errors ${fmtPct(t.errors / t.calls)} · 429: ${t.e429}` : "–"
   $("anChartTitle").textContent = d.step === "hour" ? "Tokens per hour" : "Tokens per day"
   renderTokenChart(d)
+  renderErrorChart(d)
   renderModelTable(d)
   renderScatter(d)
   renderModes(d)
@@ -978,10 +986,12 @@ function anTip(e, html) {
   tip.style.top = e.clientY + 14 + "px"
 }
 
-function renderTokenChart(d) {
-  const svg = $("anChart"), W = 900, H = 220, L = 52, B = 24, T = 10
+// Stacked bars over the period's slots. `parts`: [[label, color, value(row)]];
+// `fmt` formats the axis, `tip(row)` the hover text.
+function stackedBars(svg, d, H, parts, fmt, tip) {
+  const W = 900, L = 52, B = 24, T = 10
   const rows = d.series
-  const total = (r) => r.fresh + r.cached + r.output
+  const total = (r) => parts.reduce((a, [, , v]) => a + v(r), 0)
   const max = Math.max(1, ...rows.map(total)) * 1.08
   const y = (v) => H - B - (v / max) * (H - B - T)
   const bw = (W - L) / Math.max(1, rows.length)
@@ -992,16 +1002,16 @@ function renderTokenChart(d) {
   let out = ""
   for (const f of [0, 0.5, 1]) {
     const v = (max / 1.08) * f, yy = y(v)
-    out += `<line x1="${L}" x2="${W}" y1="${yy}" y2="${yy}" stroke="rgba(26,22,18,.12)"/><text x="${L - 8}" y="${yy + 4}" text-anchor="end" font-size="10" fill="#7d7461" font-family="ui-monospace,Menlo,monospace">${fmtTok(Math.round(v))}</text>`
+    out += `<line x1="${L}" x2="${W}" y1="${yy}" y2="${yy}" stroke="rgba(26,22,18,.12)"/><text x="${L - 8}" y="${yy + 4}" text-anchor="end" font-size="10" fill="#7d7461" font-family="ui-monospace,Menlo,monospace">${fmt(v)}</text>`
   }
   const every = Math.ceil(rows.length / 8)
   rows.forEach((r, i) => {
     const x = L + i * bw + Math.min(3, bw * 0.15), w = Math.max(1, bw - Math.min(6, bw * 0.3))
     let base = 0
-    const parts = [[r.fresh, "var(--s1)"], [r.cached, "var(--s2)"], [r.output, "var(--s3)"]].filter(([v]) => v > 0)
-    parts.forEach(([v, c], k) => {
+    const segs = parts.map(([, c, v]) => [v(r), c]).filter(([v]) => v > 0)
+    segs.forEach(([v, c], k) => {
       const y0 = y(base), y1 = y(base + v)
-      const top = k === parts.length - 1
+      const top = k === segs.length - 1
       // 2px surface gap between stacked segments; only the top one is rounded.
       out += `<rect x="${x}" y="${y1}" width="${w}" height="${Math.max(0.5, y0 - y1 - (k ? 2 : 0))}" rx="${top ? Math.min(4, w / 2) : 0}" fill="${c}"/>`
       base += v
@@ -1014,9 +1024,29 @@ function renderTokenChart(d) {
     const i = e.target.dataset && e.target.dataset.i
     if (i == null) return anTip(e)
     const r = rows[i]
-    anTip(e, `<b>${escapeHtml(d.step === "hour" ? new Date(r.t).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }) : new Date(r.t).toLocaleDateString())}</b><br>input: ${fmtTok(r.fresh)}<br>from cache: ${fmtTok(r.cached)}<br>output: ${fmtTok(r.output)}<br>total: ${fmtTok(total(r))}`)
+    anTip(e, `<b>${escapeHtml(d.step === "hour" ? new Date(r.t).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }) : new Date(r.t).toLocaleDateString())}</b><br>${tip(r)}`)
   }
   svg.onmouseleave = (e) => anTip(e)
+}
+
+function renderTokenChart(d) {
+  const total = (r) => r.fresh + r.cached + r.output
+  stackedBars($("anChart"), d, 220, [["input", "var(--s1)", (r) => r.fresh], ["from cache", "var(--s2)", (r) => r.cached], ["output", "var(--s3)", (r) => r.output]],
+    (v) => fmtTok(Math.round(v)),
+    (r) => `input: ${fmtTok(r.fresh)}<br>from cache: ${fmtTok(r.cached)}<br>output: ${fmtTok(r.output)}<br>total: ${fmtTok(total(r))}`)
+}
+
+// Causes in fixed categorical order; unknown (old data) stays gray.
+const ERR_CAUSES = [["e429", "429 rate limit", "var(--s1)"], ["e4xx", "upstream 4xx", "var(--s2)"], ["e5xx", "upstream 5xx", "var(--s3)"], ["eNet", "network / proxy", "var(--s4)"], ["eNoProxy", "no live proxy", "var(--s5)"], ["eAbort", "aborted", "var(--s6)"], ["unknown", "unknown", "var(--s0)"]]
+function causeList(c) {
+  return ERR_CAUSES.filter(([k]) => c[k] > 0).map(([k, name]) => `${name}: ${c[k]}`).join("<br>") || "none"
+}
+function renderErrorChart(d) {
+  const c = d.totals.byCause
+  $("anErrTitle").textContent = d.step === "hour" ? "Failed calls per hour" : "Failed calls per day"
+  // Totals ride in the legend: several hues sit below 3:1 on the card, so the numbers carry identity too.
+  $("anErrLegend").innerHTML = ERR_CAUSES.filter(([k]) => k !== "unknown" || c.unknown > 0).map(([k, name, col]) => `<span><i style="background:${col}"></i>${name} · ${c[k]}</span>`).join("")
+  stackedBars($("anErrChart"), d, 180, ERR_CAUSES.map(([k, name, col]) => [name, col, (r) => r.errors[k]]), (v) => (v < 10 ? +v.toFixed(1) : Math.round(v)), (r) => causeList(r.errors))
 }
 
 function renderModelTable(d) {
@@ -1037,7 +1067,7 @@ function renderModelTable(d) {
         <td class="n">${fmtTok(m.output)}</td>
         <td class="n">${fmtMs(m.ttftMs)}</td>
         <td class="mono">${m.tokensPerSec == null ? "–" : `<span class="ibar" style="width:${Math.round((m.tokensPerSec / maxTps) * 120)}px"></span>${m.tokensPerSec}`}</td>
-        <td class="n">${fmtPct(m.errRate)}</td>
+        <td class="n"${m.errors || m.byCause.eAbort ? ` tabindex="0" data-tip="${escapeAttr(causeList(m.byCause).replace(/<br>/g, " · "))}"` : ""}>${fmtPct(m.errRate)}</td>
       </tr>`).join("")
     : '<tr><td colspan="8" class="empty">no calls in this period yet.</td></tr>'
 }
