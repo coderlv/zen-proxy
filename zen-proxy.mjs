@@ -1684,6 +1684,13 @@ if (isMain) {
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0))
 }
 
+// A failed model attempt goes to the log and to this request's Recent row, so
+// a fallback shows why it happened without digging through Logs.
+function noteAttempt(req, model, attempt, what) {
+  log(`${model} attempt ${attempt + 1} failed: ${what}`)
+  ;(req.zenAttempts ??= []).push({ model, what: what.slice(0, 160) })
+}
+
 function recordReq(req, model, ms, status, at = Date.now()) {
   const entry = { at, ip: clientIp(req), model, status, ms }
   const key = `${entry.at}|${entry.model}|${entry.status}`
@@ -1691,13 +1698,15 @@ function recordReq(req, model, ms, status, at = Date.now()) {
   // the response does); merged rows add theirs up.
   const u = req?.zenUsage
   const tok = u ? { input: u.input, output: u.output, reasoning: u.reasoning, cached: u.cached } : null
+  const info = req?.zenAttempts ? { attempts: req.zenAttempts } : null
   const last = requestStats.recent[requestStats.recent.length - 1]
   if (!last || last[0] !== key) {
-    requestStats.recent.push([key, 1, ms, tok])
+    requestStats.recent.push([key, 1, ms, tok, info])
     if (requestStats.recent.length > 200) requestStats.recent.shift()
   } else {
     last[1]++
     last[2] = ms
+    last[4] = info
     if (tok) last[3] = last[3] ? Object.fromEntries(Object.keys(tok).map((k) => [k, last[3][k] + tok[k]])) : tok
   }
   requestStats.total++
@@ -1923,7 +1932,7 @@ async function handleMessages(req, res) {
         }
         lastErr = { error: { type: "api_error", message: err.message } }
         lastStatus = 502
-        log(`${model} attempt ${attempt + 1} failed: ${err.message}`)
+        noteAttempt(req, model, attempt, err.message)
         if (attempt < retries) {
           delayMs = config.retryBackoffMs * (attempt + 1)
           continue
@@ -1971,7 +1980,7 @@ async function handleMessages(req, res) {
         lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
-      log(`${model} attempt ${attempt + 1} failed: ${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
+      noteAttempt(req, model, attempt, `${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
@@ -2078,7 +2087,7 @@ async function handleChat(req, res) {
         }
         lastErr = { error: { type: "upstream_error", message: err.message } }
         lastStatus = 502
-        log(`${model} attempt ${attempt + 1} failed: ${err.message}`)
+        noteAttempt(req, model, attempt, err.message)
         if (attempt < retries) {
           delayMs = config.retryBackoffMs * (attempt + 1)
           continue
@@ -2137,7 +2146,7 @@ async function handleChat(req, res) {
         lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
-      log(`${model} attempt ${attempt + 1} failed: ${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
+      noteAttempt(req, model, attempt, `${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
@@ -3105,7 +3114,7 @@ async function handleStatus(req, res) {
       error: syncState.error,
     },
     requests: { total: requestStats.total, errors: requestStats.errors, lastMinute, last5m },
-    recent: requestStats.recent.map(([k, count, ms, tok]) => ({ ...parseKey(k), count, ms, ...tok })),
+    recent: requestStats.recent.map(([k, count, ms, tok, info]) => ({ ...parseKey(k), count, ms, ...tok, ...info })),
   })
 }
 

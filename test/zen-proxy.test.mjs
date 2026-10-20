@@ -3567,6 +3567,22 @@ describe("token analytics", () => {
     assert.deepEqual(row[3], { input: 1200, output: 40, reasoning: 25, cached: 1000 })
   })
 
+  test("a fallback's Recent row lists each failed attempt and why", async () => {
+    zp.saveConfig({ proxies: [], defaultModel: "mimo-v2.5-free", fallbackModels: ["mimo-v2.5-free", "big-pickle"], retriesPerModel: 0 })
+    zp.requestStats.recent.length = 0
+    globalThis.fetch = async (_u, init) =>
+      JSON.parse(init.body).model === "mimo-v2.5-free"
+        ? new Response(JSON.stringify({ error: { message: "provider overloaded" } }), { status: 500, headers: { "content-type": "application/json" } })
+        : usageSse([{ choices: [{ delta: { content: "hi" } }] }])
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify({ model: "mimo-v2.5-free", max_tokens: 50, stream: true, messages: [{ role: "user", content: "x" }] }) }), res)
+    await res.done
+    await new Promise((r) => setTimeout(r, 20))
+    const row = zp.requestStats.recent.at(-1)
+    assert.match(row[0], /mimo-v2\.5-free→big-pickle\|200$/)
+    assert.deepEqual(row[4].attempts, [{ model: "mimo-v2.5-free", what: "500 provider overloaded" }])
+  })
+
   test("the meter measures TTFT and speed while passing bytes through untouched", async () => {
     const start = Date.now()
     await new Promise((r) => setTimeout(r, 30))

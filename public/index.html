@@ -256,6 +256,10 @@ tbody tr:last-child td { border-bottom:none }
 @media (prefers-reduced-motion: reduce) { .ztip { transition:none } }
 
 .empty { font-family:var(--serif); font-style:italic; color:var(--muted); text-align:center; padding:38px; font-size:15px }
+tr.has-detail { cursor:pointer }
+tr.has-detail td:first-child::before { content:"▸ "; color:var(--muted) }
+tr.has-detail.open td:first-child::before { content:"▾ " }
+tr.detail td { background:var(--paper2); font-family:var(--mono); font-size:11.5px; line-height:1.8; white-space:normal; word-break:break-word }
 .pager { display:flex; align-items:center; justify-content:flex-end; gap:12px; margin-top:16px }
 .pager button { padding:6px 13px; font-size:10.5px; box-shadow:3px 3px 0 var(--ink) }
 .pager button:active { box-shadow:0 0 0 var(--ink) }
@@ -681,7 +685,10 @@ function renderTable(recent) {
   const slice = rows.slice((tablePage - 1) * PAGE_SIZE, tablePage * PAGE_SIZE)
   tb.innerHTML = slice.map((r) => {
     const cls = r.status < 300 ? "ok" : r.status === 429 ? "warn" : "bad"
-    return `<tr>
+    const key = `${r.at}|${r.model}|${r.status}`
+    const detail = reqDetail(r)
+    const open = detail && openRows.has(key)
+    return `<tr${detail ? ` class="has-detail${open ? " open" : ""}" data-key="${escapeHtml(key)}" onclick="toggleRow(this)"` : ""}>
       <td class="mono">${fmtTime(r.at)}</td>
       <td class="mono">${escapeHtml(r.model)}</td>
       <td><span class="badge ${cls}">${r.status}</span></td>
@@ -690,7 +697,7 @@ function renderTable(recent) {
       <td class="mono">${fmtTok(r.output)}</td>
       <td class="mono">${fmtTok(r.reasoning)}</td>
       <td class="mono">${r.count}</td>
-    </tr>`
+    </tr>${open ? `<tr class="detail"><td colspan="8">${detail}</td></tr>` : ""}`
   }).join("")
   pager.innerHTML = `
     <button onclick="pageTable(-1)" ${tablePage <= 1 ? "disabled" : ""}>‹ prev</button>
@@ -698,6 +705,21 @@ function renderTable(recent) {
     <button onclick="pageTable(1)" ${tablePage >= pages ? "disabled" : ""}>next ›</button>`
 }
 function pageTable(d) { tablePage += d; refreshStatus() }
+// Expanded rows survive the live refresh: they are kept by row key.
+const openRows = new Set()
+function toggleRow(tr) {
+  const k = tr.dataset.key
+  openRows.has(k) ? openRows.delete(k) : openRows.add(k)
+  refreshStatus()
+}
+// The "why" behind a row: each failed model attempt, then who answered.
+function reqDetail(r) {
+  if (!r.attempts?.length) return ""
+  const served = r.model.split("→").pop()
+  const chain = r.attempts.map((a) => `<span class="badge bad">${escapeHtml(a.model)}</span> ${escapeHtml(a.what)}`)
+  if (r.status < 400) chain.push(`<span class="badge ok">${escapeHtml(served)}</span> ${r.status}`)
+  return `<b>Attempts</b><br>${chain.join("<br>→ ")}`
+}
 
 async function refreshModels() {
   const cfg = await api("/api/config")
