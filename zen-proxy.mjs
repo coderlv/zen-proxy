@@ -570,11 +570,15 @@ async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev)
     let r, failed
     try {
       r = await proxyAttempt(chosen, url, init, req, !health)
-      if (r.status !== 429) return r
+      if (r.status !== 429) {
+        if (req) req.zenProxy = maskProxy(chosen)
+        return r
+      }
     } catch (err) {
       if (init.signal?.aborted) throw err
       failed = err
     }
+    if (req) (req.zenProxyFails ??= []).push({ proxy: maskProxy(chosen), why: r ? "429" : failed.message.slice(0, 120) })
     let next
     try {
       if (i < tries) next = pickProxy(key)
@@ -1556,6 +1560,7 @@ function meterResponse(r, ev, start, req) {
       const end = Date.now()
       recordUsage({ ...ev, status: 200, usage, ttftMs: first ? first - start : null, genMs: first ? end - first : 0 })
       if (req && usage) req.zenUsage = usage
+      if (req && first) req.zenSpeed = { ttftMs: first - start, tps: usage?.output > 0 && end - first >= 100 ? Math.round((usage.output / (end - first)) * 10_000) / 10 : null }
     },
   })
   return new Response(r.body.pipeThrough(tap), { status: r.status, statusText: r.statusText, headers: r.headers })
@@ -1698,7 +1703,7 @@ function recordReq(req, model, ms, status, at = Date.now()) {
   // the response does); merged rows add theirs up.
   const u = req?.zenUsage
   const tok = u ? { input: u.input, output: u.output, reasoning: u.reasoning, cached: u.cached } : null
-  const info = req?.zenAttempts ? { attempts: req.zenAttempts } : null
+  const info = req && { attempts: req.zenAttempts, proxy: req.zenProxy, proxyFails: req.zenProxyFails, ...req.zenSpeed }
   const last = requestStats.recent[requestStats.recent.length - 1]
   if (!last || last[0] !== key) {
     requestStats.recent.push([key, 1, ms, tok, info])

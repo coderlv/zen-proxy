@@ -3325,8 +3325,11 @@ describe("proxy transport", () => {
   test("a tunnel cut before the first byte is retried on the next proxy", async () => {
     zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover", proxyRetries: 3 })
     Object.assign(rig.seen, { cutsLeft: 1, cutAfterFirst: false })
-    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/flaky`, {}, { req: mockReq(), model: DEFAULT_MODEL })
+    const req = mockReq()
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/flaky`, {}, { req, model: DEFAULT_MODEL })
     assert.equal(r.status, 200)
+    assert.equal(req.zenProxy, zp.maskProxy(rig.socksProxy), "the Recent row names the proxy that answered")
+    assert.deepEqual(req.zenProxyFails.map((f) => f.proxy), [zp.maskProxy(rig.httpProxy)])
     assert.equal(await r.text(), "data: one\n\ndata: [DONE]\n\n")
     assert.ok(zp.proxyStat(rig.httpProxy).cooldownUntil > Date.now(), "the proxy that dropped the stream is benched")
   })
@@ -3591,8 +3594,11 @@ describe("token analytics", () => {
       { choices: [], usage: { prompt_tokens: 100, completion_tokens: 40, prompt_tokens_details: { cached_tokens: 80 } } },
       { gapMs: 60 },
     )
-    const r = zp.meterResponse(src, { model: "m1", mode: "direct" }, start)
+    const req = {}
+    const r = zp.meterResponse(src, { model: "m1", mode: "direct" }, start, req)
     const text = await r.text()
+    assert.ok(req.zenSpeed.ttftMs >= 80, `row ttft ${req.zenSpeed.ttftMs}`)
+    assert.ok(req.zenSpeed.tps > 0, "the Recent row gets its own tok/s")
     assert.match(text, /Hel/)
     assert.match(text, /\[DONE\]/)
     const a = zp.analytics("24h")
