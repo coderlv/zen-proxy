@@ -2428,6 +2428,31 @@ describe("Anthropic Messages API layer", () => {
     assert.equal(tool.content, "contents")
   })
 
+  test("an assistant tool turn goes out as one message with its reasoning (DeepSeek 400s otherwise)", () => {
+    const out = zp.anthropicToChatBody(
+      {
+        messages: [
+          { role: "user", content: "do it" },
+          {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "need the file", signature: "" },
+              { type: "text", text: "Reading it." },
+              { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "/a" } },
+            ],
+          },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "contents" }] },
+          { role: "assistant", content: [{ type: "text", text: "Done." }, { type: "tool_use", id: "call_2", name: "Read", input: {} }] },
+        ],
+      },
+      "m",
+    )
+    const turns = out.messages.filter((m) => m.role === "assistant")
+    assert.equal(turns.length, 2, "text and tool calls are not split into two assistant messages")
+    assert.deepEqual([turns[0].content, turns[0].reasoning_content, turns[0].tool_calls[0].id], ["Reading it.", "need the file", "call_1"])
+    assert.equal(turns[1].reasoning_content, "", "a turn without thinking still carries the field")
+  })
+
   test("anthropic tools convert to chat function tools", () => {
     const tools = zp.anthropicToolsToChat([
       { name: "Read", description: "read it", input_schema: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] } },

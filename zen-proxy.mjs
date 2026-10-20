@@ -1064,6 +1064,7 @@ function anthropicToChatMessages(system, messages) {
     const blocks = Array.isArray(m?.content) ? m.content : []
     const toolCalls = []
     const parts = []
+    const thinking = []
     // A tool_result is its own chat message with role "tool", not part of the
     // surrounding user turn, so those are flushed out first.
     const flush = () => {
@@ -1078,6 +1079,7 @@ function anthropicToChatMessages(system, messages) {
     for (const b of blocks) {
       const type = b?.type
       if (type === "text") parts.push({ type: "text", text: b.text ?? "" })
+      else if (type === "thinking") thinking.push(b.thinking ?? "")
       else if (type === "image") {
         const url = anthropicImageUrl(b)
         if (url) parts.push({ type: "image_url", image_url: { url } })
@@ -1106,8 +1108,16 @@ function anthropicToChatMessages(system, messages) {
         if (images.length) out.push({ role: "user", content: images.map((url) => ({ type: "image_url", image_url: { url } })) })
       }
     }
+    // One assistant message carrying text, tool calls and reasoning together.
+    // DeepSeek's thinking mode answers 400 to a tool-call turn that comes back
+    // without its reasoning or split in two (text, then calls), and that 400
+    // walked every agent loop on to the next model. Other models ignore it.
+    if (role === "assistant" && toolCalls.length) {
+      const text = parts.filter((p) => p?.type === "text" && p.text).map((p) => p.text).join("")
+      out.push({ role, content: text, reasoning_content: thinking.join(""), tool_calls: toolCalls })
+      continue
+    }
     flush()
-    if (toolCalls.length) out.push({ role: "assistant", content: "", tool_calls: toolCalls })
   }
   if (!out.length) out.push({ role: "user", content: "" })
   return out
@@ -1905,6 +1915,7 @@ async function handleMessages(req, res) {
         }
         lastErr = { error: { type: "api_error", message: err.message } }
         lastStatus = 502
+        log(`${model} attempt ${attempt + 1} failed: ${err.message}`)
         if (attempt < retries) {
           delayMs = config.retryBackoffMs * (attempt + 1)
           continue
@@ -1952,6 +1963,7 @@ async function handleMessages(req, res) {
         lastErr = { error: { type: "api_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
+      log(`${model} attempt ${attempt + 1} failed: ${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
@@ -2058,6 +2070,7 @@ async function handleChat(req, res) {
         }
         lastErr = { error: { type: "upstream_error", message: err.message } }
         lastStatus = 502
+        log(`${model} attempt ${attempt + 1} failed: ${err.message}`)
         if (attempt < retries) {
           delayMs = config.retryBackoffMs * (attempt + 1)
           continue
@@ -2116,6 +2129,7 @@ async function handleChat(req, res) {
         lastErr = { error: { type: "upstream_error", message: `upstream returned ${upstreamRes.status}` } }
       }
       lastStatus = upstreamRes.status
+      log(`${model} attempt ${attempt + 1} failed: ${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)

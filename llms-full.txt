@@ -295,7 +295,9 @@ You don't need to change anything. When a fallback happens the response tells yo
 { "model": "mimo-v2.6-flash-free", "zen_served_by": "space-bunny-free", /* … */ }
 ```
 
-plus response headers `x-zen-served-by` and `x-zen-fallback: true`.
+plus response headers `x-zen-served-by` and `x-zen-fallback: true`. Each failed attempt is logged as `<model> attempt N failed: <status> <upstream message>` (dashboard Logs, `/api/logs`).
+
+On `/v1/messages`, an assistant turn with tool calls is sent upstream as a single chat message carrying its text, its `tool_calls` and `reasoning_content` (the turn's `thinking` blocks, `""` if none). DeepSeek's thinking mode rejects a tool turn without it, or split into a text message plus a tool-call message, with `400 The reasoning_content in the thinking mode must be passed back`; other models ignore the field.
 
 > The proxy deliberately does **not** fake opencode's tool schemas to get past this check. That gate is an access control, and the honest behaviour is to tell you which models are gated and let your real agent traffic use them.
 

@@ -129,7 +129,8 @@ The OpenAI-shaped routes get no name mapping, so they are handled differently: a
 - **A bare `curl` gets `403`.** The gateway only answers genuine *agent* traffic. Every agent above does this; a hand-rolled chat client won't.
 - **Health probes are agent-shaped.** Sync sends each model the same thing a real client sends — opencode's tool manifest plus `stream: true` — so `ok` means the model genuinely answered. A model marked `gate-blocked` is one the free-tier gate refused even for that shape; blocks lift on their own and the model is never dropped. Real traffic is still tracked on top (`ok (live traffic)`).
 - **Probing tells real health; the catalog tells existence.** A retired model answers `400 Model is unavailable` and is not added, while a live one answers with a stream — so the list reflects what actually works, not just what upstream advertises.
-- **Fallbacks announce themselves** via `zen_served_by` and the `x-zen-served-by` / `x-zen-fallback` headers.
+- **Fallbacks announce themselves** via `zen_served_by` and the `x-zen-served-by` / `x-zen-fallback` headers, and every failed model attempt is logged with its status and upstream message (dashboard Logs), so a frequent fallback can be traced to its cause.
+- **Thinking is passed back on tool turns.** On `/v1/messages` an assistant turn with tool calls goes upstream as one message with its `reasoning_content`; DeepSeek's thinking mode answers `400` otherwise, which used to send every agent loop to the next model.
 - **`agent-tools.json` is a capture of OpenCode's tools.** If OpenCode changes its tool schemas, the `/v1/messages` bridge may stop satisfying the gateway. Re-capture it from any OpenCode request.
 </details>
 
