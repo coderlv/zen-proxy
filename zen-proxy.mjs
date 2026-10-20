@@ -558,8 +558,41 @@ async function upstreamFetch(url, init = {}, opts = {}) {
 async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev) {
   const list = config.proxies ?? []
   if (!proxy && (!list.length || (health && config.proxyHealthChecks === "direct"))) return fetch(url, init)
-  const chosen = proxy ?? pickProxy(req ? sessionFor(req).value : "server")
   if (ev) ev.mode = config.proxySessionMode
+  if (proxy) return proxyAttempt(proxy, url, init, req, false)
+  // A dead tunnel, a body cut before its first byte, or a 429 (a per-IP limit)
+  // is the proxy's fault, not the model's: try the next proxy right here so the
+  // caller's model retries and fallback chain are never spent on it.
+  const tries = 1 + Math.max(0, Math.floor(Number(config.proxyRetries) || 0))
+  const key = req ? sessionFor(req).value : "server"
+  let chosen = pickProxy(key)
+  for (let i = 1; ; i++) {
+    let r, failed
+    try {
+      r = await proxyAttempt(chosen, url, init, req, !health)
+      if (r.status !== 429) return r
+    } catch (err) {
+      if (init.signal?.aborted) throw err
+      failed = err
+    }
+    let next
+    try {
+      if (i < tries) next = pickProxy(key)
+    } catch {}
+    if (!next) {
+      // Out of tries or out of live proxies: a 429 goes back as-is for the
+      // caller's usual handling; a transport failure is a pool verdict.
+      if (r) return r
+      const err = new Error(`no working proxy after ${i} attempt${i > 1 ? "s" : ""}, last: ${failed.message}`)
+      err.code = "NO_PROXY"
+      throw err
+    }
+    if (r) try { await r.body?.cancel() } catch {}
+    chosen = next
+  }
+}
+
+async function proxyAttempt(chosen, url, init, req, peek) {
   // Swap a minted session for this proxy's own; one the client brought is theirs.
   if (config.proxySessionMode !== "per-client" && init.headers?.[SESSION_HEADERS[0]]) {
     const sess = sessionFor(req, chosen)
@@ -573,15 +606,51 @@ async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev)
   st.uses++
   const t0 = Date.now()
   try {
-    const r = await proxiedFetch(chosen, url, init)
+    let r = await proxiedFetch(chosen, url, init)
     st.lastMs = Date.now() - t0
     st.lastStatus = r.status
     if (r.status === 429) proxyCooldown(chosen, "upstream 429 (rate limited)")
+    if (peek && r.ok && r.body) r = await withFirstChunk(r, chosen)
     return r
   } catch (err) {
     if (!init.signal?.aborted) proxyCooldown(chosen, err.message)
     throw err
   }
+}
+
+// Waits for the first body byte so a tunnel that dies right after the headers
+// throws here, while a retry is still possible. A cut later on cannot be
+// replayed; it only benches the proxy.
+// shortcut: no first-byte timeout (streams carry no signal), add one if hung proxies show up.
+async function withFirstChunk(r, chosen) {
+  const reader = r.body.getReader()
+  let first
+  try {
+    first = await reader.read()
+  } catch (err) {
+    reader.cancel().catch(() => {})
+    throw err
+  }
+  const body = new ReadableStream({
+    start(c) {
+      if (first.done) c.close()
+      else c.enqueue(first.value)
+    },
+    async pull(c) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) c.close()
+        else c.enqueue(value)
+      } catch (err) {
+        proxyCooldown(chosen, `stream cut: ${err.message}`)
+        c.error(err)
+      }
+    },
+    cancel(why) {
+      return reader.cancel(why)
+    },
+  })
+  return new Response(body, { status: r.status, statusText: r.statusText, headers: r.headers })
 }
 
 function proxyStatus(now = Date.now()) {
@@ -590,6 +659,7 @@ function proxyStatus(now = Date.now()) {
     strategy: config.proxyStrategy,
     sessionMode: config.proxySessionMode,
     cooldownMs: config.proxyCooldownMs,
+    retries: config.proxyRetries,
     healthChecks: config.proxyHealthChecks,
     strategies: PROXY_STRATEGIES,
     proxies: (config.proxies ?? []).map((url) => {
@@ -674,6 +744,7 @@ const DEFAULT_CONFIG = {
   disabledProxies: [],
   proxyStrategy: PROXY_STRATEGIES.includes(ENV.PROXY_STRATEGY) ? ENV.PROXY_STRATEGY : "round-robin",
   proxyCooldownMs: Number(ENV.PROXY_COOLDOWN_MS ?? 60_000),
+  proxyRetries: Number(ENV.PROXY_RETRIES ?? 3),
   // "proxy" = model probes, sync, /health and dashboard tests use the pool too;
   // "direct" = they go straight out, so you can tell a dead model from a dead proxy.
   proxyHealthChecks: ENV.PROXY_HEALTH_CHECKS === "direct" ? "direct" : "proxy",
@@ -2089,9 +2160,8 @@ async function* sseChunks(upstreamRes) {
     }
     if (buf.trim()) yield buf
   } finally {
-    try {
-      reader.cancel()
-    } catch {}
+    // cancel() on a stream that errored rejects; left alone that is an unhandled rejection.
+    reader.cancel().catch(() => {})
   }
 }
 
@@ -2345,7 +2415,9 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
       emit("message_stop", {})
       res.write("data: [DONE]\n\n")
       res.end()
-    } catch {
+    } catch (err) {
+      // Headers are long gone, so say it in-band rather than end as if finished.
+      if (!res.destroyed) emit("error", { error: { type: "api_error", message: `upstream stream lost: ${err?.message ?? err}` } })
       res.end()
     } finally {
       cleanup()
@@ -2909,6 +2981,7 @@ async function handleApiConfig(req, res) {
       if (cleaned.proxyHealthChecks != null) cleaned.proxyHealthChecks = cleaned.proxyHealthChecks === "direct" ? "direct" : "proxy"
       if (cleaned.proxySessionMode != null) cleaned.proxySessionMode = cleaned.proxySessionMode === "per-client" ? "per-client" : "per-proxy"
       cleaned.proxyCooldownMs = Math.max(0, num(cleaned.proxyCooldownMs ?? config.proxyCooldownMs, config.proxyCooldownMs))
+      cleaned.proxyRetries = Math.min(20, Math.max(0, Math.floor(num(cleaned.proxyRetries ?? config.proxyRetries, config.proxyRetries))))
       if (cleaned.probeAuth != null && !["auto", "key", "anonymous"].includes(String(cleaned.probeAuth))) {
         cleaned.probeAuth = "auto"
       }

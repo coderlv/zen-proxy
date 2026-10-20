@@ -173,10 +173,11 @@ Where things live — outside the install dir, so a reinstall or `git pull` neve
 | `disabledProxies` | `[]` | Ids of proxies kept in the list but out of rotation; toggled from the dashboard or `PATCH /api/proxies` |
 | `proxyStrategy` | `round-robin` | `round-robin`, `random`, `sticky`, `least-used` or `failover` |
 | `proxyCooldownMs` | `60000` | How long a failing or rate-limited proxy sits out |
+| `proxyRetries` | `3` | Extra proxies one request tries after a dead tunnel, a stream cut before its first byte, or a `429` (0–20) |
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: how probes, sync, model TEST, `/health` and `/v1/models` reach upstream |
 | `proxySessionMode` | `per-proxy` | `per-proxy`: each proxy gets its own session id. `per-client`: one session per client, only the IP rotates |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_HEALTH_CHECKS=direct` `PROXY_SESSION_MODE=per-client` `ZEN_PROXY_CONFIG` `ZEN_PROXY_STATS` (analytics file path)
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_RETRIES` `PROXY_HEALTH_CHECKS=direct` `PROXY_SESSION_MODE=per-client` `ZEN_PROXY_CONFIG` `ZEN_PROXY_STATS` (analytics file path)
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service.
 </details>
@@ -206,7 +207,7 @@ HTTP, HTTPS (TLS to the proxy) and SOCKS5 with username/password are supported. 
 | `least-used` | the live proxy with the fewest requests so far |
 | `failover` | always the first live proxy, the next one only after a failure |
 
-A proxy that fails to connect, rejects its credentials, or gets a `429` from upstream sits out `proxyCooldownMs`, and the normal retry loop moves on to the next one. `403` responses do not bench a proxy: they come from the free-tier gate, not from the IP. When every proxy is cooling down, requests fail with `503` instead of quietly going out from your own IP. A successful **Check** brings a proxy back early.
+A proxy that fails to connect, rejects its credentials, drops the stream, or gets a `429` from upstream sits out `proxyCooldownMs`. The same request is then retried right away on the next proxy, up to `proxyRetries` times, without spending the model's retries or falling back to another model; when those run out it fails with `503`. A stream cut after the first byte has already reached the client cannot be replayed: the proxy is benched, and `/v1/messages` clients get an `error` event instead of a reply that just stops. `403` responses do not bench a proxy: they come from the free-tier gate, not from the IP. When every proxy is cooling down, requests fail with `503` instead of quietly going out from your own IP. A successful **Check** brings a proxy back early.
 
 By default each proxy gets its own `x-opencode-session` id, so a new exit IP also looks like a new session upstream rather than the same client on a different address. Set `proxySessionMode` to `per-client` to keep one session per client and rotate only the IP; the Analytics tab compares what each mode does to the prompt cache. A session the client sends itself is left untouched either way.
 

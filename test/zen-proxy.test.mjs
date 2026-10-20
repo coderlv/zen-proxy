@@ -3050,6 +3050,19 @@ async function startProxyRig() {
       res.writeHead(429, { "content-type": "application/json" })
       return res.end('{"error":{"type":"rate_limit"}}')
     }
+    if (req.url.startsWith("/flaky")) {
+      // The first `cutsLeft` calls lose the connection right after the headers
+      // (or after one chunk, with `cutAfterFirst`), as a dying proxy does.
+      res.writeHead(200, { "content-type": "text/event-stream" })
+      if (seen.cutsLeft > 0) {
+        seen.cutsLeft--
+        res.flushHeaders()
+        if (seen.cutAfterFirst) res.write("data: one\n\n")
+        return setTimeout(() => res.socket.destroy(), 20)
+      }
+      res.write("data: one\n\n")
+      return setTimeout(() => res.end("data: [DONE]\n\n"), 20)
+    }
     if (req.url.startsWith("/sse")) {
       res.writeHead(200, { "content-type": "text/event-stream" })
       res.write("data: one\n\n")
@@ -3265,12 +3278,41 @@ describe("proxy transport", () => {
     assert.match(st.lastError, /407/)
   })
 
-  test("an upstream 429 benches that proxy and rotation moves on", async () => {
-    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover" })
+  test("an upstream 429 benches that proxy and the same call moves to the next one", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover", proxyRetries: 3 })
+    const before = rig.seen.upstream.length
     const r = await zp.upstreamFetch(`${rig.upstreamUrl}/limited`, {})
-    assert.equal(r.status, 429)
+    assert.equal(r.status, 429, "with every proxy benched the last 429 goes back as-is")
     await r.body?.cancel()
+    assert.equal(rig.seen.upstream.length - before, 2)
+    assert.throws(() => zp.pickProxy(), (e) => e.code === "NO_PROXY")
+  })
+
+  test("a tunnel cut before the first byte is retried on the next proxy", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover", proxyRetries: 3 })
+    Object.assign(rig.seen, { cutsLeft: 1, cutAfterFirst: false })
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/flaky`, {}, { req: mockReq(), model: DEFAULT_MODEL })
+    assert.equal(r.status, 200)
+    assert.equal(await r.text(), "data: one\n\ndata: [DONE]\n\n")
+    assert.ok(zp.proxyStat(rig.httpProxy).cooldownUntil > Date.now(), "the proxy that dropped the stream is benched")
+  })
+
+  test("a cut after the first byte cannot be replayed but still benches the proxy", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover" })
+    Object.assign(rig.seen, { cutsLeft: 1, cutAfterFirst: true })
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/flaky`, {}, { req: mockReq(), model: DEFAULT_MODEL })
+    await assert.rejects(r.text(), /aborted/)
+    assert.match(zp.proxyStat(rig.httpProxy).lastError, /stream cut/)
     assert.equal(zp.pickProxy(), rig.socksProxy)
+  })
+
+  test("proxy failures answer 503 once retries run out, without walking the model chain", async () => {
+    zp.saveConfig({ proxies: [rig.badHttpProxy], proxyCooldownMs: 0, proxyRetries: 2 })
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: DEFAULT_MODEL, messages: [{ role: "user", content: "x" }] }) }), res)
+    assert.equal(res.state.status, 503)
+    assert.match(res.body, /after 3 attempts.*407/)
+    zp.saveConfig({ proxyCooldownMs: 60_000 })
   })
 
   test("health checks can bypass the pool", async () => {
@@ -3360,6 +3402,33 @@ describe("proxy transport", () => {
     await zp.handleProxies(mockReq({ method: "DELETE", _body: JSON.stringify({ id: badId }) }), res)
     assert.deepEqual(zp.config.proxies, [rig.httpProxy])
     assert.deepEqual(zp.config.disabledProxies, [], "a removed proxy leaves no disabled id behind")
+  })
+})
+
+describe("a stream that dies mid-way", () => {
+  test("the Anthropic relay reports it in-band and leaks no unhandled rejection", async () => {
+    zp.saveConfig({ proxies: [] })
+    let leaked = 0
+    const onLeak = () => leaked++
+    process.on("unhandledRejection", onLeak)
+    const enc = new TextEncoder()
+    globalThis.fetch = async () =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
+            setTimeout(() => c.error(new Error("aborted")), 10)
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      )
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify({ model: DEFAULT_MODEL, max_tokens: 5, stream: true, messages: [{ role: "user", content: "x" }] }) }), res)
+    await res.done
+    await new Promise((r) => setTimeout(r, 50))
+    process.off("unhandledRejection", onLeak)
+    assert.match(res.body, /event: error[\s\S]*upstream stream lost/)
+    assert.equal(leaked, 0)
   })
 })
 
