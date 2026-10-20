@@ -605,23 +605,36 @@ async function proxyAttempt(chosen, url, init, req, peek) {
   const st = proxyStat(chosen)
   st.uses++
   const t0 = Date.now()
+  // Upstream holds its headers until the first token, so one deadline covers a
+  // proxy that hangs before the headers and one that hangs right after them.
+  // The caller's own signal (non-stream timeout) still aborts it too.
+  const ms = peek ? Math.max(0, Number(config.proxyFirstByteMs) || 0) : 0
+  const ctrl = ms ? new AbortController() : null
+  let timedOut = false
+  const timer = ms ? setTimeout(() => ((timedOut = true), ctrl.abort()), ms) : null
+  if (ctrl && init.signal) {
+    if (init.signal.aborted) ctrl.abort()
+    else init.signal.addEventListener("abort", () => ctrl.abort(), { once: true })
+  }
   try {
-    let r = await proxiedFetch(chosen, url, init)
+    let r = await proxiedFetch(chosen, url, ctrl ? { ...init, signal: ctrl.signal } : init)
     st.lastMs = Date.now() - t0
     st.lastStatus = r.status
     if (r.status === 429) proxyCooldown(chosen, "upstream 429 (rate limited)")
     if (peek && r.ok && r.body) r = await withFirstChunk(r, chosen)
     return r
   } catch (err) {
+    if (timedOut) err = new Error(`no first byte within ${ms} ms`)
     if (!init.signal?.aborted) proxyCooldown(chosen, err.message)
     throw err
+  } finally {
+    clearTimeout(timer)
   }
 }
 
 // Waits for the first body byte so a tunnel that dies right after the headers
 // throws here, while a retry is still possible. A cut later on cannot be
 // replayed; it only benches the proxy.
-// shortcut: no first-byte timeout (streams carry no signal), add one if hung proxies show up.
 async function withFirstChunk(r, chosen) {
   const reader = r.body.getReader()
   let first
@@ -660,6 +673,7 @@ function proxyStatus(now = Date.now()) {
     sessionMode: config.proxySessionMode,
     cooldownMs: config.proxyCooldownMs,
     retries: config.proxyRetries,
+    firstByteMs: config.proxyFirstByteMs,
     healthChecks: config.proxyHealthChecks,
     strategies: PROXY_STRATEGIES,
     proxies: (config.proxies ?? []).map((url) => {
@@ -745,6 +759,9 @@ const DEFAULT_CONFIG = {
   proxyStrategy: PROXY_STRATEGIES.includes(ENV.PROXY_STRATEGY) ? ENV.PROXY_STRATEGY : "round-robin",
   proxyCooldownMs: Number(ENV.PROXY_COOLDOWN_MS ?? 60_000),
   proxyRetries: Number(ENV.PROXY_RETRIES ?? 3),
+  // Generous on purpose: upstream sends nothing until the first token, and a
+  // big context on a slow free model can take a minute to get there.
+  proxyFirstByteMs: Number(ENV.PROXY_FIRST_BYTE_MS ?? 90_000),
   // "proxy" = model probes, sync, /health and dashboard tests use the pool too;
   // "direct" = they go straight out, so you can tell a dead model from a dead proxy.
   proxyHealthChecks: ENV.PROXY_HEALTH_CHECKS === "direct" ? "direct" : "proxy",
@@ -2478,7 +2495,10 @@ function relayStream(req, res, upstreamRes, requested, strip = false) {
           if (out) res.write(out)
         }
       }
-    } catch {
+    } catch (err) {
+      // OpenAI clients throw on a data chunk that carries `error`; without it a
+      // cut stream reads as a finished, shorter answer.
+      if (!res.destroyed) res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: `upstream stream lost: ${err?.message ?? err}` } })}\n\n`)
       res.end()
     } finally {
       cleanup()
@@ -2634,7 +2654,10 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false) {
       send([{ index: 0, delta: {}, finish_reason: strip ? "stop" : state.finish }], state.usage ? { usage: usageToChat(state.usage) } : {})
       res.write("data: [DONE]\n\n")
       res.end()
-    } catch {
+    } catch (err) {
+      // OpenAI clients throw on a data chunk that carries `error`; without it a
+      // cut stream reads as a finished, shorter answer.
+      if (!res.destroyed) res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: `upstream stream lost: ${err?.message ?? err}` } })}\n\n`)
       res.end()
     } finally {
       cleanup()
@@ -2982,6 +3005,7 @@ async function handleApiConfig(req, res) {
       if (cleaned.proxySessionMode != null) cleaned.proxySessionMode = cleaned.proxySessionMode === "per-client" ? "per-client" : "per-proxy"
       cleaned.proxyCooldownMs = Math.max(0, num(cleaned.proxyCooldownMs ?? config.proxyCooldownMs, config.proxyCooldownMs))
       cleaned.proxyRetries = Math.min(20, Math.max(0, Math.floor(num(cleaned.proxyRetries ?? config.proxyRetries, config.proxyRetries))))
+      cleaned.proxyFirstByteMs = Math.max(0, num(cleaned.proxyFirstByteMs ?? config.proxyFirstByteMs, config.proxyFirstByteMs))
       if (cleaned.probeAuth != null && !["auto", "key", "anonymous"].includes(String(cleaned.probeAuth))) {
         cleaned.probeAuth = "auto"
       }

@@ -3063,6 +3063,15 @@ async function startProxyRig() {
       res.write("data: one\n\n")
       return setTimeout(() => res.end("data: [DONE]\n\n"), 20)
     }
+    if (req.url.startsWith("/stall")) {
+      // The first `stallsLeft` calls send headers and then nothing at all.
+      res.writeHead(200, { "content-type": "text/event-stream" })
+      if (seen.stallsLeft > 0) {
+        seen.stallsLeft--
+        return res.flushHeaders()
+      }
+      return res.end("data: one\n\n")
+    }
     if (req.url.startsWith("/sse")) {
       res.writeHead(200, { "content-type": "text/event-stream" })
       res.write("data: one\n\n")
@@ -3306,6 +3315,17 @@ describe("proxy transport", () => {
     assert.equal(zp.pickProxy(), rig.socksProxy)
   })
 
+  test("a proxy that sends headers and then stalls is dropped after the first-byte timeout", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover", proxyRetries: 3, proxyFirstByteMs: 200 })
+    rig.seen.stallsLeft = 1
+    const t0 = Date.now()
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/stall`, {}, { req: mockReq(), model: DEFAULT_MODEL })
+    assert.equal(await r.text(), "data: one\n\n")
+    assert.ok(Date.now() - t0 < 2000)
+    assert.match(zp.proxyStat(rig.httpProxy).lastError, /no first byte within 200 ms/)
+    zp.saveConfig({ proxyFirstByteMs: 90_000 })
+  })
+
   test("proxy failures answer 503 once retries run out, without walking the model chain", async () => {
     zp.saveConfig({ proxies: [rig.badHttpProxy], proxyCooldownMs: 0, proxyRetries: 2 })
     const res = mockRes()
@@ -3406,29 +3426,55 @@ describe("proxy transport", () => {
 })
 
 describe("a stream that dies mid-way", () => {
-  test("the Anthropic relay reports it in-band and leaks no unhandled rejection", async () => {
-    zp.saveConfig({ proxies: [] })
+  // One event, then the upstream body errors, as a dropped proxy tunnel does.
+  const dying = (event) => async () =>
+    new Response(
+      new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`))
+          setTimeout(() => c.error(new Error("aborted")), 10)
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+  const run = async (handler, body) => {
     let leaked = 0
     const onLeak = () => leaked++
     process.on("unhandledRejection", onLeak)
-    const enc = new TextEncoder()
-    globalThis.fetch = async () =>
-      new Response(
-        new ReadableStream({
-          start(c) {
-            c.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'))
-            setTimeout(() => c.error(new Error("aborted")), 10)
-          },
-        }),
-        { status: 200, headers: { "content-type": "text/event-stream" } },
-      )
     const res = mockRes()
-    await zp.handleMessages(mockReq({ _body: JSON.stringify({ model: DEFAULT_MODEL, max_tokens: 5, stream: true, messages: [{ role: "user", content: "x" }] }) }), res)
+    await handler(mockReq({ _body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "x" }], ...body }) }), res)
     await res.done
     await new Promise((r) => setTimeout(r, 50))
     process.off("unhandledRejection", onLeak)
-    assert.match(res.body, /event: error[\s\S]*upstream stream lost/)
     assert.equal(leaked, 0)
+    return res.body
+  }
+  beforeEach(() => zp.saveConfig({ proxies: [] }))
+
+  test("the Anthropic relay reports it in-band and leaks no unhandled rejection", async () => {
+    globalThis.fetch = dying({ choices: [{ delta: { content: "hi" } }] })
+    const body = await run(zp.handleMessages, { model: DEFAULT_MODEL, max_tokens: 5 })
+    assert.match(body, /event: error[\s\S]*upstream stream lost/)
+  })
+
+  test("the chat relay ends with an error chunk, not a silent close", async () => {
+    globalThis.fetch = dying({ choices: [{ delta: { content: "hi" } }] })
+    const body = await run(zp.handleChat, { model: DEFAULT_MODEL })
+    const last = JSON.parse(body.trim().split("\n\n").at(-1).slice(5))
+    assert.match(last.error.message, /upstream stream lost/)
+    assert.doesNotMatch(body, /\[DONE\]/)
+  })
+
+  test("the Responses-backed chat relay does the same", async () => {
+    const prev = zp.config.responsesModels
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    try {
+      globalThis.fetch = dying({ type: "response.output_text.delta", delta: "hi" })
+      const body = await run(zp.handleChat, { model: "gpt-5.5" })
+      assert.match(body, /"content":"hi"[\s\S]*"error":\{[^}]*upstream stream lost/)
+    } finally {
+      zp.saveConfig({ responsesModels: prev })
+    }
   })
 })
 

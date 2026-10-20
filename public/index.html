@@ -486,6 +486,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
           </select>
           <label>Cooldown after a failure (ms)</label><input id="pxCooldown" type="number" min="0">
           <label>Retries on another proxy (dead tunnel, cut stream, 429)</label><input id="pxRetries" type="number" min="0" max="20">
+          <label>First-byte timeout, then the next proxy (ms, 0 = off)</label><input id="pxFirstByte" type="number" min="0">
         </div>
         <div>
           <label>Health checks (probes, sync, model TEST, /health)</label>
@@ -1039,6 +1040,7 @@ async function refreshProxies(data) {
   if (document.activeElement?.id !== "pxStrategy") $("pxStrategy").value = d.strategy
   if (document.activeElement?.id !== "pxCooldown") $("pxCooldown").value = d.cooldownMs
   if (document.activeElement?.id !== "pxRetries") $("pxRetries").value = d.retries
+  if (document.activeElement?.id !== "pxFirstByte") $("pxFirstByte").value = d.firstByteMs
   if (document.activeElement?.id !== "pxHealth") $("pxHealth").value = d.healthChecks
   if (document.activeElement?.id !== "pxSession") $("pxSession").value = d.sessionMode
   const live = d.proxies.filter((p) => p.enabled && !p.coolingMs).length
@@ -1107,6 +1109,7 @@ async function saveProxySettings() {
     proxyStrategy: $("pxStrategy").value,
     proxyCooldownMs: Number($("pxCooldown").value || 0),
     proxyRetries: Number($("pxRetries").value || 0),
+    proxyFirstByteMs: Number($("pxFirstByte").value || 0),
     proxyHealthChecks: $("pxHealth").value,
     proxySessionMode: $("pxSession").value,
   }) })
