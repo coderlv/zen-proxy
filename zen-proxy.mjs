@@ -480,8 +480,26 @@ function proxyStat(url) {
   return st
 }
 
+// Last hour of cooldowns, grouped by cause for the Proxies tab summary.
+// shortcut: in memory only, so a restart empties it.
+const proxyEvents = []
+function cooldownKind(why) {
+  if (/\b429\b/.test(why)) return "429"
+  if (/stream cut/.test(why)) return "stream cut"
+  if (/first byte/.test(why)) return "no first byte"
+  if (/\b407\b/.test(why)) return "proxy auth (407)"
+  if (/tls|socket|econn|etimedout|ehost|enet|epipe|disconnect|closed|hang up|timed? ?out|handshake|socks|connect|aborted/i.test(why)) return "connection"
+  return "other"
+}
+function recentProxyEvents(now = Date.now()) {
+  while (proxyEvents.length && proxyEvents[0].at < now - HOUR) proxyEvents.shift()
+  return proxyEvents
+}
+
 function proxyCooldown(url, why) {
   const st = proxyStat(url)
+  proxyEvents.push({ at: Date.now(), kind: cooldownKind(why) })
+  recentProxyEvents()
   st.fails++
   st.lastError = why
   st.cooldownUntil = Date.now() + Math.max(0, Number(config.proxyCooldownMs) || 0)
@@ -672,7 +690,13 @@ async function withFirstChunk(r, chosen) {
 
 function proxyStatus(now = Date.now()) {
   const off = new Set(config.disabledProxies ?? [])
+  const list = config.proxies ?? []
+  const disabled = list.filter((u) => off.has(proxyId(u))).length
+  const cooling = list.filter((u) => !off.has(proxyId(u)) && proxyStat(u).cooldownUntil > now).length
+  const reasons = {}
+  for (const e of recentProxyEvents(now)) reasons[e.kind] = (reasons[e.kind] ?? 0) + 1
   return {
+    summary: { total: list.length, live: list.length - disabled - cooling, cooling, disabled, lastHour: reasons },
     strategy: config.proxyStrategy,
     sessionMode: config.proxySessionMode,
     cooldownMs: config.proxyCooldownMs,
@@ -3442,6 +3466,7 @@ export {
   proxyStat,
   proxyState,
   proxyStatus,
+  cooldownKind,
   upstreamFetch,
   proxiedFetch,
   handleProxies,

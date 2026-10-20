@@ -187,7 +187,7 @@ Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set
 <details>
 <summary>Outbound proxies and rotation</summary>
 
-Upstream traffic can leave through a pool of proxies instead of your own IP. Manage it from the dashboard's **Proxies** tab: paste one proxy or a whole batch, pick a rotation strategy, check each proxy with one click, and **Disable** / **Enable** one to take it out of rotation without deleting it. No proxies configured means traffic goes direct, exactly as before. Disabling every proxy does not go direct: requests fail until one is enabled again, and only **Remove all** means direct.
+Upstream traffic can leave through a pool of proxies instead of your own IP. Manage it from the dashboard's **Proxies** tab: paste one proxy or a whole batch, pick a rotation strategy, check each proxy with one click, and **Disable** / **Enable** one to take it out of rotation without deleting it. A summary above the list shows how many proxies are live, cooling down and off, and what benched them in the last hour (connection, stream cut, no first byte, 429, proxy auth 407, other), so a pool of thousands reads at a glance. No proxies configured means traffic goes direct, exactly as before. Disabling every proxy does not go direct: requests fail until one is enabled again, and only **Remove all** means direct.
 
 Accepted lines (one per line, or comma-separated):
 

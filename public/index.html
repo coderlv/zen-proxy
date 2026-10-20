@@ -521,6 +521,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
         <button onclick="testProxy()">Check all</button>
         <button onclick="removeProxy()">Remove all</button>
       </div>
+      <div class="row" id="pxSummary" style="margin:0 0 12px;gap:8px"></div>
       <table id="proxyTable">
         <thead><tr><th>Proxy</th><th>Status</th><th>Uses</th><th>Fails</th><th>Last</th><th></th></tr></thead>
         <tbody></tbody>
@@ -1108,6 +1109,13 @@ async function refreshProxies(data) {
   const live = d.proxies.filter((p) => p.enabled && !p.coolingMs).length
   const off = d.proxies.filter((p) => !p.enabled).length
   $("proxyCount").textContent = d.proxies.length ? `${live} / ${d.proxies.length} live` + (off ? ` · ${off} off` : "") : "direct"
+  const sm = d.summary
+  const causes = Object.entries(sm.lastHour).sort((a, b) => b[1] - a[1])
+  $("pxSummary").innerHTML = !sm.total ? "" : `
+    <span class="badge ok">${sm.live.toLocaleString()} live</span>
+    <span class="badge bad">${sm.cooling.toLocaleString()} cooling</span>
+    <span class="badge mut">${sm.disabled.toLocaleString()} off</span>
+    <span class="hint" style="margin:0 0 0 8px">cooldowns in the last hour: ${causes.length ? causes.map(([k, n]) => `${escapeHtml(k)} <b>${n}</b>`).join(" · ") : "none"}</span>`
   const tb = $("proxyTable").querySelector("tbody")
   if (!d.proxies.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">no proxies, so upstream traffic goes direct.</td></tr>'; return }
   tb.innerHTML = d.proxies.map((p) => {

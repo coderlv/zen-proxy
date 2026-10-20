@@ -3306,10 +3306,27 @@ describe("proxy transport", () => {
 
   test("a 407 cools the proxy down and surfaces the reason", async () => {
     zp.saveConfig({ proxies: [rig.badHttpProxy] })
+    const before = zp.proxyStatus().summary.lastHour["proxy auth (407)"] ?? 0
     await assert.rejects(zp.upstreamFetch(`${rig.upstreamUrl}/x`, {}), /407/)
-    const st = zp.proxyStatus().proxies[0]
+    const d = zp.proxyStatus()
+    const st = d.proxies[0]
     assert.ok(st.coolingMs > 0)
     assert.match(st.lastError, /407/)
+    assert.equal(d.summary.lastHour["proxy auth (407)"], before + 1, "the pool summary counts it by cause")
+    assert.deepEqual([d.summary.live, d.summary.cooling, d.summary.disabled], [0, 1, 0])
+  })
+
+  test("cooldown causes group into a few readable kinds", () => {
+    const kinds = [
+      "Client network socket disconnected before secure TLS connection was established",
+      "stream cut: aborted",
+      "no first byte within 90000 ms",
+      "upstream 429 (rate limited)",
+      "proxy CONNECT failed: 407 Proxy Authentication Required",
+      "connect ECONNREFUSED 10.0.0.1:4290",
+      "something odd",
+    ].map(zp.cooldownKind)
+    assert.deepEqual(kinds, ["connection", "stream cut", "no first byte", "429", "proxy auth (407)", "connection", "other"])
   })
 
   test("an upstream 429 benches that proxy and the same call moves to the next one", async () => {
