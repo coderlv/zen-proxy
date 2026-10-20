@@ -403,9 +403,13 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
 
     <div class="panel">
       <h2><span class="hh">Recent requests</span><span class="sticker grape" style="transform:none">live feed</span></h2>
+      <div class="row" style="margin-bottom:12px">
+        <div class="seg" id="reqShow"><button data-f="" class="on">All</button><button data-f="errors">Errors only</button></div>
+        <select id="reqModel" onchange="tablePage = 1; refreshStatus()"><option value="">all models</option></select>
+      </div>
       <table id="reqTable">
-        <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>TTFT</th><th>tok/s</th><th>In</th><th>Out</th><th>Reasoning</th><th>Count</th></tr></thead>
-        <tbody><tr><td colspan="10" class="empty">no requests yet — go make some noise.</td></tr></tbody>
+        <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>TTFT</th><th>tok/s</th><th>In</th><th>Cache</th><th>Out</th><th>Reasoning</th><th>Count</th></tr></thead>
+        <tbody><tr><td colspan="11" class="empty">no requests yet — go make some noise.</td></tr></tbody>
       </table>
       <div class="pager" id="reqPager"></div>
     </div>
@@ -674,11 +678,26 @@ function renderTable(recent) {
   const tb = $("reqTable").querySelector("tbody")
   const pager = $("reqPager")
   if (!recent || !recent.length) {
-    tb.innerHTML = '<tr><td colspan="10" class="empty">no requests yet — go make some noise.</td></tr>'
+    tb.innerHTML = '<tr><td colspan="11" class="empty">no requests yet — go make some noise.</td></tr>'
     pager.innerHTML = ""
     return
   }
-  const rows = recent.slice().reverse()
+  // Models are offered as they appear in the feed, each hop of a fallback on its own.
+  const sel = $("reqModel")
+  const models = [...new Set(recent.flatMap((r) => r.model.split("→")))].sort()
+  if (sel.dataset.models !== models.join()) {
+    sel.dataset.models = models.join()
+    const keep = sel.value
+    sel.innerHTML = '<option value="">all models</option>' + models.map((m) => `<option>${escapeHtml(m)}</option>`).join("")
+    sel.value = models.includes(keep) ? keep : ""
+  }
+  const errorsOnly = $("reqShow").querySelector(".on").dataset.f === "errors"
+  const rows = recent.slice().reverse().filter((r) => (!errorsOnly || r.status >= 400) && (!sel.value || r.model.split("→").includes(sel.value)))
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="11" class="empty">nothing in the feed matches this filter.</td></tr>'
+    pager.innerHTML = ""
+    return
+  }
   const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE))
   if (tablePage > pages) tablePage = pages
   if (tablePage < 1) tablePage = 1
@@ -696,10 +715,11 @@ function renderTable(recent) {
       <td class="mono">${r.ttftMs == null ? "–" : fmtDur(r.ttftMs)}</td>
       <td class="mono">${r.tps ?? "–"}</td>
       <td class="mono" title="${r.cached == null ? "" : `${r.cached.toLocaleString()} of ${r.input.toLocaleString()} from cache`}">${fmtTok(r.input)}</td>
+      <td class="mono">${r.input ? fmtPct(r.cached / r.input) : "–"}</td>
       <td class="mono">${fmtTok(r.output)}</td>
       <td class="mono">${fmtTok(r.reasoning)}</td>
       <td class="mono">${r.count}</td>
-    </tr>${open ? `<tr class="detail"><td colspan="10">${detail}</td></tr>` : ""}`
+    </tr>${open ? `<tr class="detail"><td colspan="11">${detail}</td></tr>` : ""}`
   }).join("")
   pager.innerHTML = `
     <button onclick="pageTable(-1)" ${tablePage <= 1 ? "disabled" : ""}>‹ prev</button>
@@ -707,6 +727,13 @@ function renderTable(recent) {
     <button onclick="pageTable(1)" ${tablePage >= pages ? "disabled" : ""}>next ›</button>`
 }
 function pageTable(d) { tablePage += d; refreshStatus() }
+$("reqShow").addEventListener("click", (e) => {
+  const b = e.target.closest("button")
+  if (!b) return
+  for (const x of $("reqShow").children) x.classList.toggle("on", x === b)
+  tablePage = 1
+  refreshStatus()
+})
 // Expanded rows survive the live refresh: they are kept by row key.
 const openRows = new Set()
 function toggleRow(tr) {

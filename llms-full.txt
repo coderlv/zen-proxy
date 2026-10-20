@@ -121,7 +121,7 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
 
 manage everything, no config files
 
-- **Overview** — upstream health, uptime, request counters, live recent-request feed with status, latency, TTFT, tok/s and input / output / reasoning tokens per request (hover the input count for the cached share); a row marked ▸ expands to the failed model attempts behind it and their errors, the proxy that answered and the proxies that failed before it
+- **Overview** — upstream health, uptime, request counters, live recent-request feed with status, latency, TTFT, tok/s, input / cache % / output / reasoning tokens per request, filterable to errors only or one model; a row marked ▸ expands to the failed model attempts behind it and their errors, the proxy that answered and the proxies that failed before it
 - **Analytics** — tokens (input / from cache / output / reasoning) for Today, 24h, 7d, 30d or All against the previous period, a stacked hourly/daily chart, per-model calls, cache hit, average time to first token and tokens/s, a TTFT-vs-speed scatter, and cache hit per session mode
 - **Models** — add/remove allowed models, pick the default, one-click **Test** per model
 - **Proxies** — add one proxy or paste a batch, pick the rotation strategy and cooldown, choose whether health checks go through the proxies or direct, check, disable / enable or remove each proxy; live uses / fails / cooldown per proxy
