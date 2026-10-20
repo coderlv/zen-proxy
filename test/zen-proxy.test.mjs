@@ -3554,6 +3554,19 @@ describe("token analytics", () => {
     assert.equal(zp.normalizeUsage(null), null)
   })
 
+  test("a streamed request's token counts land on its Recent requests row", async () => {
+    zp.saveConfig({ proxies: [] })
+    zp.requestStats.recent.length = 0
+    globalThis.fetch = async () =>
+      usageSse([{ choices: [{ delta: { content: "hi" } }] }], { choices: [], usage: { prompt_tokens: 1200, completion_tokens: 40, prompt_tokens_details: { cached_tokens: 1000 }, completion_tokens_details: { reasoning_tokens: 25 } } })
+    const res = mockRes()
+    await zp.handleMessages(mockReq({ _body: JSON.stringify({ model: DEFAULT_MODEL, max_tokens: 50, stream: true, messages: [{ role: "user", content: "x" }] }) }), res)
+    await res.done
+    await new Promise((r) => setTimeout(r, 20))
+    const row = zp.requestStats.recent.at(-1)
+    assert.deepEqual(row[3], { input: 1200, output: 40, reasoning: 25, cached: 1000 })
+  })
+
   test("the meter measures TTFT and speed while passing bytes through untouched", async () => {
     const start = Date.now()
     await new Promise((r) => setTimeout(r, 30))

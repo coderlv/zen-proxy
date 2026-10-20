@@ -552,7 +552,7 @@ async function upstreamFetch(url, init = {}, opts = {}) {
     recordUsage({ ...ev, status: r.status })
     return r
   }
-  return meterResponse(r, ev, start)
+  return meterResponse(r, ev, start, opts.req)
 }
 
 async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev) {
@@ -1511,7 +1511,8 @@ function recordUsage(ev) {
 // the first non-empty delta marks time-to-first-token, the last usage block
 // gives the token counts. Bytes pass through untouched and pipeThrough keeps
 // backpressure and cancellation intact.
-function meterResponse(r, ev, start) {
+// `req` (optional) gets the counts as `zenUsage`, for its Recent requests row.
+function meterResponse(r, ev, start, req) {
   if (!r.body || !/text\/event-stream/i.test(r.headers.get("content-type") ?? "")) {
     recordUsage({ ...ev, status: 200 })
     return r
@@ -1554,6 +1555,7 @@ function meterResponse(r, ev, start) {
       if (buf) onLine(buf.trimEnd())
       const end = Date.now()
       recordUsage({ ...ev, status: 200, usage, ttftMs: first ? first - start : null, genMs: first ? end - first : 0 })
+      if (req && usage) req.zenUsage = usage
     },
   })
   return new Response(r.body.pipeThrough(tap), { status: r.status, statusText: r.statusText, headers: r.headers })
@@ -1685,12 +1687,18 @@ if (isMain) {
 function recordReq(req, model, ms, status, at = Date.now()) {
   const entry = { at, ip: clientIp(req), model, status, ms }
   const key = `${entry.at}|${entry.model}|${entry.status}`
-  if (!requestStats.recent.length || requestStats.recent[requestStats.recent.length - 1][0] !== key) {
-    requestStats.recent.push([key, 1, ms])
+  // Token counts the meter left on this request (streams finish metering before
+  // the response does); merged rows add theirs up.
+  const u = req?.zenUsage
+  const tok = u ? { input: u.input, output: u.output, reasoning: u.reasoning, cached: u.cached } : null
+  const last = requestStats.recent[requestStats.recent.length - 1]
+  if (!last || last[0] !== key) {
+    requestStats.recent.push([key, 1, ms, tok])
     if (requestStats.recent.length > 200) requestStats.recent.shift()
   } else {
-    requestStats.recent[requestStats.recent.length - 1][1]++
-    requestStats.recent[requestStats.recent.length - 1][2] = ms
+    last[1]++
+    last[2] = ms
+    if (tok) last[3] = last[3] ? Object.fromEntries(Object.keys(tok).map((k) => [k, last[3][k] + tok[k]])) : tok
   }
   requestStats.total++
   if (status >= 400) requestStats.errors++
@@ -3097,7 +3105,7 @@ async function handleStatus(req, res) {
       error: syncState.error,
     },
     requests: { total: requestStats.total, errors: requestStats.errors, lastMinute, last5m },
-    recent: requestStats.recent.map(([k, count, ms]) => ({ ...parseKey(k), count, ms })),
+    recent: requestStats.recent.map(([k, count, ms, tok]) => ({ ...parseKey(k), count, ms, ...tok })),
   })
 }
 

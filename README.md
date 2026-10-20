@@ -232,6 +232,8 @@ The dashboard's **Analytics** tab answers two questions: how many tokens went th
 
 Counts come from the `usage` the upstream stream reports; nothing is estimated. Only client traffic is metered, not probes or model tests. "Calls" are upstream attempts, retries included. Note that tool-less requests carry OpenCode's tool manifest (see below), which shows up as input tokens, mostly cached.
 
+The **Recent requests** feed on the Overview tab shows the same counts per request: input (hover for the cached share), output and reasoning tokens.
+
 Data is kept in `stats.json` in the zen-proxy data dir (see Configuration), saved every 30 seconds and on shutdown. Hourly detail is kept for 31 days; older hours fold into one bucket per day, so the file stays small. `GET /api/analytics?range=today|24h|7d|30d|all` returns the same numbers as JSON.
 </details>
 

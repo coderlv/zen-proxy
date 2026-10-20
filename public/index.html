@@ -400,8 +400,8 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
     <div class="panel">
       <h2><span class="hh">Recent requests</span><span class="sticker grape" style="transform:none">live feed</span></h2>
       <table id="reqTable">
-        <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>Count</th></tr></thead>
-        <tbody><tr><td colspan="5" class="empty">no requests yet — go make some noise.</td></tr></tbody>
+        <thead><tr><th>Time</th><th>Model</th><th>Result</th><th>Latency</th><th>In</th><th>Out</th><th>Reasoning</th><th>Count</th></tr></thead>
+        <tbody><tr><td colspan="8" class="empty">no requests yet — go make some noise.</td></tr></tbody>
       </table>
       <div class="pager" id="reqPager"></div>
     </div>
@@ -670,7 +670,7 @@ function renderTable(recent) {
   const tb = $("reqTable").querySelector("tbody")
   const pager = $("reqPager")
   if (!recent || !recent.length) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty">no requests yet — go make some noise.</td></tr>'
+    tb.innerHTML = '<tr><td colspan="8" class="empty">no requests yet — go make some noise.</td></tr>'
     pager.innerHTML = ""
     return
   }
@@ -686,6 +686,9 @@ function renderTable(recent) {
       <td class="mono">${escapeHtml(r.model)}</td>
       <td><span class="badge ${cls}">${r.status}</span></td>
       <td class="mono">${r.ms == null ? "—" : fmtDur(r.ms)}</td>
+      <td class="mono" title="${r.cached == null ? "" : `${r.cached.toLocaleString()} of ${r.input.toLocaleString()} from cache`}">${fmtTok(r.input)}</td>
+      <td class="mono">${fmtTok(r.output)}</td>
+      <td class="mono">${fmtTok(r.reasoning)}</td>
       <td class="mono">${r.count}</td>
     </tr>`
   }).join("")
