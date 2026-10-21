@@ -730,6 +730,11 @@ async function withFirstChunk(r, chosen) {
     reader.cancel().catch(() => {})
     throw err
   }
+  // How long and how much before a cut, and the gap since the last chunk: a
+  // gap that repeats across cuts points at an idle timeout, not a dying node.
+  const firstAt = Date.now()
+  let lastAt = firstAt
+  let bytes = first.value?.length ?? 0
   const body = new ReadableStream({
     start(c) {
       if (first.done) c.close()
@@ -738,10 +743,14 @@ async function withFirstChunk(r, chosen) {
     async pull(c) {
       try {
         const { done, value } = await reader.read()
-        if (done) c.close()
-        else c.enqueue(value)
+        if (done) return c.close()
+        bytes += value.length
+        lastAt = Date.now()
+        c.enqueue(value)
       } catch (err) {
-        proxyCooldown(chosen, `stream cut: ${err.message}`)
+        const now = Date.now()
+        const sec = (ms) => `${(ms / 1000).toFixed(1)}s`
+        proxyCooldown(chosen, `stream cut: ${err.message} after ${sec(now - firstAt)} of stream, ${bytes} B in, idle ${sec(now - lastAt)}`)
         c.error(err)
       }
     },
@@ -2901,7 +2910,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
         // an `error` event — emit it, close nothing further, stop.
         closeThink()
         closeText()
-        emit("error", { error: { type: "api_error", message: "upstream stream ended mid-reply" } })
+        emit("error", { error: midReplyErr("api_error") })
         res.end()
         return
       }
@@ -2935,7 +2944,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
         closeText()
         // The 200 is already on the wire; Anthropic's mid-stream failure event
         // is the only way left to tell the caller the turn collapsed.
-        emit("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
+        emit("error", { error: midReplyErr("api_error", null, err) })
       }
       res.end()
     } finally {
@@ -3064,12 +3073,12 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
     clearTimeout(timer)
     if (req.signal?.removeEventListener) req.signal.removeEventListener("abort", onAbort)
   }
-  const midReplyError = (message) => {
+  const midReplyError = (error) => {
     // The 200 line is already on the wire — an in-band error chunk plus the
     // [DONE] sentinel is the only honest ending left. SDKs raise on error
     // chunks instead of returning a silent half-turn.
     if (!res.destroyed) {
-      res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message } })}\n\n`)
+      res.write(`data: ${JSON.stringify({ error })}\n\n`)
       res.write("data: [DONE]\n\n")
     }
     res.end()
@@ -3083,7 +3092,7 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
           // Upstream closed without delivering a finish chunk or [DONE]: the
           // reply died in flight, and a silent end reads like a successful
           // empty turn (measured against a hostile mid-cut).
-          if (!sawFinish) midReplyError(upstreamErr ?? "upstream stream ended mid-reply")
+          if (!sawFinish) midReplyError(midReplyErr("upstream_error", upstreamErr))
           else res.end()
           return
         }
@@ -3101,7 +3110,7 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
     } catch (err) {
       // The reader died (cut, reset, abort). Nothing more can come upstream;
       // surface it in-band before ending.
-      midReplyError(upstreamErr ?? err?.message ?? "upstream stream ended mid-reply")
+      midReplyError(midReplyErr("upstream_error", upstreamErr, err))
     } finally {
       cleanup()
     }
@@ -3311,14 +3320,14 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
         // Upstream never declared completion: end with the failure instead of
         // a finish_reason the model never reached (measured: hostile mid-cut).
         if (!res.destroyed) {
-          res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? "upstream stream ended mid-reply" } })}\n\n`)
+          res.write(`data: ${JSON.stringify({ error: midReplyErr("upstream_error", upstreamErr) })}\n\n`)
           res.write("data: [DONE]\n\n")
         }
       }
       res.end()
     } catch (err) {
       if (!res.destroyed) {
-        res.write(`data: ${JSON.stringify({ error: { type: "upstream_error", message: upstreamErr ?? err?.message ?? "upstream stream ended mid-reply" } })}\n\n`)
+        res.write(`data: ${JSON.stringify({ error: midReplyErr("upstream_error", upstreamErr, err) })}\n\n`)
         res.write("data: [DONE]\n\n")
       }
       res.end()
@@ -3431,7 +3440,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
         // mid-cut): emitting response.completed would tell the caller a turn
         // ended that upstream never finished. The Responses dialect carries
         // mid-stream failure as an `error` event.
-        if (!res.destroyed) evt("error", { error: { type: "api_error", message: "upstream stream ended mid-reply" } })
+        if (!res.destroyed) evt("error", { error: midReplyErr("api_error") })
         res.end()
         return
       }
@@ -3473,7 +3482,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
       res.end()
     } catch (err) {
       // The 200 is on the wire already: announce the collapse in-band.
-      if (!res.destroyed) evt("error", { error: { type: "api_error", message: err?.message ?? "upstream stream ended mid-reply" } })
+      if (!res.destroyed) evt("error", { error: midReplyErr("api_error", null, err) })
       res.end()
     }
   }
@@ -3590,12 +3599,12 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
       // against a hostile cut). The Responses dialect says failure as an
       // `error` event; silence reads like a successful partial turn.
       if (!sawFinish && !res.destroyed) {
-        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? "upstream stream ended mid-reply" })}\n\n`)
+        res.write(`event: error\ndata: ${JSON.stringify({ ...midReplyErr("upstream_error", upstreamErr), type: "error" })}\n\n`)
       }
       res.end()
     } catch (err) {
       if (!res.destroyed) {
-        res.write(`event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_error", message: upstreamErr ?? err?.message ?? "upstream stream ended mid-reply" })}\n\n`)
+        res.write(`event: error\ndata: ${JSON.stringify({ ...midReplyErr("upstream_error", upstreamErr, err), type: "error" })}\n\n`)
       }
       res.end()
     } finally {
@@ -3603,6 +3612,15 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
     }
   }
   return pump()
+}
+
+// The error a relay sends in-band when the reply dies mid-stream. An error the
+// provider sent itself passes through as-is; a transport cut is named
+// ECONNRESET in code and text, which agent harnesses that resume network
+// failures recognize (ZCode's stream recovery matches either).
+function midReplyErr(type, upstreamErr, err) {
+  if (upstreamErr) return { type, message: upstreamErr }
+  return { type, code: "ECONNRESET", message: `upstream connection lost mid-reply (ECONNRESET): ${err?.message ?? "no finish marker"}` }
 }
 
 function rewriteSSE(block, requested, strip = false, pinState = null) {

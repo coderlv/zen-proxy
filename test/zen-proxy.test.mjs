@@ -3358,7 +3358,7 @@ describe("proxy transport", () => {
     Object.assign(rig.seen, { cutsLeft: 1, cutAfterFirst: true })
     const r = await zp.upstreamFetch(`${rig.upstreamUrl}/flaky`, {}, { req: mockReq(), model: DEFAULT_MODEL })
     await assert.rejects(r.text(), /aborted/)
-    assert.match(zp.proxyStat(rig.httpProxy).lastError, /stream cut/)
+    assert.match(zp.proxyStat(rig.httpProxy).lastError, /^stream cut: aborted after \d+\.\ds of stream, [1-9]\d* B in, idle \d+\.\ds$/)
     assert.equal(zp.pickProxy(), rig.socksProxy)
   })
 
@@ -3501,7 +3501,8 @@ describe("a stream that dies mid-way", () => {
   test("the Anthropic relay reports it in-band and leaks no unhandled rejection", async () => {
     globalThis.fetch = dying({ choices: [{ delta: { content: "hi" } }] })
     const body = await run(zp.handleMessages, { model: DEFAULT_MODEL, max_tokens: 5 })
-    assert.match(body, /event: error[\s\S]*"message":"aborted"/)
+    // Named ECONNRESET in code and text so harnesses that resume network failures retry it.
+    assert.match(body, /event: error[\s\S]*"code":"ECONNRESET","message":"upstream connection lost mid-reply \(ECONNRESET\): aborted"/)
   })
 
   test("the chat relay ends with an error chunk, not a silent close", async () => {
@@ -3509,7 +3510,7 @@ describe("a stream that dies mid-way", () => {
     const body = await run(zp.handleChat, { model: DEFAULT_MODEL })
     const blocks = body.trim().split("\n\n")
     assert.equal(blocks.at(-1), "data: [DONE]")
-    assert.match(JSON.parse(blocks.at(-2).slice(5)).error.message, /aborted/)
+    assert.deepEqual(JSON.parse(blocks.at(-2).slice(5)).error, { type: "upstream_error", code: "ECONNRESET", message: "upstream connection lost mid-reply (ECONNRESET): aborted" })
   })
 
   test("the Responses-backed chat relay does the same", async () => {
