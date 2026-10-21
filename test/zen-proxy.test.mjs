@@ -3606,6 +3606,38 @@ describe("token analytics", () => {
     assert.deepEqual(row[4].attempts, [{ model: "mimo-v2.5-free", what: "500 provider overloaded" }])
   })
 
+  test("a field the model's backend refuses is dropped, remembered and the same model retried", async () => {
+    // glm's backend 400s on ZCode's GLM-style `thinking` and `reasoning`; other
+    // models take them. Before, each call walked on to the next model.
+    zp.saveConfig({ proxies: [], defaultModel: "strict-free", fallbackModels: ["strict-free", "big-pickle"], retriesPerModel: 0 })
+    const sent = []
+    globalThis.fetch = async (_u, init) => {
+      const b = JSON.parse(init.body)
+      sent.push({ model: b.model, keys: Object.keys(b).filter((k) => ["thinking", "reasoning", "reasoning_effort"].includes(k)).sort() })
+      const bad = ["thinking", "reasoning"].find((k) => k in b)
+      return bad && b.model === "strict-free"
+        ? new Response(JSON.stringify({ error: { type: "unknown_parameter", message: `Upstream request failed: [unknown_parameter] invalid request body: json: unknown field "${bad}"` } }), { status: 400, headers: { "content-type": "application/json" } })
+        : usageSse([{ choices: [{ delta: { content: "hi" } }] }])
+    }
+    const ask = async () => {
+      const res = mockRes()
+      await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "strict-free", stream: true, thinking: { type: "enabled" }, reasoning: { effort: "max" }, reasoning_effort: "max", messages: [{ role: "user", content: "x" }] }) }), res)
+      await res.done
+      return res
+    }
+    const first = await ask()
+    assert.equal(first.state.status, 200)
+    assert.equal(first.state.headers["x-zen-served-by"], undefined, "no fallback")
+    assert.deepEqual(sent, [
+      { model: "strict-free", keys: ["reasoning", "reasoning_effort", "thinking"] },
+      { model: "strict-free", keys: ["reasoning", "reasoning_effort"] },
+      { model: "strict-free", keys: ["reasoning_effort"] },
+    ], "same model, one refused field fewer each time, nothing else touched")
+    sent.length = 0
+    await ask()
+    assert.deepEqual(sent, [{ model: "strict-free", keys: ["reasoning_effort"] }], "learned: the next call goes out without them")
+  })
+
   test("the meter measures TTFT and speed while passing bytes through untouched", async () => {
     const start = Date.now()
     await new Promise((r) => setTimeout(r, 30))

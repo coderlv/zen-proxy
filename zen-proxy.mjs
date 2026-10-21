@@ -2339,6 +2339,11 @@ async function handleMessages(req, res) {
   res.end(JSON.stringify(e.body))
 }
 
+// Top-level body fields a model's backend refused by name, e.g. glm 400s
+// `unknown field "thinking"` where other models take ZCode's GLM-style
+// thinking params. Memory only: relearned with one 400 per field after a restart.
+const rejectedFields = new Map()
+
 async function handleChat(req, res, responsesRoute = false) {
   const start = Date.now()
   let body
@@ -2417,6 +2422,7 @@ async function handleChat(req, res, responsesRoute = false) {
       if (format === "responses") delete payload.tool_choice
       else payload.tool_choice = "none"
     }
+    for (const f of rejectedFields.get(model) ?? []) delete payload[f]
     let delayMs = 0
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
@@ -2533,6 +2539,17 @@ async function handleChat(req, res, responsesRoute = false) {
       }
       lastStatus = upstreamRes.status
       noteAttempt(req, model, attempt, `${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
+      // The backend named a field it will not take: resend to the same model
+      // without it instead of walking the chain. Each field goes once, so
+      // this ends.
+      const refused = lastStatus === 400 && /unknown field "([^"]+)"/.exec(String(lastErr?.error?.message ?? ""))?.[1]
+      if (refused && Object.hasOwn(payload, refused)) {
+        delete payload[refused]
+        if (!rejectedFields.has(model)) rejectedFields.set(model, new Set())
+        rejectedFields.get(model).add(refused)
+        attempt--
+        continue
+      }
       const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
       if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
