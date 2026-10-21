@@ -7,6 +7,9 @@
 <p align="center"><sub>No account. No API key. OpenAI&nbsp;and&nbsp;Anthropic&nbsp;compatible. Runs on your machine.</sub></p>
 
 <p align="center">
+  <a href="https://discord.gg/Dw5Ctrtuw">
+    <img src="https://img.shields.io/badge/Discord-Join%20the%20server-5865F2?style=flat-square&labelColor=1a1612&logo=discord&logoColor=white" alt="Join the Discord server">
+  </a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ccf73a?style=flat-square&labelColor=1a1612" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/node-%3E%3D18-8b8b8b?style=flat-square&labelColor=1a1612" alt="Node 18+">
   <img src="https://img.shields.io/badge/dependencies-0-8b8b8b?style=flat-square&labelColor=1a1612" alt="Zero dependencies">
@@ -82,7 +85,7 @@ It stays up until you stop it, so you point your agent at it once and keep using
 | | |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI, streaming and not |
-| `POST /v1/responses` | OpenAI Responses API, translated both ways |
+| `POST /v1/responses` | OpenAI Responses API, translated both ways — a body that speaks Responses gets Responses back, a chat body keeps its chat reply |
 | `POST /v1/messages` | Anthropic Messages API — **this is the Claude Code one** |
 | `POST /v1/messages/count_tokens` | Anthropic token estimate |
 | `GET /v1/models` | What's live right now |
@@ -120,6 +123,10 @@ zen-proxy sits in front of that gateway and identifies your agent as a real sess
 For `/v1/messages` specifically, the gateway also requires OpenCode's own tool manifest, so zen-proxy attaches those tools alongside Claude Code's and renames the resulting calls back. **Claude Code's system prompt is passed through untouched.**
 
 The OpenAI-shaped routes get no name mapping, so they are handled differently: a request carrying **no tools at all** — an agent's own internal call, like summarization or title generation — is given OpenCode's own tool manifest so it passes the gate, exactly as opencode sends it on every call. The gateway does not honour `tool_choice: "none"` — it answers a plain summarization prompt with real `read` calls — so any tool call is stripped from the reply instead, on both OpenAI-shaped routes.
+
+A request that brings **its own tools** and pins one of them with `tool_choice` — a forced-tool helper, like a title or label call — needs the same `read` in the list, or the gateway refuses the whole request. The proxy adds a **stub** named `read` for exactly those calls: the gate looks at the tool's name and nothing else, and the pin is what makes it safe to add one, because a caller that pins a function cannot be asked for anything else. Your tool list and your pin are forwarded untouched.
+
+The pin is not enforcement, though — the gateway hands it to the provider, and the provider may still answer with a call you never offered. The stub is deliberately a stub for that reason: OpenCode's own `read` schema invites the model to call it, and a pinned helper that comes back with a stray `read` is a tool your client cannot run. So a pinned reply is **filtered down to the pinned call** — on all three routes, streaming included — and a reply whose every call got dropped ends as a plain stop instead of claiming a tool call that does not exist. An unpinned agent turn is never filtered.
 </details>
 
 <details>
@@ -302,6 +309,10 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # permanent
 </details>
 
 ---
+
+<p align="center">
+  <sub>💬 <a href="https://discord.gg/Dw5Ctrtuw">Join the Discord</a> — install help, troubleshooting, and which free model is fast right now.</sub>
+</p>
 
 <p align="center">
   <sub>Machine-readable: <a href="llms.txt">llms.txt</a> &nbsp;·&nbsp; <a href="llms-full.txt">llms-full.txt</a></sub>

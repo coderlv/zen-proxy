@@ -8,3 +8,11 @@ zen-proxy/
 .DS_Store
 # left behind when an older build's config/analytics move to ~/.config and ~/.local/share
 *.migrated
+# local agent working files: tooling state, this checkout's own opencode
+# config, and implementation plans kept out of the repo
+.freebuff/
+opencode.json
+docs/compose/plans/
+# local runbook for the Discord MCP server; holds the bot token and
+# invite details, so it must never leave this machine
+docs/discord-mcp-setup.md
