@@ -2777,7 +2777,10 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
   const id = `msg_${randomBytes(12).toString("hex")}`
   const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
 
-  const st = { textOpen: false, thinkOpen: false, toolIndex: 0, blocks: new Map(), finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, callKept: false, nextBlock: 1 }
+  // Blocks are numbered in the order they open: glm interleaves reasoning with
+  // text, and a thinking_delta sent into an open text block breaks clients
+  // ("reasoning part 0 not found" in the AI SDK).
+  const st = { textOpen: false, thinkOpen: false, textIndex: 0, thinkIndex: 0, nextIndex: 0, blocks: new Map(), finish: "stop", finished: false, usage: null, dropped: new Set(), kept: false, callKept: false }
   emit("message_start", {
     message: {
       id,
@@ -2793,13 +2796,13 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
 
   const closeText = () => {
     if (st.textOpen) {
-      emit("content_block_stop", { index: 0 })
+      emit("content_block_stop", { index: st.textIndex })
       st.textOpen = false
     }
   }
   const closeThink = () => {
     if (st.thinkOpen) {
-      emit("content_block_stop", { index: 0 })
+      emit("content_block_stop", { index: st.thinkIndex })
       st.thinkOpen = false
     }
   }
@@ -2842,17 +2845,20 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
             if (typeof delta.content === "string" && delta.content) {
               closeThink()
               if (!st.textOpen) {
-                emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } })
+                st.textIndex = st.nextIndex++
+                emit("content_block_start", { index: st.textIndex, content_block: { type: "text", text: "" } })
                 st.textOpen = true
               }
-              emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: delta.content } })
+              emit("content_block_delta", { index: st.textIndex, delta: { type: "text_delta", text: delta.content } })
             }
             if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
-              if (!st.textOpen && !st.thinkOpen) {
-                emit("content_block_start", { index: 0, content_block: { type: "thinking", thinking: "", signature: "" } })
+              closeText()
+              if (!st.thinkOpen) {
+                st.thinkIndex = st.nextIndex++
+                emit("content_block_start", { index: st.thinkIndex, content_block: { type: "thinking", thinking: "", signature: "" } })
                 st.thinkOpen = true
               }
-              emit("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: delta.reasoning_content } })
+              emit("content_block_delta", { index: st.thinkIndex, delta: { type: "thinking_delta", thinking: delta.reasoning_content } })
             }
             for (const tc of strip ? [] : delta.tool_calls ?? []) {
               closeThink()
@@ -2880,9 +2886,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
               } else if (st.dropped.has(tIndex)) {
                 continue
               }
-              // Renumbered blocks only when filtering — the plain path keeps the
-              // upstream index so a caller never sees a numbering change.
-              const blockIndex = st.blocks.has(tIndex) ? st.blocks.get(tIndex).index : pin ? st.nextBlock++ : tIndex + 1
+              const blockIndex = st.blocks.has(tIndex) ? st.blocks.get(tIndex).index : st.nextIndex++
               if (!st.blocks.has(tIndex)) {
                 const rawName = tc.function?.name ?? "unknown"
                 const mapped = remapAgentTool(rawName, "{}")

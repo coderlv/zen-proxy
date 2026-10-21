@@ -4875,6 +4875,41 @@ describe("streams announce mid-flight failure (measured: every relay used to end
     assert.ok(!res.body.includes("message_stop"))
   })
 
+  test("relayAnthropicStream: interleaved reasoning, text and tool calls each get a block of their own", async () => {
+    // glm thinks, writes, thinks again, then calls a tool. A thinking_delta sent
+    // into the open text block made the AI SDK throw "reasoning part 0 not found".
+    async function* chunks() {
+      yield chunk({ reasoning_content: "plan " })
+      yield chunk({ content: "looking" })
+      yield chunk({ reasoning_content: "more thought" })
+      yield chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: '{"q":1}' } }] })
+      yield chunk({ content: "after the call" })
+      yield `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`
+      yield "data: [DONE]\n\n"
+    }
+    const res = mockRes()
+    await zp.relayAnthropicStream(mockReq(), res, chunks(), "big-pickle", "big-pickle")
+    await res.done
+    const events = res.body.split("\n\n").filter((b) => b.startsWith("event: content_block")).map((b) => JSON.parse(b.split("\ndata: ")[1]))
+    const open = new Map()
+    const started = []
+    const want = { thinking_delta: "thinking", text_delta: "text", input_json_delta: "tool_use" }
+    for (const e of events) {
+      if (e.type === "content_block_start") {
+        assert.ok(!open.has(e.index) && !started.includes(e.index), `index ${e.index} opened once`)
+        open.set(e.index, e.content_block.type)
+        started.push(e.index)
+      } else if (e.type === "content_block_delta") {
+        assert.equal(open.get(e.index), want[e.delta.type], `${e.delta.type} lands in an open ${want[e.delta.type]} block`)
+      } else {
+        assert.ok(open.delete(e.index), `stop for open index ${e.index}`)
+      }
+    }
+    assert.equal(open.size, 0, "every block closed")
+    assert.deepEqual(started, [...started].sort((a, b) => a - b), "indexes rise in opening order")
+    assert.deepEqual(events.filter((e) => e.type === "content_block_start").map((e) => e.content_block.type), ["thinking", "text", "thinking", "tool_use", "text"])
+  })
+
   test("relayResponsesStream: missing response.completed ends with an error chunk plus [DONE]", async () => {
     const upstream = new Response(
       `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { object: "response" } })}\n\n` +
