@@ -3599,12 +3599,12 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
       // against a hostile cut). The Responses dialect says failure as an
       // `error` event; silence reads like a successful partial turn.
       if (!sawFinish && !res.destroyed) {
-        res.write(`event: error\ndata: ${JSON.stringify({ ...midReplyErr("upstream_error", upstreamErr), type: "error" })}\n\n`)
+        res.write(`event: error\ndata: ${JSON.stringify(responsesErrorEvent(midReplyErr("upstream_error", upstreamErr)))}\n\n`)
       }
       res.end()
     } catch (err) {
       if (!res.destroyed) {
-        res.write(`event: error\ndata: ${JSON.stringify({ ...midReplyErr("upstream_error", upstreamErr, err), type: "error" })}\n\n`)
+        res.write(`event: error\ndata: ${JSON.stringify(responsesErrorEvent(midReplyErr("upstream_error", upstreamErr, err)))}\n\n`)
       }
       res.end()
     } finally {
@@ -3622,6 +3622,9 @@ function midReplyErr(type, upstreamErr, err) {
   if (upstreamErr) return { type, message: upstreamErr }
   return { type, code: "ECONNRESET", message: `upstream connection lost mid-reply (ECONNRESET): ${err?.message ?? "no finish marker"}` }
 }
+
+// The Responses dialect's error event is flat, and its code slot names the kind.
+const responsesErrorEvent = (e) => ({ type: "error", code: e.code ?? e.type, message: e.message })
 
 function rewriteSSE(block, requested, strip = false, pinState = null) {
   if (!block.trim()) return null

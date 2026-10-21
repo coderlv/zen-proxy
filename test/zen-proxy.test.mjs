@@ -4909,6 +4909,19 @@ describe("streams announce mid-flight failure (measured: every relay used to end
     assert.ok(res.body.includes("event: error"))
   })
 
+  test("relayResponsesPassthrough: a cut is coded ECONNRESET, a provider error keeps its message", async () => {
+    const run = async (text) => {
+      const res = mockRes()
+      await zp.relayResponsesPassthrough(mockReq(), res, new Response(text, { status: 200, headers: { "content-type": "text/event-stream" } }), "big-pickle")
+      await res.done
+      return JSON.parse(res.body.split("event: error\ndata: ").at(-1))
+    }
+    const delta = `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "partial" })}\n\n`
+    assert.deepEqual(await run(delta), { type: "error", code: "ECONNRESET", message: "upstream connection lost mid-reply (ECONNRESET): no finish marker" })
+    const failed = `event: error\ndata: ${JSON.stringify({ type: "error", message: "provider overloaded" })}\n\n`
+    assert.deepEqual(await run(delta + failed), { type: "error", code: "upstream_error", message: "provider overloaded" })
+  })
+
   test("handleChat with a streaming client: a mid-cut upstream ends the SSE with the failure in-band", async () => {
     zp.saveConfig({ fallbackModels: ["big-pickle"], defaultModel: "", autoSyncIntervalMs: 0, cacheMs: 0, retriesPerModel: 0 })
     globalThis.fetch = routeFetch([["/chat/completions", () => cutSse()]])
