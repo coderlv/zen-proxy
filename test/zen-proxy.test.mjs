@@ -3606,6 +3606,20 @@ describe("token analytics", () => {
     assert.deepEqual(row[4].attempts, [{ model: "mimo-v2.5-free", what: "500 provider overloaded" }])
   })
 
+  test("messageShape outlines a history without its text", () => {
+    const call = { id: "c", type: "function", function: { name: "read", arguments: "{}" } }
+    const shape = zp.messageShape([
+      { role: "system", content: "secret system" },
+      { role: "user", content: "secret ask" },
+      { role: "assistant", content: "", tool_calls: [call, call] },
+      { role: "tool", tool_call_id: "c", content: "r" },
+      { role: "tool", tool_call_id: "c", content: "r" },
+      { role: "assistant", content: "done", reasoning_content: "why" },
+      { role: "assistant", content: [{ type: "text", text: "" }], reasoning_content: "", tool_calls: [call], reasoning_details: [] },
+    ])
+    assert.equal(shape, "s u a[c2 rc-] tx2 a[c0 rc+ txt] a[c1 rc0 +reasoning_details]")
+  })
+
   test("a field the model's backend refuses is dropped, remembered and the same model retried", async () => {
     // glm's backend 400s on ZCode's GLM-style `thinking` and `reasoning`; other
     // models take them. Before, each call walked on to the next model.

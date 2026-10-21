@@ -2339,6 +2339,27 @@ async function handleMessages(req, res) {
   res.end(JSON.stringify(e.body))
 }
 
+// A content-free outline of a chat history for the log: s/u/t per message, and
+// per assistant message its tool calls, whether reasoning_content is there
+// (rc+ text, rc0 empty, rc- absent) and any other keys. Repeats collapse to xN.
+function messageShape(messages) {
+  const known = new Set(["role", "content", "tool_calls", "reasoning_content", "tool_call_id", "name"])
+  const tokens = (Array.isArray(messages) ? messages : []).map((m) => {
+    if (m?.role !== "assistant") return { system: "s", user: "u", tool: "t" }[m?.role] ?? "?"
+    const rc = typeof m.reasoning_content !== "string" ? "rc-" : m.reasoning_content ? "rc+" : "rc0"
+    const text = typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.map((p) => p?.text ?? "").join("") : ""
+    const extra = Object.keys(m).filter((k) => !known.has(k)).map((k) => `+${k}`)
+    return `a[${[`c${m.tool_calls?.length ?? 0}`, rc, text ? "txt" : "", ...extra].filter(Boolean).join(" ")}]`
+  })
+  const out = []
+  for (const t of tokens) {
+    const last = out.at(-1)
+    if (last?.t === t) last.n++
+    else out.push({ t, n: 1 })
+  }
+  return out.map(({ t, n }) => (n > 1 ? `${t}x${n}` : t)).join(" ")
+}
+
 // Top-level body fields a model's backend refused by name, e.g. glm 400s
 // `unknown field "thinking"` where other models take ZCode's GLM-style
 // thinking params. Memory only: relearned with one 400 per field after a restart.
@@ -2539,6 +2560,8 @@ async function handleChat(req, res, responsesRoute = false) {
       }
       lastStatus = upstreamRes.status
       noteAttempt(req, model, attempt, `${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
+      // shortcut: diagnostic for DeepSeek's "reasoning_content must be passed back" 400, which a hand-built history does not reproduce; drop once the cause is fixed.
+      if (lastStatus === 400 && /reasoning_content/.test(String(lastErr?.error?.message ?? ""))) log(`${model} history shape: ${messageShape(payload.messages)}`)
       // The backend named a field it will not take: resend to the same model
       // without it instead of walking the chain. Each field goes once, so
       // this ends.
@@ -4395,6 +4418,7 @@ export {
   proxyState,
   proxyStatus,
   cooldownKind,
+  messageShape,
   upstreamFetch,
   proxiedFetch,
   handleProxies,
