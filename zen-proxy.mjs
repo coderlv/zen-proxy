@@ -639,13 +639,15 @@ async function upstreamFetch(url, init = {}, opts = {}) {
 
 async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev) {
   const list = config.proxies ?? []
-  if (!proxy && (!list.length || (health && config.proxyHealthChecks === "direct"))) return fetch(url, init)
+  if (!proxy && (!list.length || (health && config.proxyHealthChecks === "direct"))) return fetch(url, init).then((r) => (rotateSession(req, r), r))
   if (ev) ev.mode = config.proxySessionMode
   if (proxy) return proxyAttempt(proxy, url, init, req, false)
   // A dead tunnel, a body cut before its first byte, or a 429 (a per-IP limit)
   // is the proxy's fault, not the model's: try the next proxy right here so the
   // caller's model retries and fallback chain are never spent on it.
-  const tries = 1 + Math.max(0, Math.floor(Number(config.proxyRetries) || 0))
+  // Once every exit of one call came back 429, the limit is on the request (its
+  // content or key), not the IP: later calls of this request get one proxy each.
+  const tries = req?.zenLimited ? 1 : 1 + Math.max(0, Math.floor(Number(config.proxyRetries) || 0))
   const key = req ? sessionFor(req).value : "server"
   let chosen = pickProxy(key)
   for (let i = 1; ; i++) {
@@ -665,10 +667,14 @@ async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev)
     try {
       if (i < tries) next = pickProxy(key)
     } catch {}
-    if (!next) {
+    // A client that left (ZCode stops waiting for headers at 300 s) gets no more proxies spent on it.
+    if (!next || req?.socket?.destroyed) {
       // Out of tries or out of live proxies: a 429 goes back as-is for the
       // caller's usual handling; a transport failure is a pool verdict.
-      if (r) return r
+      if (r) {
+        if (req && i > 1 && r.status === 429) req.zenLimited = true
+        return r
+      }
       const err = new Error(`no working proxy after ${i} attempt${i > 1 ? "s" : ""}, last: ${failed.message}`)
       err.code = "NO_PROXY"
       throw err
@@ -704,9 +710,10 @@ async function proxyAttempt(chosen, url, init, req, peek) {
   }
   try {
     let r = await proxiedFetch(chosen, url, ctrl ? { ...init, signal: ctrl.signal } : init)
+    rotateSession(req, r)
     st.lastMs = Date.now() - t0
     st.lastStatus = r.status
-    if (r.status === 429) proxyCooldown(chosen, "upstream 429 (rate limited)")
+    if (r.status === 429 && !req?.zenLimited) proxyCooldown(chosen, "upstream 429 (rate limited)")
     if (peek && r.ok && r.body) r = await withFirstChunk(r, chosen)
     return r
   } catch (err) {
@@ -1035,17 +1042,37 @@ function genSessionId(now = Date.now()) {
 }
 // With a proxy, the minted id is per client *and* per proxy: a new exit IP
 // that kept the old session would still read as the same client upstream.
+// Harnesses that name their own conversation (ZCode, Claude Code, Codex): the
+// minted session follows it, so parallel conversations on one machine stop
+// sharing one upstream identity. Their ids are not opencode-shaped, so they key
+// the pool and never go upstream themselves.
+const HARNESS_SESSION_HEADERS = ["x-session-id", "x-claude-code-session-id", "session_id"]
+const SESSION_POOL_MAX = 10_000
 function sessionFor(req, proxy) {
   const incoming = req?.headers?.["x-opencode-session"]
   if (typeof incoming === "string" && incoming.trim()) return { value: incoming.trim(), injected: false }
-  let key = req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
+  const harness = HARNESS_SESSION_HEADERS.map((h) => req?.headers?.[h]).find((v) => typeof v === "string" && v.trim())
+  let key = harness ? "harness:" + harness.trim() : req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
   if (proxy) key += "@" + proxyId(proxy)
   let hit = sessionPool.get(key)
   if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS) {
     hit = genSessionId()
+    sessionPool.delete(key)
     sessionPool.set(key, hit)
+    // Oldest first: one key per conversation (times proxies) would otherwise pile up for good.
+    if (sessionPool.size > SESSION_POOL_MAX) sessionPool.delete(sessionPool.keys().next().value)
   }
+  if (req) req.zenSessionKey = key
   return { value: hit.value, injected: true }
+}
+// A limit or a refused session belongs to the id upstream saw: drop it, so the
+// next attempt and the rest of the conversation run on a fresh one.
+function rotateSession(req, r) {
+  const key = req?.zenSessionKey
+  if (!key || r.ok || !sessionPool.has(key)) return
+  const drop = (why) => sessionPool.delete(key) && log(`session ${key.split("@")[0]} rotated after ${why}`)
+  if (r.status === 429 || r.status === 403) drop(r.status)
+  else if (r.status === 400) r.clone().text().then((t) => /MissingSessionID|session/i.test(t) && drop("400 session error"), () => {})
 }
 function sessionHeader(req) {
   if (!config.injectSession) return undefined
@@ -2217,6 +2244,12 @@ async function handleMessages(req, res) {
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
       delayMs = 0
+      // The client gave up: further tries would spend free quota and proxies on nobody.
+      if (res.destroyed) {
+        log(`${requested}: client left after ${((Date.now() - start) / 1000).toFixed(1)}s, chain stopped at ${model}`)
+        recordReq(req, `${requested}→${model}`, Date.now() - start, 499)
+        return
+      }
       let upstreamRes
       try {
         upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
@@ -2448,6 +2481,12 @@ async function handleChat(req, res, responsesRoute = false) {
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
       delayMs = 0
+      // The client gave up: further tries would spend free quota and proxies on nobody.
+      if (res.destroyed) {
+        log(`${requested}: client left after ${((Date.now() - start) / 1000).toFixed(1)}s, chain stopped at ${model}`)
+        recordReq(req, `${requested}→${model}`, Date.now() - start, 499)
+        return
+      }
       let upstreamRes
       try {
         upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
@@ -4490,6 +4529,7 @@ export {
   maxBodyBytes,
   toBool,
   sessionFor,
+  rotateSession,
   sessionHeader,
   MAX_BODY,
   VALID_MODEL_ID,

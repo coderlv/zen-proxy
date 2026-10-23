@@ -307,6 +307,29 @@ describe("session injection", () => {
     assert.ok(zp.sessionFor(mockReq()).injected, "local client gets an injected id")
   })
 
+  test("a harness session gets its own minted session, rotated on limits", async () => {
+    const conv = (id) => mockReq({ headers: { "x-session-id": id } })
+    const a = zp.sessionFor(conv("conv-a")).value
+    assert.equal(zp.sessionFor(conv("conv-a")).value, a, "same conversation → same session")
+    assert.notEqual(zp.sessionFor(conv("conv-b")).value, a, "parallel conversation on the same machine → its own")
+    assert.match(a, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    const req = conv("conv-a")
+    zp.sessionFor(req)
+    zp.rotateSession(req, new Response("{}", { status: 400 }))
+    zp.rotateSession(req, new Response("", { status: 200 }))
+    await new Promise((r) => setTimeout(r, 10))
+    assert.equal(zp.sessionFor(conv("conv-a")).value, a, "an ordinary 400 or a 200 keeps it")
+    zp.rotateSession(req, new Response("", { status: 429 }))
+    const b = zp.sessionFor(conv("conv-a")).value
+    assert.notEqual(b, a, "429 rotates")
+    zp.rotateSession(req, new Response("", { status: 403 }))
+    const c = zp.sessionFor(conv("conv-a")).value
+    assert.notEqual(c, b, "403 rotates")
+    zp.rotateSession(req, new Response(JSON.stringify({ error: { type: "MissingSessionID" } }), { status: 400 }))
+    await new Promise((r) => setTimeout(r, 10))
+    assert.notEqual(zp.sessionFor(conv("conv-a")).value, c, "a 400 about the session rotates")
+  })
+
   test("a minted session id carries a decodable recent timestamp", () => {
     // Upstream decodes the leading 12 hex digits as a creation time in opencode's
     // own format and refuses ids without a plausible one — the same 403 a missing
@@ -1509,6 +1532,14 @@ describe("handleChat", () => {
     await zp.handleChat(req, res)
     assert.equal(res.state.status, 429)
     assert.match(res.body, /FreeUsageLimitError/)
+  })
+
+  test("the chain stops once the client has left", async () => {
+    const res = mockRes()
+    let calls = 0
+    globalThis.fetch = routeFetch([["/chat/completions", () => (calls++, (res.destroyed = true), jsonResponse({ error: { message: "FreeUsageLimitError" } }, 429))]])
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "whatever", messages: [] }) }), res)
+    assert.equal(calls, 1, "no model or retry is tried for a client that is gone")
   })
 
   test("non-retryable 400 propagates its status, not 429", async () => {
@@ -3339,6 +3370,34 @@ describe("proxy transport", () => {
     await r.body?.cancel()
     assert.equal(rig.seen.upstream.length - before, 2)
     assert.throws(() => zp.pickProxy(), (e) => e.code === "NO_PROXY")
+  })
+
+  test("a 429 from every exit of one call limits the rest of the request to one proxy, unbenched", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover", proxyRetries: 3, injectSession: true })
+    const req = mockReq({ headers: { "x-session-id": "conv-limited" } })
+    const call = async () => {
+      const before = rig.seen.upstream.length
+      const r = await zp.upstreamFetch(`${rig.upstreamUrl}/limited`, { headers: zp.zenHeaders(req, "Bearer public") }, { req, model: DEFAULT_MODEL })
+      await r.body?.cancel()
+      return rig.seen.upstream.slice(before)
+    }
+    const first = await call()
+    assert.equal(first.length, 2)
+    for (const p of [rig.httpProxy, rig.socksProxy]) zp.proxyStat(p).cooldownUntil = 0
+    const second = await call()
+    assert.equal(second.length, 1, "one proxy per later call")
+    assert.notEqual(second[0].session, first[0].session, "the 429 rotated the session this proxy carried")
+    assert.ok(!zp.proxyStat(rig.httpProxy).cooldownUntil, "a request-bound 429 does not bench the proxy")
+  })
+
+  test("no further proxy is spent on a client that has left", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover", proxyRetries: 3 })
+    const req = mockReq()
+    req.socket.destroyed = true
+    const before = rig.seen.upstream.length
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/limited`, {}, { req, model: DEFAULT_MODEL })
+    await r.body?.cancel()
+    assert.equal(rig.seen.upstream.length - before, 1)
   })
 
   test("a tunnel cut before the first byte is retried on the next proxy", async () => {
