@@ -534,6 +534,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
         <thead><tr><th>Proxy</th><th>Status</th><th>Uses</th><th>Fails</th><th>Last</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
+      <div class="pager" id="pxPager"></div>
     </div>
   </section>
 
@@ -1147,9 +1148,27 @@ async function refreshProxies(data) {
     <span class="badge bad">${sm.cooling.toLocaleString()} cooling</span>
     <span class="badge mut">${sm.disabled.toLocaleString()} off</span>
     <span class="hint" style="margin:0 0 0 8px">cooldowns in the last hour: ${causes.length ? causes.map(([k, n]) => `${escapeHtml(k)} <b>${n}</b>`).join(" · ") : "none"}</span>`
+  pxData = d
+  renderProxyRows()
+}
+
+// One page at a time: re-rendering a 9000-row table every 4 s kept Chrome's
+// renderer cycling between 0.5 and 1 GB.
+const PX_PAGE = 50
+let pxPage = 1, pxData = null
+function pageProxies(n) { pxPage += n; renderProxyRows() }
+function renderProxyRows() {
+  const d = pxData
   const tb = $("proxyTable").querySelector("tbody")
-  if (!d.proxies.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">no proxies, so upstream traffic goes direct.</td></tr>'; return }
-  tb.innerHTML = d.proxies.map((p) => {
+  const pager = $("pxPager")
+  if (!d.proxies.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">no proxies, so upstream traffic goes direct.</td></tr>'; pager.innerHTML = ""; return }
+  const pages = Math.ceil(d.proxies.length / PX_PAGE)
+  pxPage = Math.min(Math.max(1, pxPage), pages)
+  pager.innerHTML = pages < 2 ? "" : `
+    <button onclick="pageProxies(-1)" ${pxPage <= 1 ? "disabled" : ""}>‹ prev</button>
+    <span class="pager-info">page ${pxPage} / ${pages} · ${d.proxies.length} proxies</span>
+    <button onclick="pageProxies(1)" ${pxPage >= pages ? "disabled" : ""}>next ›</button>`
+  tb.innerHTML = d.proxies.slice((pxPage - 1) * PX_PAGE, pxPage * PX_PAGE).map((p) => {
     const status = !p.enabled
       ? `<span class="badge mut">off</span>`
       : p.coolingMs

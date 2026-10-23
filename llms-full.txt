@@ -224,6 +224,7 @@ Upstream traffic can leave through a proxy pool instead of your own IP. With no 
 - **Sessions**: with `proxySessionMode: "per-proxy"` (default) the minted `x-opencode-session` pair is per client *and* per proxy, so rotating the exit IP rotates the session with it; `"per-client"` keeps one session per client and rotates only the IP. A session the client sends itself is passed through unchanged. The Analytics tab compares the cache hit of the two.
 - **Backpressure**: proxied bodies are pull-driven. The tunnel socket pauses while the reader is behind, so upstream is held back over TCP instead of the body piling up in memory.
 - **Health checks**: `proxyHealthChecks: "proxy"` (default) sends probes, sync, model **Test**, `/health` and `/v1/models` through the pool; `"direct"` sends them straight out, which tells a dead model from a dead proxy. The `autoUA` npm lookup is always direct.
+- **Dashboard list**: the Proxies tab shows 50 proxies per page (‹ prev / next ›), and the page survives the 4 s live refresh. Only one page is rendered: a 9000-row table re-rendered every 4 s held Chrome's renderer at 0.5–1 GB.
 - **Credentials** are masked in the dashboard, `/api/config`, `/api/proxies` and logs, and stored only in `zen-proxy.json`. `PUT /api/config` never touches the list.
 
 ### bring your own key
