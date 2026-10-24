@@ -11,7 +11,7 @@ opencode's Zen gateway serves its free models (`big-pickle`, `space-bunny-free`,
 - The legacy `https://opencode.ai/zen/v1` base still answers `/models` but rejects genuine agent traffic with **403 FreeTierError**. The served base is `https://opencode.ai/inference/v1`.
 - Most agents force their own UA and never send a session header, so they cannot use the free tier directly.
 
-zen-proxy solves this by injecting the correct `User-Agent` and a stable per-client `x-opencode-session` pair upstream, then re-exposing everything on `http://127.0.0.1:8787/v1` — as either a standard OpenAI API or a standard Anthropic Messages API.
+zen-proxy solves this by injecting the correct `User-Agent` (OpenCode's full form, `opencode/<v> ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`), a stable per-client `x-opencode-session` pair and OpenCode's other headers (`x-opencode-client: cli`, `x-opencode-project: global`, a per-call `x-opencode-request: msg_…`, `accept: */*`) upstream, sending generation to `/inference/openai/v1` as OpenCode does (`/models` stays on `/inference/v1`), then re-exposing everything on `http://127.0.0.1:8787/v1` — as either a standard OpenAI API or a standard Anthropic Messages API.
 
 ## Key facts
 

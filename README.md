@@ -117,7 +117,8 @@ zen-proxy sits in front of that gateway and identifies your agent as a real sess
 |---|---|
 | `x-opencode-session` **and** `x-opencode-session-id`, same value | Mints a stable per-client id and sends both |
 | The id must look real — its first 12 hex chars encode a timestamp | Generates ids in OpenCode's own format, not random hex |
-| Base must be `https://opencode.ai/inference/v1` | Uses it, and migrates configs still pointing at the retired `/zen/v1` |
+| Base must be `https://opencode.ai/inference/v1` | Uses it for `/models`, sends generation to `/inference/openai/v1` like OpenCode itself, and migrates configs still pointing at the retired `/zen/v1` |
+| The rest of OpenCode's request headers | Sends what OpenCode 1.19.4 sends: `User-Agent: opencode/<v> ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`, `accept: */*`, `x-opencode-client: cli`, `x-opencode-project: global`, a fresh `x-opencode-request: msg_…` per call (a client's own `x-opencode-*` win) |
 | Streaming, a system message, tool definitions | Real agents already send these; the proxy fills gaps where it can |
 
 For `/v1/messages` specifically, the gateway also requires OpenCode's own tool manifest, so zen-proxy attaches those tools alongside Claude Code's and renames the resulting calls back. **Claude Code's system prompt is passed through untouched.**

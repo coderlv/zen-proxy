@@ -40,7 +40,7 @@ opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …)
   ▸ feature list
   
     - **OpenAI-compatible API** — `/v1/chat/completions` (stream + non-stream), `/v1/models`, `/v1/responses`
-    - **UA unlock** — injects `User-Agent: opencode/1.18.30` plus a stable per-client `x-opencode-session` / `x-opencode-session-id` pair upstream, the things that open the free tier
+    - **UA unlock** — injects `User-Agent: opencode/1.18.30` plus a stable per-client `x-opencode-session` / `x-opencode-session-id` pair upstream, the things that open the free tier Like OpenCode 1.19.4 on the wire it also sends the full UA (`opencode/<v> ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`), `accept: */*`, `x-opencode-client: cli`, `x-opencode-project: global` and a fresh `x-opencode-request: msg_…` per call, and sends generation to `/inference/openai/v1` (the per-model `api` in OpenCode's catalog) while `/models` stays on `/inference/v1`.
     - **BYOK** — ride anonymous `public` or bring your own Zen key (stable + no shared-pool throttling)
     - **Smart fallback** — tries models in order on `429`/`5xx` and dead-model `4xx` (e.g. "Model is unavailable"), honors `retry-after`
     - **Model aliases** — e.g. `gpt-4o → mimo-v2.5-free`, replies rewritten back

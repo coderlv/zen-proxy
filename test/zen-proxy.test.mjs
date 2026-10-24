@@ -264,9 +264,36 @@ describe("ip handling", () => {
   test("zenHeaders sends x-real-ip for public IPs, omits for loopback", () => {
     const pub = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
     assert.equal(pub["x-real-ip"], "8.8.8.8")
-    assert.equal(pub["user-agent"], zp.config.ua)
+    assert.ok(pub["user-agent"].startsWith(zp.config.ua))
     const loop = zp.zenHeaders(mockReq({ remoteAddress: "127.0.0.1" }), "Bearer public")
     assert.equal(loop["x-real-ip"], undefined)
+  })
+
+  test("upstream requests carry opencode's own header set", () => {
+    const keepUa = zp.config.ua
+    zp.saveConfig({ ua: "opencode/1.19.4" })
+    const h = zp.zenHeaders(mockReq(), "Bearer public")
+    assert.equal(h["user-agent"], "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4")
+    assert.equal(h.accept, "*/*")
+    assert.equal(h["x-opencode-client"], "cli")
+    assert.equal(h["x-opencode-project"], "global")
+    assert.match(h["x-opencode-request"], /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    assert.notEqual(zp.zenHeaders(mockReq(), "Bearer public")["x-opencode-request"], h["x-opencode-request"], "one id per request")
+    const own = zp.zenHeaders(mockReq({ headers: { "x-opencode-client": "desktop", "x-opencode-project": "abc" } }), "Bearer public")
+    assert.deepEqual([own["x-opencode-client"], own["x-opencode-project"]], ["desktop", "abc"])
+    zp.saveConfig({ ua: "custom-agent/2" })
+    assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "custom-agent/2", "a hand-set UA is sent as is")
+    zp.saveConfig({ ua: keepUa })
+  })
+
+  test("generation goes to opencode's /inference/openai/v1 on the default upstream", () => {
+    const keep = zp.config.upstream
+    zp.saveConfig({ upstream: "https://opencode.ai/inference/v1" })
+    assert.equal(zp.inferenceUrl("chat"), "https://opencode.ai/inference/openai/v1/chat/completions")
+    assert.equal(zp.inferenceUrl("responses"), "https://opencode.ai/inference/openai/v1/responses")
+    zp.saveConfig({ upstream: "http://127.0.0.1:9/v1" })
+    assert.equal(zp.inferenceUrl("chat"), "http://127.0.0.1:9/v1/chat/completions", "a custom upstream is used as is")
+    zp.saveConfig({ upstream: keep })
   })
 
   test("zenHeaders forwards x-opencode-* headers", () => {

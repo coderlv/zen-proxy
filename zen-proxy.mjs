@@ -76,6 +76,14 @@ const VALID_MODEL_ID = /^[A-Za-z0-9._:@+/%-]+$/
 // still points at it silently loses every free model.
 const DEFAULT_UPSTREAM = "https://opencode.ai/inference/v1"
 const LEGACY_UPSTREAMS = new Set(["https://opencode.ai/zen/v1", "https://opencode.ai/zen"])
+// opencode sends generation to /inference/openai/v1 (the per-model `api` in its
+// catalog) while /models only exists on /inference/v1, so the default base keeps
+// serving the model list and generation goes where opencode sends it.
+const OPENCODE_INFERENCE = "https://opencode.ai/inference/openai/v1"
+function inferenceUrl(format) {
+  const base = config.upstream === DEFAULT_UPSTREAM ? OPENCODE_INFERENCE : config.upstream
+  return base + (format === "responses" ? "/responses" : "/chat/completions")
+}
 function normalizeUpstream(v) {
   const u = String(v ?? "").trim().replace(/\/+$/, "")
   if (!u) return DEFAULT_UPSTREAM
@@ -1074,17 +1082,37 @@ const SESSION_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 const SESSION_MAX_AGE_MS = 30 * 60_000
 const sessionPool = new Map()
 let sessionClock = { ms: 0, ctr: 0 }
-function genSessionId(now = Date.now()) {
+// opencode's Identifier: sessions count down (descending), messages count up.
+function opencodeId(prefix, descending, now = Date.now()) {
   if (now !== sessionClock.ms) {
     sessionClock.ms = now
     sessionClock.ctr = 0
   }
   sessionClock.ctr++
   const stamp = BigInt(now) * 0x1000n + BigInt(sessionClock.ctr)
-  const masked = ~stamp
+  const masked = descending ? ~stamp : stamp
   const hex = Array.from({ length: 6 }, (_, i) => Number(masked >> BigInt(40 - 8 * i) & 0xffn).toString(16).padStart(2, "0")).join("")
   const tail = Array.from(randomBytes(14), (b) => SESSION_ALPHABET[b % 62]).join("")
-  return { value: "ses_" + hex + tail, at: now }
+  return prefix + hex + tail
+}
+function genSessionId(now = Date.now()) {
+  return { value: opencodeId("ses_", true, now), at: now }
+}
+
+// The rest of what opencode 1.19.4 puts on every model request (captured on
+// the wire, 2026-10-24). A client that sends its own x-opencode-* keeps them.
+const OPENCODE_UA_TAIL = " ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4"
+function opencodeHeaders(req, auth) {
+  const own = (h) => (typeof req?.headers?.[h] === "string" && req.headers[h]) || undefined
+  return {
+    "content-type": "application/json",
+    accept: "*/*",
+    authorization: auth,
+    "user-agent": /^opencode\/[\d.]+$/.test(config.ua) ? config.ua + OPENCODE_UA_TAIL : config.ua,
+    "x-opencode-client": own("x-opencode-client") ?? "cli",
+    "x-opencode-project": own("x-opencode-project") ?? "global",
+    "x-opencode-request": own("x-opencode-request") ?? opencodeId("msg_", false),
+  }
 }
 // With a proxy, the minted id is per client *and* per proxy: a new exit IP
 // that kept the old session would still read as the same client upstream.
@@ -2125,12 +2153,7 @@ function ipOmit(ip) {
 }
 
 function zenHeaders(req, auth) {
-  const headers = {
-    "content-type": "application/json",
-    accept: "application/json, text/event-stream",
-    authorization: auth,
-    "user-agent": config.ua,
-  }
+  const headers = opencodeHeaders(req, auth)
   const sess = sessionFor(req)
   // Send both session headers whenever we are allowed to supply one. A client
   // that brings its own session keeps it; we just mirror it into the second
@@ -2140,10 +2163,6 @@ function zenHeaders(req, auth) {
   }
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
-  for (const h of ["x-opencode-request", "x-opencode-client", "x-opencode-project"]) {
-    const v = req.headers[h]
-    if (typeof v === "string" && v) headers[h] = v
-  }
   return headers
 }
 
@@ -2298,7 +2317,7 @@ async function handleMessages(req, res) {
       }
       let upstreamRes
       try {
-        upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+        upstreamRes = await upstreamFetch(inferenceUrl(format), {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
@@ -2535,7 +2554,7 @@ async function handleChat(req, res, responsesRoute = false) {
       }
       let upstreamRes
       try {
-        upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+        upstreamRes = await upstreamFetch(inferenceUrl(format), {
           method: "POST",
           headers: zenHeaders(req, auth),
           body: JSON.stringify(payload),
@@ -3305,14 +3324,9 @@ function agentProbePayload(id, format) {
 // actually lives on. Returns the raw Response so sync can classify it.
 async function probeModel(id, auth, session) {
   const format = modelFormat(id)
-  const headers = {
-    "content-type": "application/json",
-    accept: "application/json, text/event-stream",
-    authorization: auth,
-    "user-agent": config.ua,
-  }
+  const headers = opencodeHeaders(null, auth)
   if (session) for (const h of SESSION_HEADERS) headers[h] = session
-  const r = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+  const r = await upstreamFetch(inferenceUrl(format), {
     method: "POST",
     headers,
     body: JSON.stringify(agentProbePayload(id, format)),
@@ -4195,15 +4209,10 @@ async function handleTest(req, res) {
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
     const format = modelFormat(model)
-    const upstreamRes = await upstreamFetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
+    const upstreamRes = await upstreamFetch(inferenceUrl(format), {
       method: "POST",
       headers: (() => {
-        const h = {
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          authorization: auth,
-          "user-agent": config.ua,
-        }
+        const h = opencodeHeaders(null, auth)
         const sess = sessionHeader(req)
         if (sess) for (const name of SESSION_HEADERS) h[name] = sess
         const ip = req.socket.remoteAddress ?? ""
@@ -4577,6 +4586,8 @@ export {
   toBool,
   sessionFor,
   rotateSession,
+  opencodeHeaders,
+  inferenceUrl,
   sessionHeader,
   MAX_BODY,
   VALID_MODEL_ID,
