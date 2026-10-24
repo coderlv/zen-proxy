@@ -199,6 +199,7 @@ It is kept outside the install dir, so reinstalls and `git pull` never touch it:
 | `proxyRetries` | `3` | Extra proxies one request tries after a dead tunnel, a stream cut before its first byte, or a `429` (0–20) |
 | `proxyFirstByteMs` | `90000` | A proxy that sends no first byte (headers included) in this time is dropped for the next one; `0` turns it off |
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: route for probes, sync, model test, `/health`, `/v1/models` |
+| (probe message) | — | Sync probes and the dashboard **Test** send one user message, `hi`, as any user would (`max_tokens` 5, opencode's tool list with `tool_choice: "none"` for the gate) |
 | `proxySessionMode` | `per-proxy` | `per-proxy` (session rotates with the proxy) or `per-client` (only the IP rotates) |
 
 Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `PROXIES` (comma-separated), `PROXY_STRATEGY`, `PROXY_COOLDOWN_MS`, `PROXY_RETRIES`, `PROXY_FIRST_BYTE_MS`, `PROXY_HEALTH_CHECKS`, `PROXY_SESSION_MODE`, `ZEN_PROXY_CONFIG` (custom config path), `ZEN_PROXY_STATS` (analytics file).

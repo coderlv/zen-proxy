@@ -642,7 +642,7 @@ describe("sync prunes unsupported models", () => {
     assert.equal(s.gated.length, 0, "nothing is written off as gate-blocked")
     assert.ok(seen.length >= 2 && seen.every((b) => b.stream === true), "every probe streams")
     assert.ok(seen.every((b) => b.tools?.length > 0), "every probe carries the tool manifest")
-    assert.ok(seen.every((b) => b.tool_choice === "none"), "ping replies stay plain text, not tool calls")
+    assert.ok(seen.every((b) => b.tool_choice === "none"), "hi replies stay plain text, not tool calls")
   })
 
   test("responses-format models get an agent-shaped probe on /responses", async () => {
@@ -668,7 +668,7 @@ describe("sync prunes unsupported models", () => {
     assert.ok(s.working.includes("muse-spark-1.3-contributor-free"), "reported working")
     assert.equal(sentBody.stream, true, "responses probe streams too")
     assert.ok(sentBody.tools?.length > 0, "responses probe carries converted tools")
-    assert.equal(sentBody.input, "ping")
+    assert.equal(sentBody.input, "hi")
     assert.ok(!("tool_choice" in sentBody), "responses payload stays in responses dialect")
   })
 })
@@ -863,7 +863,7 @@ describe("auth visibility & key test", () => {
     assert.equal(sentAuth, "Bearer sk-custom-zen-key")
     assert.equal(sentBody.stream, true, "probe streams like a real client")
     assert.ok(sentBody.tools?.length > 0, "probe carries opencode's tool manifest")
-    assert.equal(sentBody.tool_choice, "none", "ping answers stay plain text")
+    assert.equal(sentBody.tool_choice, "none", "hi answers stay plain text")
   })
 })
 

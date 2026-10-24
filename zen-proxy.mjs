@@ -3286,15 +3286,15 @@ function probeAuthHeader() {
 function agentProbePayload(id, format) {
   const tools = gateBridgeTools()
   if (format === "responses") {
-    const payload = { model: id, input: "ping", max_output_tokens: 32, stream: true }
+    const payload = { model: id, input: "hi", max_output_tokens: 32, stream: true }
     const converted = chatToolsToResponses(tools)
     if (converted) payload.tools = converted
     return payload
   }
-  const payload = { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5, stream: true }
+  const payload = { model: id, messages: [{ role: "user", content: "hi" }], max_tokens: 5, stream: true }
   if (tools.length) {
     payload.tools = tools
-    // The bridge is for the gate, not the answer: a "ping" should come back as
+    // The bridge is for the gate, not the answer: a "hi" should come back as
     // text, never as a tool call.
     payload.tool_choice = "none"
   }
@@ -3319,7 +3319,7 @@ async function probeModel(id, auth, session) {
     signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
   }, { health: true })
   // A live model answers the streamed probe with SSE, and sync only needs the
-  // status. Hang up instead of waiting for the model to finish its "ping".
+  // status. Hang up instead of waiting for the model to finish its "hi".
   if (r.ok) {
     try { await r.body?.cancel() } catch {}
   }
