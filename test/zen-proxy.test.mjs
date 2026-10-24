@@ -40,6 +40,7 @@ after(() => {
 
 const MODEL_ID_RE = /^[A-Za-z0-9._:@+/%-]+$/
 const DEFAULT_MODEL = zp.config.defaultModel || zp.config.fallbackModels[0] || ""
+const DEFAULT_ENV_BLOCK = zp.config.envBlock
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url))
 // Git Bash (Windows) mangles backslash paths; forward slashes work everywhere
 const toPosix = (p) => p.replace(/\\/g, "/")
@@ -5700,6 +5701,41 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
       messages: [{ role: "system", content: "prompt" }, { role: "user", content: "hi" }],
     })
     assert.ok(sysText(sent).includes(process.platform), `the placeholder must be substituted: ${sysText(sent)}`)
+  })
+
+  test("the shipped default spells all five fields the gate reads", async () => {
+    cfg({ envBlock: DEFAULT_ENV_BLOCK })
+    const sent = await sentFor({
+      model: "big-pickle",
+      messages: [{ role: "system", content: "prompt" }, { role: "user", content: "hi" }],
+    })
+    const t = sysText(sent)
+    for (const field of ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"])
+      assert.ok(t.includes(field), `the gate reads the field structure, not just the tag: missing ${field} in ${t}`)
+    assert.ok(!t.includes("{"), `every placeholder must be filled: ${t}`)
+    assert.ok(t.includes(`Working directory: ${process.cwd()}`), `the block states where the proxy really runs: ${t}`)
+  })
+
+  test("the git field walks up to the repo the working directory sits in", async () => {
+    fs.mkdirSync(path.join(tmpDir, "fake-repo", ".git"), { recursive: true })
+    const repo = fs.realpathSync(path.join(tmpDir, "fake-repo"))
+    const deep = path.join(repo, "src", "deep")
+    fs.mkdirSync(deep, { recursive: true })
+    const before = process.cwd()
+    process.chdir(deep)
+    try {
+      cfg({ envBlock: DEFAULT_ENV_BLOCK })
+      const sent = await sentFor({
+        model: "big-pickle",
+        messages: [{ role: "system", content: "prompt" }, { role: "user", content: "hi" }],
+      })
+      const t = sysText(sent)
+      assert.ok(t.includes(`Working directory: ${deep}`), `the working directory is the caller's, not the repo root: ${t}`)
+      assert.ok(t.includes(`Workspace root folder: ${repo}`), `the root line names the repo the call runs in: ${t}`)
+      assert.ok(t.includes("Is directory a git repo: yes"), `inside a repo the answer is yes: ${t}`)
+    } finally {
+      process.chdir(before)
+    }
   })
 
   test("the block reaches the responses route through the input translation", async () => {

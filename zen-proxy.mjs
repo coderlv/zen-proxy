@@ -1039,13 +1039,16 @@ const DEFAULT_CONFIG = {
   // Append opencode's own tools to Anthropic /v1/messages requests so the free
   // tier accepts them. Calls to them are renamed back to the caller's tools.
   agentTools: ENV.AGENT_TOOLS !== "0",
-  // The gate also reads the system prompt: without OpenCode's `<env>` block it
-  // answers 429 even with the captured hello (measured 2026-10-24, see
-  // docs/investigations/2026-10-24-free-tier-429.md). The tag is what is
-  // recognized, so the block carries only what the proxy can state truthfully;
-  // {platform} and {date} are filled per request. "" leaves the caller's prompt
-  // exactly as the caller wrote it.
-  envBlock: ENV.ENV_BLOCK ?? "<env>\n  Platform: {platform}\n  Today's date: {date}\n</env>",
+  // The gate reads the system prompt: a caller prompt without OpenCode's `<env>`
+  // block gets 429 even with OpenCode's headers, tools and ClientHello (measured
+  // 2026-10-24, see docs/investigations/2026-10-24-free-tier-429.md). What it
+  // recognizes is the block's *field structure* — the five lines opencode itself
+  // writes — not the text under them: the same fields with the proxy's own values
+  // pass, a two-field block does not. So the default spells all five, and every
+  // placeholder is filled with something the proxy can state truthfully. Tools are
+  // not required once the block is right. "" leaves the caller's prompt exactly as
+  // the caller wrote it.
+  envBlock: ENV.ENV_BLOCK ?? "<env>\n  Working directory: {cwd}\n  Workspace root folder: {root}\n  Is directory a git repo: {git}\n  Platform: {platform}\n  Today's date: {date}\n</env>",
   // opencode Zen serves each model on a specific endpoint family
   // (chat/completions | responses | messages). Patterns may end in `*`.
   // Source of truth: https://opencode.ai/docs/zen
@@ -2322,16 +2325,42 @@ function opencodeChatBody(payload) {
   return payload
 }
 
-// What the gate looks for in the system prompt. A caller prompt without the
-// `<env>` tag gets 429 even with OpenCode's headers and ClientHello; a one-line
-// block gets 200, so the tag is recognized and its contents are not read. A
-// caller that already carries one is left alone. Health probes never go through
-// here: a probe that passes the gate starts spending quota on a model it only
-// wanted to check.
+// What the gate looks for in the system prompt. A caller prompt without OpenCode's
+// `<env>` block gets 429 even with OpenCode's headers, tools and ClientHello; the
+// five fields opencode writes get 200 even with the proxy's own values, while only
+// Platform + date gets 429 — so the recognized thing is the field structure, not
+// the text under it (measured 2026-10-24, two independent records). Tools are not
+// required once the block is right, and the date format is free (ISO passes). A
+// caller that already carries a block is left alone. Health probes never come
+// through here: a probe that passes the gate starts spending quota on a model it
+// only wanted to check.
+const gitRootCache = new Map()
+function gitRootAt(dir) {
+  const key = path.resolve(dir)
+  const hit = gitRootCache.get(key)
+  if (hit !== undefined) return hit
+  let found = ""
+  for (let d = key; ; d = path.dirname(d)) {
+    if (fs.existsSync(path.join(d, ".git"))) {
+      found = d
+      break
+    }
+    if (path.dirname(d) === d) break
+  }
+  if (gitRootCache.size > 256) gitRootCache.clear()
+  gitRootCache.set(key, found)
+  return found
+}
+
 function envBlockText() {
   const raw = String(config.envBlock ?? "")
   if (!raw) return ""
+  const cwd = process.cwd()
+  const git = gitRootAt(cwd)
   return raw
+    .replace("{cwd}", cwd)
+    .replace("{root}", git || cwd)
+    .replace("{git}", git ? "yes" : "no")
     .replace("{platform}", process.platform)
     .replace("{date}", new Date().toISOString().slice(0, 10))
 }
@@ -4789,6 +4818,7 @@ export {
   AGENT_TOOL_MAP,
   AGENT_PREAMBLE_TEXT,
   envBlockText,
+  gitRootAt,
   applyEnvBlock,
   agentProbePayload,
   relayStream,
