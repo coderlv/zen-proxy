@@ -3339,13 +3339,23 @@ describe("proxy transport", () => {
     assert.ok(rig.seen.socks >= 1)
   })
 
-  test("tunnels failing on three entries of one host pause the host instead of walking on", async () => {
-    const bad = [1, 2, 3, 4].map((n) => rig.badHttpProxy.replace("wrong", "wrong" + n))
+  test("tunnels failing on six entries of one host in a row pause the host instead of walking on", async () => {
+    const bad = [1, 2, 3, 4, 5, 6, 7].map((n) => rig.badHttpProxy.replace("wrong", "wrong" + n))
     zp.saveConfig({ proxies: bad, proxyStrategy: "failover", proxyRetries: 10 })
     await assert.rejects(zp.upstreamFetch(`${rig.upstreamUrl}/x`, {}, { req: mockReq(), model: DEFAULT_MODEL }), (e) => e.code === "NO_PROXY")
-    assert.deepEqual(bad.map((u) => zp.proxyStat(u).uses), [1, 1, 1, 0], "the fourth entry is never tried")
+    assert.deepEqual(bad.map((u) => zp.proxyStat(u).uses), [1, 1, 1, 1, 1, 1, 0], "the seventh entry is never tried")
     zp.proxyStat(bad[0]).cooldownUntil = 0
     assert.throws(() => zp.pickProxy(), (e) => e.code === "NO_PROXY" && /throttling/.test(e.message), "the host stays paused")
+  })
+
+  test("an open tunnel resets the failure streak, so scattered failures never pause the host", async () => {
+    const bad = [1, 2, 3, 4, 5, 6, 7, 8].map((n) => rig.badHttpProxy.replace("wrong", "wrong" + n))
+    zp.saveConfig({ proxies: [...bad.slice(0, 4), rig.httpProxy, ...bad.slice(4)], proxyStrategy: "failover", proxyRetries: 10 })
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/chat`, {}, { req: mockReq(), model: DEFAULT_MODEL })
+    await r.text()
+    zp.proxyStat(rig.httpProxy).cooldownUntil = Date.now() + 60_000
+    await assert.rejects(zp.upstreamFetch(`${rig.upstreamUrl}/x`, {}, { req: mockReq(), model: DEFAULT_MODEL }), (e) => e.code === "NO_PROXY")
+    assert.ok(!(zp.hostState.get(new URL(rig.httpProxy).host)?.pausedUntil > Date.now()), "4 + 4 failures split by a success never trip")
   })
 
   test("a 407 cools the proxy down and surfaces the reason", async () => {

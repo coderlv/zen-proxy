@@ -572,11 +572,13 @@ function recentProxyEvents(now = Date.now()) {
 }
 
 // The entries of a rotating gateway share one host. Tunnels failing across
-// several of them at once mean the gateway is throttling the account (measured
+// several of them in a row mean the gateway is throttling the account (measured
 // on novaproxy: resets and 407 "plan expired" after ~100 parallel CONNECTs,
 // clean again after a quiet minute), so walking on to the next entry only
-// feeds the throttle: the whole host sits out a short pause instead.
-const HOST_TRIP = 3
+// feeds the throttle: the whole host sits out a short pause instead. Any tunnel
+// that opens resets the streak: single exits dying now and then is ordinary
+// (measured at startup: 429, TLS reset, 407, 407 with the gateway healthy).
+const HOST_TRIP = 6
 const HOST_WINDOW_MS = 10_000
 const HOST_PAUSE_MS = 60_000
 const hostState = new Map()
@@ -589,7 +591,11 @@ function noteHostFailure(url, now = Date.now()) {
   if (h.fails.length < HOST_TRIP) return
   h.fails = []
   h.pausedUntil = now + HOST_PAUSE_MS
-  log(`proxy host ${host} paused for ${HOST_PAUSE_MS / 1000}s: ${HOST_TRIP} entries failed to tunnel within ${HOST_WINDOW_MS / 1000}s, the gateway is throttling`)
+  log(`proxy host ${host} paused for ${HOST_PAUSE_MS / 1000}s: ${HOST_TRIP} entries in a row failed to tunnel within ${HOST_WINDOW_MS / 1000}s, the gateway is throttling`)
+}
+function noteHostSuccess(url) {
+  const h = hostState.get(proxyMeta(url).host)
+  if (h) h.fails = []
 }
 const hostPaused = (url, now) => (hostState.get(proxyMeta(url).host)?.pausedUntil ?? 0) > now
 
@@ -749,6 +755,7 @@ async function proxyAttempt(chosen, url, init, req, peek) {
   }
   try {
     let r = await proxiedFetch(chosen, url, ctrl ? { ...init, signal: ctrl.signal } : init)
+    noteHostSuccess(chosen)
     rotateSession(req, r)
     st.lastMs = Date.now() - t0
     st.lastStatus = r.status
