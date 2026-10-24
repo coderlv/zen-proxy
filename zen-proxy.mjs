@@ -486,13 +486,35 @@ async function openTunnel(proxy, host, port, signal) {
 
 // fetch() over a proxy tunnel. Supports the subset of fetch the upstream calls
 // use: string body, plain-object headers, an AbortSignal.
+// A plain TCP connection for the no-proxy path, handed over paused like a tunnel.
+function directSocket(host, port, signal) {
+  return new Promise((resolve, reject) => {
+    const s = net.connect(port, host)
+    const onAbort = () => {
+      s.destroy()
+      reject(signal.reason ?? new Error("aborted"))
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+    s.once("connect", () => {
+      signal?.removeEventListener("abort", onAbort)
+      s.pause()
+      resolve(s)
+    })
+    s.once("error", (err) => {
+      signal?.removeEventListener("abort", onAbort)
+      reject(err)
+    })
+  })
+}
+
+// `proxy` null means a direct connection: same client, so no fetch() extras.
 async function proxiedFetch(proxy, url, init = {}) {
   const target = new URL(url)
   const secure = target.protocol === "https:"
   const port = Number(target.port) || (secure ? 443 : 80)
   const signal = init.signal
   if (signal?.aborted) throw signal.reason ?? new Error("aborted")
-  let sock = await openTunnel(proxy, target.hostname, port, signal)
+  let sock = proxy ? await openTunnel(proxy, target.hostname, port, signal) : await directSocket(target.hostname, port, signal)
   // The reader left it paused; nothing arrives before our request is written,
   // so handing it over flowing loses no bytes.
   sock.resume()
@@ -690,9 +712,17 @@ async function upstreamFetch(url, init = {}, opts = {}) {
   return meterResponse(r, ev, start, opts.req)
 }
 
+// fetch() adds `accept-language: *` and `sec-fetch-mode: cors`, which opencode
+// never sends, so direct calls use the proxy client over a plain socket. A fetch
+// someone replaced (tests, embedders) is still honoured.
+const nativeFetch = globalThis.fetch
+function directFetch(url, init) {
+  return globalThis.fetch === nativeFetch ? proxiedFetch(null, url, init) : fetch(url, init)
+}
+
 async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev) {
   const list = config.proxies ?? []
-  if (!proxy && (!list.length || (health && config.proxyHealthChecks === "direct"))) return fetch(url, init).then((r) => (rotateSession(req, r), r))
+  if (!proxy && (!list.length || (health && config.proxyHealthChecks === "direct"))) return directFetch(url, init).then((r) => (rotateSession(req, r), r))
   if (ev) ev.mode = config.proxySessionMode
   if (proxy) return proxyAttempt(proxy, url, init, req, false)
   // A dead tunnel, a body cut before its first byte, or a 429 (a per-IP limit)
@@ -2152,6 +2182,15 @@ function ipOmit(ip) {
   return false
 }
 
+// What opencode puts in every chat body beside the conversation (same capture).
+// A client's own token budget is kept.
+const OPENCODE_MAX_TOKENS = 32000
+function opencodeChatBody(payload) {
+  payload.stream_options = { include_usage: true }
+  if (payload.max_tokens == null && payload.max_completion_tokens == null) payload.max_tokens = OPENCODE_MAX_TOKENS
+  return payload
+}
+
 function zenHeaders(req, auth) {
   const headers = opencodeHeaders(req, auth)
   const sess = sessionFor(req)
@@ -2298,7 +2337,7 @@ async function handleMessages(req, res) {
     // The gate's read stub, when the caller needs one, rides inside the
     // translated body (see anthropicToChatBody) — this must not inject again.
     const chatShaped = anthropicToChatBody(body, model)
-    const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : { ...chatShaped, stream: true }
+    const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : opencodeChatBody({ ...chatShaped, stream: true })
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
       // /responses takes only "auto"; the chat endpoint takes the pin.
@@ -2521,7 +2560,7 @@ async function handleChat(req, res, responsesRoute = false) {
     // Streams upstream regardless of what the client asked for — see
     // collectChatCompletion — and the collector puts the shape back.
     const payload =
-      format === "responses" ? responsesRequest(requestBody, model, true) : { ...requestBody, model, stream: true }
+      format === "responses" ? responsesRequest(requestBody, model, true) : opencodeChatBody({ ...requestBody, model, stream: true })
     // A Responses body that reaches a responses-family model keeps its input
     // verbatim: the chat round-trip above preserves mostly everything, but
     // content parts do not survive it losslessly — an input_image next to
@@ -3310,7 +3349,7 @@ function agentProbePayload(id, format) {
     if (converted) payload.tools = converted
     return payload
   }
-  const payload = { model: id, messages: [{ role: "user", content: "hi" }], max_tokens: 5, stream: true }
+  const payload = opencodeChatBody({ model: id, messages: [{ role: "user", content: "hi" }], stream: true })
   if (tools.length) {
     payload.tools = tools
     // The bridge is for the gate, not the answer: a "hi" should come back as

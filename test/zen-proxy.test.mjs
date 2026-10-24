@@ -1527,6 +1527,17 @@ describe("handleChat", () => {
     assert.equal(JSON.parse(res.body).model, "gpt-4o")
   })
 
+  test("chat bodies carry opencode's stream_options and 32000-token default, a client's own budget wins", async () => {
+    const sent = []
+    globalThis.fetch = routeFetch([["/chat/completions", (u, opts) => (sent.push(JSON.parse(opts.body)), jsonResponse({ error: { message: "stop" } }, 400))]])
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "whatever", messages: [{ role: "user", content: "hi" }] }) }), mockRes())
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "whatever", messages: [{ role: "user", content: "hi" }], max_completion_tokens: 777 }) }), mockRes())
+    assert.deepEqual(sent[0].stream_options, { include_usage: true })
+    assert.equal(sent[0].max_tokens, 32000)
+    assert.equal(sent[1].max_tokens, undefined, "no second budget next to the client's")
+    assert.equal(sent[1].max_completion_tokens, 777)
+  })
+
   test("falls back to next candidate on 429", async () => {
     zp.saveConfig({ retriesPerModel: 0 }) // retry-then-fallback is covered in its own describe
     const [m1, m2] = zp.config.fallbackModels
@@ -3114,7 +3125,7 @@ function listen(server) {
 async function startProxyRig() {
   const seen = { upstream: [], connect: 0, socks: 0 }
   const upstream = http.createServer((req, res) => {
-    seen.upstream.push({ url: req.url, method: req.method, host: req.headers.host, session: req.headers["x-opencode-session"], sessionId: req.headers["x-opencode-session-id"] })
+    seen.upstream.push({ url: req.url, method: req.method, host: req.headers.host, session: req.headers["x-opencode-session"], sessionId: req.headers["x-opencode-session-id"], headers: req.headers })
     if (req.url.startsWith("/big")) {
       // 256MB, written only as fast as the socket drains, so `bigWritten` shows
       // how far ahead of the reader upstream was allowed to get.
@@ -3446,6 +3457,18 @@ describe("proxy transport", () => {
     const r = await zp.upstreamFetch(`${rig.upstreamUrl}/limited`, {}, { req, model: DEFAULT_MODEL })
     await r.body?.cancel()
     assert.equal(rig.seen.upstream.length - before, 1)
+  })
+
+  test("a direct call carries none of fetch()'s extra headers", async () => {
+    zp.saveConfig({ proxies: [] })
+    const before = rig.seen.upstream.length
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/chat`, { method: "POST", headers: zp.zenHeaders(mockReq(), "Bearer public"), body: "{}" }, { req: mockReq(), model: DEFAULT_MODEL })
+    assert.equal(r.status, 200)
+    await r.text()
+    const h = rig.seen.upstream.slice(before).at(-1).headers
+    assert.equal(h["accept-language"], undefined)
+    assert.equal(h["sec-fetch-mode"], undefined)
+    assert.equal(h["x-opencode-client"], "cli")
   })
 
   test("a tunnel cut before the first byte is retried on the next proxy", async () => {

@@ -40,7 +40,7 @@ opencode's free `-free` models (`mimo-v2.5-free`, `big-pickle`, `nemotron`, …)
   ▸ feature list
   
     - **OpenAI-compatible API** — `/v1/chat/completions` (stream + non-stream), `/v1/models`, `/v1/responses`
-    - **UA unlock** — injects `User-Agent: opencode/1.18.30` plus a stable per-client `x-opencode-session` / `x-opencode-session-id` pair upstream, the things that open the free tier Like OpenCode 1.19.4 on the wire it also sends the full UA (`opencode/<v> ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`), `accept: */*`, `x-opencode-client: cli`, `x-opencode-project: global` and a fresh `x-opencode-request: msg_…` per call, and sends generation to `/inference/openai/v1` (the per-model `api` in OpenCode's catalog) while `/models` stays on `/inference/v1`.
+    - **UA unlock** — injects `User-Agent: opencode/1.18.30` plus a stable per-client `x-opencode-session` / `x-opencode-session-id` pair upstream, the things that open the free tier Like OpenCode 1.19.4 on the wire it also sends the full UA (`opencode/<v> ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`), `accept: */*`, `x-opencode-client: cli`, `x-opencode-project: global` and a fresh `x-opencode-request: msg_…` per call, and sends generation to `/inference/openai/v1` (the per-model `api` in OpenCode's catalog) while `/models` stays on `/inference/v1`. Direct calls go through the proxy client over a plain socket, so Node `fetch()`'s `accept-language: *` and `sec-fetch-mode: cors` never leave; chat bodies get OpenCode's `stream_options: {include_usage: true}` and `max_tokens: 32000` unless the client set its own budget (sync probes and **Test** included).
     - **BYOK** — ride anonymous `public` or bring your own Zen key (stable + no shared-pool throttling)
     - **Smart fallback** — tries models in order on `429`/`5xx` and dead-model `4xx` (e.g. "Model is unavailable"), honors `retry-after`
     - **Model aliases** — e.g. `gpt-4o → mimo-v2.5-free`, replies rewritten back
@@ -199,7 +199,7 @@ It is kept outside the install dir, so reinstalls and `git pull` never touch it:
 | `proxyRetries` | `3` | Extra proxies one request tries after a dead tunnel, a stream cut before its first byte, or a `429` (0–20) |
 | `proxyFirstByteMs` | `90000` | A proxy that sends no first byte (headers included) in this time is dropped for the next one; `0` turns it off |
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: route for probes, sync, model test, `/health`, `/v1/models` |
-| (probe message) | — | Sync probes and the dashboard **Test** send one user message, `hi`, as any user would (`max_tokens` 5, opencode's tool list with `tool_choice: "none"` for the gate) |
+| (probe message) | — | Sync probes and the dashboard **Test** send one user message, `hi`, as any user would (`max_tokens` 32000 like OpenCode, opencode's tool list with `tool_choice: "none"` for the gate) |
 | `proxySessionMode` | `per-proxy` | `per-proxy` (session rotates with the proxy) or `per-client` (only the IP rotates) |
 
 Env vars: `HOST`, `PORT`, `ZEN_URL`, `ZEN_UA`, `INJECT_SESSION` (`0` to disable), `AUTO_UA` (`0` to disable), `UA_REFRESH_MS`, `PROBE_AUTH`, `RESPONSES_MODELS` (JSON), `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `DEFAULT_MODEL`, `FALLBACK_MODELS` (JSON), `MODEL_ALIASES` (JSON), `PROXY_KEY`, `ZEN_KEY`, `TRUST_FORWARDED=1`, `TIMEOUT_MS`, `CACHE_MS`, `PROXIES` (comma-separated), `PROXY_STRATEGY`, `PROXY_COOLDOWN_MS`, `PROXY_RETRIES`, `PROXY_FIRST_BYTE_MS`, `PROXY_HEALTH_CHECKS`, `PROXY_SESSION_MODE`, `ZEN_PROXY_CONFIG` (custom config path), `ZEN_PROXY_STATS` (analytics file).
