@@ -916,6 +916,9 @@ const DEFAULT_CONFIG = {
   port: Number(ENV.PORT ?? 8787),
   upstream: normalizeUpstream(ENV.ZEN_URL ?? DEFAULT_UPSTREAM),
   ua: ENV.ZEN_UA ?? "opencode/1.18.30",
+  // What the AI SDK appends to opencode's own UA on the wire. Measured from the
+  // 1.19.4 binary; the Bun part follows releases, provider-utils is set by hand.
+  uaTail: ENV.ZEN_UA_TAIL ?? "ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4",
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
@@ -1150,14 +1153,13 @@ function genSessionId(now = Date.now()) {
 
 // The rest of what opencode 1.19.4 puts on every model request (captured on
 // the wire, 2026-10-24). A client that sends its own x-opencode-* keeps them.
-const OPENCODE_UA_TAIL = " ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4"
 function opencodeHeaders(req, auth) {
   const own = (h) => (typeof req?.headers?.[h] === "string" && req.headers[h]) || undefined
   return {
     "content-type": "application/json",
     accept: "*/*",
     authorization: auth,
-    "user-agent": /^opencode\/[\d.]+$/.test(config.ua) ? config.ua + OPENCODE_UA_TAIL : config.ua,
+    "user-agent": /^opencode\/[\d.]+$/.test(config.ua) && config.uaTail ? `${config.ua} ${config.uaTail}` : config.ua,
     "x-opencode-client": own("x-opencode-client") ?? "cli",
     "x-opencode-project": own("x-opencode-project") ?? "global",
     "x-opencode-request": own("x-opencode-request") ?? opencodeId("msg_", false),
@@ -4080,6 +4082,7 @@ async function refreshUA(force = false) {
     const v = String(data?.version ?? "")
     if (!/^\d+\.\d+\.\d+/.test(v)) return uaAutoState.version
     uaAutoState.version = v
+    await refreshUaTail(v)
     const next = `opencode/${v}`
     if (next !== config.ua && /^opencode\/\d+\.\d+\.\d+/.test(config.ua)) {
       log(`auto-UA: opencode ${v} released — updating User-Agent`)
@@ -4089,6 +4092,23 @@ async function refreshUA(force = false) {
   } catch {
     return uaAutoState.version
   }
+}
+
+// A release's packageManager names the Bun that compiled it (bun@1.4.4 matched
+// the 1.19.4 binary's runtime/bun/1.4.4). provider-utils cannot be read off the
+// repo: the tag's lockfile resolves 4.0.21, the binary sends 4.0.23.
+async function refreshUaTail(v) {
+  if (!/runtime\/bun\/[\d.]+/.test(config.uaTail ?? "")) return
+  try {
+    const res = await fetch(`https://raw.githubusercontent.com/anomalyco/opencode/v${v}/package.json`, { signal: AbortSignal.timeout(10_000) })
+    if (!res.ok) return
+    const bun = /^bun@(\d+\.\d+\.\d+)$/.exec(String((await res.json())?.packageManager ?? ""))?.[1]
+    if (!bun) return
+    const next = config.uaTail.replace(/runtime\/bun\/[\d.]+/, `runtime/bun/${bun}`)
+    if (next === config.uaTail) return
+    log(`auto-UA: opencode ${v} is built with Bun ${bun}, updating the UA tail`)
+    try { saveConfig({ uaTail: next }) } catch {}
+  } catch {}
 }
 
 let uaTimer = null
@@ -4156,6 +4176,7 @@ async function handleApiConfig(req, res) {
       cleaned.trustForwarded = toBool(cleaned.trustForwarded, config.trustForwarded)
       cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
+      if ("uaTail" in cleaned) cleaned.uaTail = String(cleaned.uaTail ?? "").trim()
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       // The list is only ever edited through /api/proxies: what GET returns here

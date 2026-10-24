@@ -490,6 +490,19 @@ describe("auto-UA tracking", () => {
     assert.equal(zp.config.ua, "opencode/9.9.9", "UA must track the latest opencode version")
   })
 
+  test("refreshUA moves the UA tail to the Bun a release is built with", async () => {
+    zp.saveConfig({ autoUA: true, ua: "opencode/1.18.30", uaTail: "ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4" })
+    globalThis.fetch = routeFetch([
+      ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
+      ["raw.githubusercontent.com/anomalyco/opencode/v9.9.9/package.json", jsonResponse({ packageManager: "bun@7.7.7" })],
+    ])
+    await zp.refreshUA(true)
+    assert.equal(zp.config.uaTail, "ai-sdk/provider-utils/4.0.23 runtime/bun/7.7.7", "only the Bun part follows the release")
+    assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "opencode/9.9.9 ai-sdk/provider-utils/4.0.23 runtime/bun/7.7.7")
+    zp.saveConfig({ uaTail: "" })
+    assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "opencode/9.9.9", "an empty tail sends the bare UA")
+  })
+
   test("refreshUA leaves custom User-Agents untouched", async () => {
     zp.saveConfig({ autoUA: true, ua: "my-agent/1.0" })
     globalThis.fetch = routeFetch([

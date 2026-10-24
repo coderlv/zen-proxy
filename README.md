@@ -170,6 +170,7 @@ Where things live — outside the install dir, so a reinstall or `git pull` neve
 | `host` / `port` | `127.0.0.1` / `8787` | Bind address (restart required) |
 | `upstream` | `https://opencode.ai/inference/v1` | Zen gateway base |
 | `ua` / `autoUA` | `opencode/1.18.30` / `true` | User-Agent sent upstream; auto-tracks OpenCode releases |
+| `uaTail` | `ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4` | What the AI SDK appends to OpenCode's UA on the wire; with `autoUA` the Bun part follows the release's `packageManager`, provider-utils is set by hand (`""` = bare UA) |
 | `injectSession` | `true` | Mint and send the session header pair |
 | `agentTools` | `true` | Attach OpenCode's tools to `/v1/messages`, and to tool-less requests on the OpenAI-shaped routes |
 | `defaultModel` | `""` | Empty = auto-pick the first working free model |

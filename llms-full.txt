@@ -199,6 +199,7 @@ It is kept outside the install dir, so reinstalls and `git pull` never touch it:
 | `proxyRetries` | `3` | Extra proxies one request tries after a dead tunnel, a stream cut before its first byte, or a `429` (0–20) |
 | `proxyFirstByteMs` | `90000` | A proxy that sends no first byte (headers included) in this time is dropped for the next one; `0` turns it off |
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: route for probes, sync, model test, `/health`, `/v1/models` |
+| `uaTail` | `ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4` | Appended to an `opencode/<v>` UA, as the AI SDK does on the wire. With `autoUA`, the `runtime/bun/X` part follows `packageManager` in the release tag's `package.json` (raw.githubusercontent.com). The provider-utils part is set by hand: the repo cannot give it (the 1.19.4 tag's lockfile resolves 4.0.21 for openai-compatible, the binary sends 4.0.23). `""` sends the bare UA |
 | (probe message) | — | Sync probes and the dashboard **Test** send one user message, `hi`, as any user would (`max_tokens` 32000 like OpenCode, opencode's tool list with `tool_choice: "none"` for the gate) |
 | `proxySessionMode` | `per-proxy` | `per-proxy` (session rotates with the proxy) or `per-client` (only the IP rotates) |
 
@@ -330,3 +331,7 @@ zen-proxy · anonymous free tier · no accounts · no keys · 100% local
 go make some noise.
 
 **MIT License**
+
+### measuring what OpenCode really sends
+
+The release binary is not reproducible from its tag: for 1.19.4 the tag's source sets `User-Agent: opencode/latest/1.19.4/cli`, the binary sends `opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4`, and `dev` (the 2.x line) builds `opencode/<channel>/<version>/<client>`. Only the wire is ground truth. To re-measure after a release, run OpenCode through a local TLS-intercepting proxy: a throwaway self-signed cert for `opencode.ai`, an HTTP CONNECT server that terminates TLS for that host and forwards to the real one while logging headers and body, then `HTTPS_PROXY=http://127.0.0.1:<port> NODE_EXTRA_CA_CERTS=<cert.pem> opencode run -m opencode/<model> "hi"`. Overriding the provider `baseURL` does not work: the per-model `api` in OpenCode's catalog wins.
