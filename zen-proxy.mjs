@@ -487,6 +487,98 @@ async function openTunnel(proxy, host, port, signal) {
   }
 }
 
+// ---- the ClientHello we send -------------------------------------------------
+// Since 2026-10-24 opencode's free-tier gate reads the shape of the ClientHello
+// Cloudflare hands it. On one proxy entry (one resident IP, one sticky session),
+// the same bytes with the same headers got `429 Free usage limit reached` with
+// Node's own hello and `200` with the hello captured from the opencode 1.19.4
+// binary, and the refusal comes before any quota is spent: on the free tier the
+// handshake is part of the credential, so upstream connections send that hello.
+//
+// tls-impersonate is optional (optionalDependencies). Without it, on Node
+// < 24.15, or for what it cannot mirror, we send Node's own hello and say so. Two
+// known gaps on Node 24: extension order (controllable only from 26.4) and the
+// content of ec_point_formats (OpenSSL decides it) — the gate accepted both.
+// Ids are hex in wire order, exactly as captured; the capture and the A/B are in
+// docs/investigations/2026-10-24-free-tier-429.md.
+const OPENCODE_HELLO = {
+  ciphers: [
+    "1301", "1302", "1303", "c02b", "c02f", "c02c", "c030", "cca9", "cca8",
+    "c009", "c013", "c00a", "c014", "009c", "009d", "002f", "0035",
+  ],
+  extensions: [
+    "0000", "0017", "ff01", "000a", "000b", "0023", "0010", "0005", "000d",
+    "0012", "0033", "002d", "002b",
+  ],
+  groups: ["11ec", "001d", "0017", "0018"],
+  sigAlgs: ["0403", "0804", "0401", "0503", "0805", "0501", "0806", "0601", "0807", "0603", "0201"],
+  pointFormats: [0],
+  alpn: ["http/1.1"],
+}
+
+const helloIds = (v) =>
+  (Array.isArray(v) ? v : String(v ?? "").split(/[,\s]+/)).filter((x) => x !== "").map((x) => (typeof x === "number" ? x : parseInt(String(x), 16)))
+
+// The shape tls-impersonate wants: numeric ids, ALPN still text. Order is part of
+// the fingerprint, so nothing here sorts or rewrites it.
+function helloToArgs(hello) {
+  return {
+    cipherSuites: helloIds(hello.ciphers),
+    extensions: helloIds(hello.extensions).map((type) => ({ type })),
+    supportedGroups: helloIds(hello.groups),
+    signatureAlgorithms: helloIds(hello.sigAlgs),
+    ecPointFormats: helloIds(hello.pointFormats),
+    alpnProtocols: Array.isArray(hello.alpn) && hello.alpn.length ? hello.alpn.map(String) : ["http/1.1"],
+  }
+}
+
+let impersonator = null
+let impersonatorTried = false
+let helloOptions = null
+let helloNote = ""
+
+// Resolve the optional package once and build the connection options for the
+// configured hello. Null means "show Node's own hello", which is what the free
+// tier refuses. Logged only when the answer changes, so a config reload that
+// turns impersonation off is visible in /api/logs without repeating itself.
+async function initTlsHello() {
+  if (config.tlsImpersonate && !impersonatorTried) {
+    impersonatorTried = true
+    try {
+      impersonator = await import("tls-impersonate")
+    } catch (err) {
+      log(`tls hello: tls-impersonate is not installed (${err.code ?? err.message}), sending Node's own hello`)
+    }
+  }
+  let note = "Node's own hello"
+  helloOptions = null
+  if (config.tlsImpersonate && impersonator) {
+    if (!impersonator.isSupported?.()) {
+      note = "Node's own hello (this Node cannot control the ClientHello)"
+    } else {
+      const spec = helloToArgs(config.tlsHello ?? OPENCODE_HELLO)
+      try {
+        const built = impersonator.impersonate(spec)
+        helloOptions = built.tlsOptions
+        const gaps = built.unsupported ?? []
+        note = `impersonated hello (${spec.cipherSuites.length} ciphers, ${spec.extensions.length} extensions, alpn ${spec.alpnProtocols.join(",")})`
+        if (gaps.length) note += ` — gaps: ${gaps.map((g) => `${g.kind} ${g.id}: ${g.reason}`).join("; ")}`
+      } catch (err) {
+        note = `Node's own hello (cannot mirror the configured hello: ${err.message})`
+      }
+    }
+  }
+  if (note !== helloNote) {
+    helloNote = note
+    log(`tls hello: ${note}`)
+  }
+  return helloOptions
+}
+
+function tlsHelloOptions() {
+  return helloOptions
+}
+
 // Kept-alive connections, one pool per route (direct, or each proxy): opencode
 // holds its connection open between calls, and a tunnel that already passed its
 // CONNECT is reused instead of being rebuilt. Idle sockets close after 30 s.
@@ -497,14 +589,17 @@ function agentFor(proxy, secure) {
   let agent = agents.get(key)
   if (agent) return agent
   agent = new (secure ? https : http).Agent({ keepAlive: true, timeout: KEEPALIVE_IDLE_MS })
-  if (proxy) {
-    agent.createConnection = (opts, done) => {
-      openTunnel(proxy, opts.host, opts.port, opts.signal).then((sock) => {
-        // The reader left it paused; nothing arrives before our request is written.
-        sock.resume()
-        done(null, secure ? tls.connect({ socket: sock, servername: net.isIP(opts.host) ? undefined : opts.host, ALPNProtocols: ["http/1.1"] }) : sock)
-      }, (err) => done(err))
-    }
+  // Read per connection, so a config reload changes new connections without
+  // rebuilding the pool. Both TLS paths need it: the direct one would otherwise
+  // use Node's own createConnection, which is Node's own hello.
+  agent.createConnection = (opts, done) => {
+    const hello = secure ? tlsHelloOptions() : null
+    if (!proxy) return done(null, secure ? tls.connect({ ...opts, ...(hello ?? {}) }) : net.connect(opts))
+    openTunnel(proxy, opts.host, opts.port, opts.signal).then((sock) => {
+      // The reader left it paused; nothing arrives before our request is written.
+      sock.resume()
+      done(null, secure ? tls.connect({ socket: sock, servername: net.isIP(opts.host) ? undefined : opts.host, ALPNProtocols: ["http/1.1"], ...(hello ?? {}) }) : sock)
+    }, (err) => done(err))
   }
   agents.set(key, agent)
   return agent
@@ -983,6 +1078,13 @@ const DEFAULT_CONFIG = {
   // session per client whichever proxy it leaves through. Kept as a switch so
   // the Analytics tab can compare what each does to the prompt cache.
   proxySessionMode: ENV.PROXY_SESSION_MODE === "per-client" ? "per-client" : "per-proxy",
+  // Shape of the ClientHello sent to upstream TLS. opencode's free-tier gate reads
+  // it, so the hello captured from the binary is the default (see the 2026-10-24
+  // investigation). Needs the optional tls-impersonate package: without it, or on
+  // Node < 24.15, Node's own hello goes out and the free tier refuses it.
+  // TLS_IMPERSONATE=0 sends Node's hello on purpose; TLS_HELLO takes the spec as JSON.
+  tlsImpersonate: ENV.TLS_IMPERSONATE !== "0",
+  tlsHello: JSON.parse(ENV.TLS_HELLO ?? JSON.stringify(OPENCODE_HELLO)),
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -1057,6 +1159,7 @@ if (isMain) {
       reloading = true
       setTimeout(() => {
         config = loadConfig()
+        initTlsHello()
         reloading = false
         scheduleSync()
         scheduleUA()
@@ -4178,6 +4281,7 @@ async function handleApiConfig(req, res) {
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       if ("uaTail" in cleaned) cleaned.uaTail = String(cleaned.uaTail ?? "").trim()
       cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
+      cleaned.tlsImpersonate = toBool(cleaned.tlsImpersonate, config.tlsImpersonate)
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       // The list is only ever edited through /api/proxies: what GET returns here
       // is masked, and round-tripping it would overwrite the real credentials.
@@ -4541,6 +4645,9 @@ server.on("error", (err) => {
 })
 
 if (isMain) {
+  // The hello is what the free tier reads, so the first upstream connection must
+  // already carry the configured one — resolve it before anything can connect.
+  await initTlsHello()
   server.listen(config.port, config.host, () => {
     log(`zen-proxy listening on http://${config.host}:${config.port}`)
     log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel || "(auto)"}`)
@@ -4670,4 +4777,8 @@ export {
   sessionHeader,
   MAX_BODY,
   VALID_MODEL_ID,
+  OPENCODE_HELLO,
+  helloToArgs,
+  initTlsHello,
+  tlsHelloOptions,
 }

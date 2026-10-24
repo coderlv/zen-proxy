@@ -27,6 +27,8 @@ delete process.env.TIMEOUT_MS
 delete process.env.CACHE_MS
 delete process.env.AUTO_SYNC
 delete process.env.AUTO_SYNC_MS
+delete process.env.TLS_IMPERSONATE
+delete process.env.TLS_HELLO
 
 const zp = await import("../zen-proxy.mjs")
 const originalFetch = globalThis.fetch
@@ -3647,6 +3649,124 @@ describe("proxy transport", () => {
     await zp.handleProxies(mockReq({ method: "DELETE", _body: JSON.stringify({ id: badId }) }), res)
     assert.deepEqual(zp.config.proxies, [rig.httpProxy])
     assert.deepEqual(zp.config.disabledProxies, [], "a removed proxy leaves no disabled id behind")
+  })
+})
+
+describe("the ClientHello upstream (the free tier reads it)", () => {
+  // Just the fingerprint fields, read off the bytes a raw listener sees.
+  function parseHello(buf) {
+    let o = 5 + 1 + 3 // record header, handshake header
+    o += 2 + 32 // legacy version + random
+    o += 1 + buf[o] // session id
+    const cs = buf.readUInt16BE(o)
+    o += 2
+    const ciphers = []
+    for (let i = 0; i < cs; i += 2) ciphers.push(buf.readUInt16BE(o + i))
+    o += cs
+    o += 1 + buf[o] // compression methods
+    const end = o + buf.readUInt16BE(o)
+    o += 2
+    const extensions = []
+    const groups = []
+    const alpn = []
+    const pointFormats = []
+    while (o < end) {
+      const type = buf.readUInt16BE(o)
+      const len = buf.readUInt16BE(o + 2)
+      const data = buf.subarray(o + 4, o + 4 + len)
+      extensions.push(type)
+      // List extensions carry a 2-byte length prefix; ec_point_formats a 1-byte one.
+      if (type === 0x000a) for (let i = 0; 2 + i + 2 <= data.length; i += 2) groups.push(data.readUInt16BE(2 + i))
+      if (type === 0x000b) for (const b of data.subarray(1)) pointFormats.push(b)
+      if (type === 0x0010)
+        for (let i = 2; i < data.length; i += 1 + data[i]) alpn.push(data.subarray(i + 1, i + 1 + data[i]).toString())
+      o += 4 + len
+    }
+    return { ciphers, extensions, groups, alpn, pointFormats }
+  }
+
+  // A raw listener rather than a TLS one, so the hello is seen as bytes. It hangs
+  // up after the first record, so the handshake never completes: proxiedFetch here
+  // only exists to make the client write its hello.
+  async function helloOnWire() {
+    const server = net.createServer()
+    const seen = new Promise((resolve) => {
+      server.on("connection", (client) => {
+        const chunks = []
+        client.on("data", (buf) => {
+          chunks.push(buf)
+          const b = Buffer.concat(chunks)
+          if (b.length < 5 + b.readUInt16BE(3)) return
+          resolve(parseHello(b))
+          client.destroy()
+        })
+      })
+    })
+    let timer = null
+    try {
+      const port = await listen(server)
+      // No signal and no response: hanging up is what ends the fetch. Nothing here
+      // may outlive the test, or the runner waits for the event loop to drain.
+      zp.proxiedFetch(null, `https://127.0.0.1:${port}/`).catch(() => {})
+      return await Promise.race([
+        seen,
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("no ClientHello arrived")), 5000) }),
+      ])
+    } finally {
+      clearTimeout(timer)
+      server.close()
+    }
+  }
+
+  test("wire order survives the hex spec: sorting it changes the fingerprint", () => {
+    const spec = zp.helloToArgs({
+      ciphers: ["1303", "1301"],
+      extensions: ["0017", "0000"],
+      groups: ["0017", "11ec"],
+      sigAlgs: ["0201", "0403"],
+      pointFormats: [0],
+      alpn: ["http/1.1"],
+    })
+    assert.deepEqual(spec.cipherSuites, [0x1303, 0x1301])
+    assert.deepEqual(spec.extensions.map((e) => e.type), [0x0017, 0x0000])
+    assert.deepEqual(spec.supportedGroups, [0x0017, 0x11ec])
+    assert.deepEqual(spec.signatureAlgorithms, [0x0201, 0x0403])
+    assert.deepEqual(spec.alpnProtocols, ["http/1.1"], "ALPN is text, not an id")
+    assert.deepEqual(zp.helloToArgs({ ciphers: "1301,c02b", extensions: "0000 0017" }).cipherSuites, [0x1301, 0xc02b])
+    assert.deepEqual(zp.helloToArgs({ pointFormats: [0] }).ecPointFormats, [0], "point format 0 is a fingerprint value, not an empty entry")
+  })
+
+  test("the hello on the wire is the configured fingerprint", async (t) => {
+    const spec = zp.helloToArgs(zp.OPENCODE_HELLO)
+    if (!(await zp.initTlsHello())) return t.skip("optional tls-impersonate is not installed on this Node")
+    const hello = await helloOnWire()
+    assert.deepEqual(hello.ciphers, spec.cipherSuites, "ciphers must reach upstream in wire order")
+    assert.deepEqual(hello.groups, spec.supportedGroups, "groups must reach upstream in wire order")
+    // SNI (0) is only sent when the target is a name, so the loopback IP here sends the rest of the manifest unchanged.
+    assert.deepEqual([...hello.extensions].sort((a, b) => a - b), spec.extensions.map((e) => e.type).filter((x) => x !== 0).sort((a, b) => a - b))
+    assert.deepEqual(hello.alpn, ["http/1.1"])
+    // Extension order and the content of ec_point_formats are OpenSSL's, not ours
+    // (Node 24); the gate accepted both, so only that the configured value is
+    // advertised is checked here.
+    assert.ok(hello.pointFormats.includes(0))
+  })
+
+  test("impersonation off sends Node's own hello, and a bad spec falls back instead of throwing", async (t) => {
+    const spec = zp.helloToArgs(zp.OPENCODE_HELLO)
+    if (!(await zp.initTlsHello())) return t.skip("optional tls-impersonate is not installed on this Node")
+    try {
+      zp.config.tlsImpersonate = false
+      assert.equal(await zp.initTlsHello(), null, "off must fall back to Node's hello, not fail")
+      const hello = await helloOnWire()
+      assert.notDeepEqual(hello.ciphers, spec.cipherSuites, "the configured fingerprint must not be sent when off")
+      zp.config.tlsImpersonate = true
+      zp.config.tlsHello = { ciphers: ["zzzz"], extensions: ["0000"] }
+      assert.equal(await zp.initTlsHello(), null, "an unmirreable spec must fall back, not throw")
+    } finally {
+      zp.config.tlsImpersonate = true
+      zp.config.tlsHello = zp.OPENCODE_HELLO
+      await zp.initTlsHello()
+    }
   })
 })
 

@@ -108,7 +108,7 @@ OpenCode's free models are served only to the OpenCode CLI itself. Everyone else
 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
 ```
 
-> **Status, 2026-10-24.** The free tier is now also gated by client fingerprint at Cloudflare: the same request from the same exit IP gets `200` from Bun's `fetch` (what the OpenCode binary runs on) and `429 Free usage limit reached` from Node. zen-proxy runs on Node and does not imitate another client's TLS handshake, so on the free tier expect that 429; with your own key (`defaultZenKey`) the proxy works as before.
+> **Status, 2026-10-24.** The free tier is also gated by the TLS ClientHello: on one exit IP the same request answered `429 Free usage limit reached` with Node's own handshake and `200` with the handshake the OpenCode binary sends, and the refusal arrives before any quota is spent — on the free tier the handshake is part of the credential. `tlsImpersonate` (on by default) replays the ClientHello captured from OpenCode 1.19.4 through the *optional* `tls-impersonate` package; without that package, or on Node < 24.15, the proxy sends Node's own hello and the free tier answers 429 as before. On Node 24 two parts stay OpenSSL's, not ours: extension order (controllable only from 26.4) and the content of `ec_point_formats`. The gate accepted both. With your own key (`defaultZenKey`) the proxy works as before.
 
 zen-proxy sits in front of that gateway and identifies your agent as a real session.
 
@@ -193,8 +193,9 @@ Where things live — outside the install dir, so a reinstall or `git pull` neve
 | `proxyFirstByteMs` | `90000` | A proxy that sends no first byte (headers included) in this time is dropped for the next one; `0` turns it off |
 | `proxyHealthChecks` | `proxy` | `proxy` or `direct`: how probes, sync, model TEST, `/health` and `/v1/models` reach upstream |
 | `proxySessionMode` | `per-proxy` | `per-proxy`: each proxy gets its own session id. `per-client`: one session per client, only the IP rotates |
+| `tlsImpersonate` / `tlsHello` | `true` / *(the ClientHello captured from OpenCode 1.19.4)* | Shape of the handshake sent upstream; needs the optional `tls-impersonate` package, without which Node's own hello goes out |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_RETRIES` `PROXY_FIRST_BYTE_MS` `PROXY_HEALTH_CHECKS=direct` `PROXY_SESSION_MODE=per-client` `ZEN_PROXY_CONFIG` `ZEN_PROXY_STATS` (analytics file path)
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_RETRIES` `PROXY_FIRST_BYTE_MS` `PROXY_HEALTH_CHECKS=direct` `PROXY_SESSION_MODE=per-client` `TLS_IMPERSONATE=0` `TLS_HELLO` (the fingerprint as JSON) `ZEN_PROXY_CONFIG` `ZEN_PROXY_STATS` (analytics file path)
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service.
 </details>
@@ -214,7 +215,7 @@ socks5://user:pass@proxy.example:1080
 https://user:pass@proxy.example:443
 ```
 
-HTTP, HTTPS (TLS to the proxy) and SOCKS5 with username/password are supported. The tunnels are built on Node's own `net`/`tls`, so there are still zero dependencies.
+HTTP, HTTPS (TLS to the proxy) and SOCKS5 with username/password are supported. The tunnels are built on Node's own `net`/`tls`, so there are still zero required dependencies; `tls-impersonate` is optional and changes only the shape of the ClientHello upstream.
 
 | Strategy | Picks |
 |---|---|
