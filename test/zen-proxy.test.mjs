@@ -2,6 +2,7 @@ import { test, describe, beforeEach, after } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import http from "node:http"
+import zlib from "node:zlib"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -3125,7 +3126,14 @@ function listen(server) {
 async function startProxyRig() {
   const seen = { upstream: [], connect: 0, socks: 0 }
   const upstream = http.createServer((req, res) => {
-    seen.upstream.push({ url: req.url, method: req.method, host: req.headers.host, session: req.headers["x-opencode-session"], sessionId: req.headers["x-opencode-session-id"], headers: req.headers })
+    seen.upstream.push({ url: req.url, method: req.method, host: req.headers.host, session: req.headers["x-opencode-session"], sessionId: req.headers["x-opencode-session-id"], headers: req.headers, port: req.socket.remotePort })
+    if (req.url.startsWith("/gz")) {
+      // Compressed with whichever encoding the URL names, as opencode's gateway may.
+      const enc = req.url.split("/")[2]
+      const pack = { gzip: zlib.gzipSync, deflate: zlib.deflateSync, br: zlib.brotliCompressSync }[enc]
+      res.writeHead(200, { "content-type": "text/event-stream", "content-encoding": enc })
+      return res.end(pack(Buffer.from("data: packed\n\ndata: [DONE]\n\n")))
+    }
     if (req.url.startsWith("/big")) {
       // 256MB, written only as fast as the socket drains, so `bigWritten` shows
       // how far ahead of the reader upstream was allowed to get.
@@ -3457,6 +3465,33 @@ describe("proxy transport", () => {
     const r = await zp.upstreamFetch(`${rig.upstreamUrl}/limited`, {}, { req, model: DEFAULT_MODEL })
     await r.body?.cancel()
     assert.equal(rig.seen.upstream.length - before, 1)
+  })
+
+  test("compressed replies are asked for like opencode does and decoded for the caller", async () => {
+    for (const proxies of [[], [rig.httpProxy]]) {
+      zp.saveConfig({ proxies, proxyStrategy: "failover" })
+      for (const enc of ["gzip", "deflate", "br"]) {
+        const r = await zp.upstreamFetch(`${rig.upstreamUrl}/gz/${enc}`, { headers: {} }, { req: mockReq(), model: DEFAULT_MODEL })
+        assert.equal(r.headers.get("content-encoding"), null)
+        assert.equal(await r.text(), "data: packed\n\ndata: [DONE]\n\n", `${enc} via ${proxies.length ? "proxy" : "direct"}`)
+      }
+      assert.match(rig.seen.upstream.at(-1).headers["accept-encoding"], /^gzip, deflate, br/)
+    }
+  })
+
+  test("connections are kept alive: direct and through a proxy tunnel", async () => {
+    for (const proxies of [[], [rig.httpProxy]]) {
+      zp.saveConfig({ proxies, proxyStrategy: "failover" })
+      const connectsBefore = rig.seen.connect
+      const ports = []
+      for (let i = 0; i < 3; i++) {
+        const r = await zp.upstreamFetch(`${rig.upstreamUrl}/chat`, { method: "POST", headers: {}, body: "{}" }, { req: mockReq(), model: DEFAULT_MODEL })
+        await r.text()
+        ports.push(rig.seen.upstream.at(-1).port)
+      }
+      assert.equal(new Set(ports).size, 1, `one socket for three calls ${proxies.length ? "through the proxy" : "direct"}`)
+      if (proxies.length) assert.ok(rig.seen.connect - connectsBefore <= 1, "at most one CONNECT for three calls (the pool may already hold one)")
+    }
   })
 
   test("a direct call carries none of fetch()'s extra headers", async () => {

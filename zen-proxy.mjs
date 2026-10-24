@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import http from "node:http"
+import https from "node:https"
+import zlib from "node:zlib"
+import { pipeline } from "node:stream"
 import net from "node:net"
 import tls from "node:tls"
 import fs from "node:fs"
@@ -484,89 +487,105 @@ async function openTunnel(proxy, host, port, signal) {
   }
 }
 
-// fetch() over a proxy tunnel. Supports the subset of fetch the upstream calls
-// use: string body, plain-object headers, an AbortSignal.
-// A plain TCP connection for the no-proxy path, handed over paused like a tunnel.
-function directSocket(host, port, signal) {
-  return new Promise((resolve, reject) => {
-    const s = net.connect(port, host)
-    const onAbort = () => {
-      s.destroy()
-      reject(signal.reason ?? new Error("aborted"))
+// Kept-alive connections, one pool per route (direct, or each proxy): opencode
+// holds its connection open between calls, and a tunnel that already passed its
+// CONNECT is reused instead of being rebuilt. Idle sockets close after 30 s.
+const KEEPALIVE_IDLE_MS = 30_000
+const agents = new Map()
+function agentFor(proxy, secure) {
+  const key = `${secure ? "tls" : "tcp"}|${proxy ?? "direct"}`
+  let agent = agents.get(key)
+  if (agent) return agent
+  agent = new (secure ? https : http).Agent({ keepAlive: true, timeout: KEEPALIVE_IDLE_MS })
+  if (proxy) {
+    agent.createConnection = (opts, done) => {
+      openTunnel(proxy, opts.host, opts.port, opts.signal).then((sock) => {
+        // The reader left it paused; nothing arrives before our request is written.
+        sock.resume()
+        done(null, secure ? tls.connect({ socket: sock, servername: net.isIP(opts.host) ? undefined : opts.host, ALPNProtocols: ["http/1.1"] }) : sock)
+      }, (err) => done(err))
     }
-    signal?.addEventListener("abort", onAbort, { once: true })
-    s.once("connect", () => {
-      signal?.removeEventListener("abort", onAbort)
-      s.pause()
-      resolve(s)
-    })
-    s.once("error", (err) => {
-      signal?.removeEventListener("abort", onAbort)
-      reject(err)
-    })
-  })
+  }
+  agents.set(key, agent)
+  return agent
 }
 
-// `proxy` null means a direct connection: same client, so no fetch() extras.
+// Encodings opencode asks for; zstd only where this Node can decode it.
+const ACCEPT_ENCODING = typeof zlib.createZstdDecompress === "function" ? "gzip, deflate, br, zstd" : "gzip, deflate, br"
+function decoderFor(encoding) {
+  switch (String(encoding ?? "").trim().toLowerCase()) {
+    case "gzip": case "x-gzip": return zlib.createGunzip()
+    case "deflate": return zlib.createInflate()
+    case "br": return zlib.createBrotliDecompress()
+    case "zstd": return zlib.createZstdDecompress?.() ?? null
+    default: return null
+  }
+}
+
+// fetch() for upstream calls, over a proxy tunnel or (`proxy` null) direct.
+// Supports the subset the upstream calls use: string body, plain-object
+// headers, an AbortSignal. Unlike fetch() it adds no headers of its own.
 async function proxiedFetch(proxy, url, init = {}) {
   const target = new URL(url)
   const secure = target.protocol === "https:"
   const port = Number(target.port) || (secure ? 443 : 80)
   const signal = init.signal
   if (signal?.aborted) throw signal.reason ?? new Error("aborted")
-  let sock = proxy ? await openTunnel(proxy, target.hostname, port, signal) : await directSocket(target.hostname, port, signal)
-  // The reader left it paused; nothing arrives before our request is written,
-  // so handing it over flowing loses no bytes.
-  sock.resume()
-  if (secure) {
-    sock = tls.connect({ socket: sock, servername: net.isIP(target.hostname) ? undefined : target.hostname, ALPNProtocols: ["http/1.1"] })
-  }
   const headers = { ...init.headers, host: target.host }
-  // fetch() decompresses for its callers; this path does not, so ask for identity.
-  delete headers["accept-encoding"]
+  if (!Object.keys(headers).some((h) => h.toLowerCase() === "accept-encoding")) headers["accept-encoding"] = ACCEPT_ENCODING
   if (init.body != null) headers["content-length"] = Buffer.byteLength(init.body)
   return new Promise((resolve, reject) => {
-    const req = http.request({
+    const req = (secure ? https : http).request({
       method: init.method ?? "GET",
+      host: target.hostname,
+      port,
       path: target.pathname + target.search,
       headers,
-      createConnection: () => sock,
+      agent: agentFor(proxy, secure),
+      servername: net.isIP(target.hostname) ? undefined : target.hostname,
       signal,
     })
-    req.on("error", (err) => {
-      sock.destroy()
-      reject(err)
-    })
+    req.on("error", reject)
     req.on("response", (res) => {
       const out = new Headers()
       for (const [k, v] of Object.entries(res.headers)) out.set(k, Array.isArray(v) ? v.join(", ") : v)
       const noBody = [204, 205, 304].includes(res.statusCode) || req.method === "HEAD"
-      // Hand-built rather than Readable.toWeb so cancel() reliably hangs up the
-      // tunnel on every supported Node — probes rely on that. Pull-driven: the
-      // socket is paused whenever the queue is full, so a slow reader pushes back
-      // on upstream over TCP instead of the whole body piling up in memory.
+      // Decoded like fetch() does, so callers see plain bytes and no stale length.
+      const dec = noBody ? null : decoderFor(res.headers["content-encoding"])
+      if (dec) {
+        out.delete("content-encoding")
+        out.delete("content-length")
+        pipeline(res, dec, () => {})
+      }
+      const src = dec ?? res
+      // Hand-built rather than Readable.toWeb so cancel() reliably hangs up on
+      // every supported Node — probes rely on that. Pull-driven: the source is
+      // paused whenever the queue is full, so a slow reader pushes back on
+      // upstream over TCP instead of the whole body piling up in memory.
       let cancelled = false
       const body = noBody
         ? null
         : new ReadableStream({
             start(c) {
-              res.pause()
-              res.on("data", (d) => {
+              src.pause()
+              src.on("data", (d) => {
                 // A chunk already in flight can still land after cancel().
                 if (cancelled) return
                 c.enqueue(new Uint8Array(d))
-                if (c.desiredSize <= 0) res.pause()
+                if (c.desiredSize <= 0) src.pause()
               })
-              res.on("end", () => { try { c.close() } catch {} })
-              res.on("error", (e) => { try { c.error(e) } catch {} })
+              src.on("end", () => { try { c.close() } catch {} })
+              src.on("error", (e) => { try { c.error(e) } catch {} })
+              if (dec) res.on("error", (e) => { try { c.error(e) } catch {} })
             },
             pull() {
-              res.resume()
+              src.resume()
             },
             cancel() {
               cancelled = true
+              // Destroying the response drops its socket instead of pooling a half-read one.
               res.destroy()
-              sock.destroy()
+              dec?.destroy()
             },
           })
       if (noBody) res.resume()
