@@ -29,6 +29,7 @@ delete process.env.AUTO_SYNC
 delete process.env.AUTO_SYNC_MS
 delete process.env.TLS_IMPERSONATE
 delete process.env.TLS_HELLO
+delete process.env.ENV_BLOCK
 
 const zp = await import("../zen-proxy.mjs")
 const originalFetch = globalThis.fetch
@@ -1000,7 +1001,7 @@ describe("responses API translation", () => {
   })
 
   test("handleChat routes a responses model to /responses and returns chat shape", async () => {
-    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    zp.saveConfig({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5", envBlock: "" })
     let hitUrl = ""
     let sentBody = null
     globalThis.fetch = routeFetch([
@@ -4676,7 +4677,7 @@ describe("pinned replies on the OpenAI-shaped routes", () => {
 
 describe("the /v1/responses route speaks Responses", () => {
   const cfg = (extra = {}) =>
-    zp.saveConfig({ defaultModel: "big-pickle", fallbackModels: ["big-pickle"], retriesPerModel: 0, retryBackoffMs: 1, autoSyncIntervalMs: 0, cacheMs: 0, agentTools: true, responsesModels: ["gpt-5*"], ...extra })
+    zp.saveConfig({ defaultModel: "big-pickle", fallbackModels: ["big-pickle"], retriesPerModel: 0, retryBackoffMs: 1, autoSyncIntervalMs: 0, cacheMs: 0, agentTools: true, responsesModels: ["gpt-5*"], envBlock: "", ...extra })
   const responsesBody = (model, input, extra = {}) => ({ model, input, ...extra })
   const chatSse = (text, usage) =>
     new Response(
@@ -5625,3 +5626,113 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
 
 
 
+
+describe("the gate reads the system prompt for opencode's <env> block", () => {
+  const cfg = (extra = {}) =>
+    zp.saveConfig({
+      defaultModel: "big-pickle",
+      fallbackModels: ["big-pickle"],
+      retriesPerModel: 0,
+      retryBackoffMs: 1,
+      autoSyncIntervalMs: 0,
+      cacheMs: 0,
+      agentTools: true,
+      envBlock: "<env>\n  Platform: {platform}\n</env>",
+      ...extra,
+    })
+  const sysText = (sent) => {
+    const c = (sent.messages ?? []).find((m) => m?.role === "system")?.content
+    return Array.isArray(c) ? c.map((p) => p?.text ?? "").join("") : String(c ?? "")
+  }
+  const sentFor = async (body, route = "/chat/completions", responsesRoute = false) => {
+    let sent = null
+    globalThis.fetch = routeFetch([[route, (u, opts) => {
+      sent = JSON.parse(opts.body)
+      return jsonResponse({ ok: true }, 200)
+    }]])
+    const req = mockReq({ _body: JSON.stringify(body) })
+    const res = mockRes()
+    await zp.handleChat(req, res, responsesRoute)
+    return sent
+  }
+
+  test("a caller prompt without the block gets it appended after its own text", async () => {
+    cfg()
+    const sent = await sentFor({
+      model: "big-pickle",
+      messages: [{ role: "system", content: "You are an expert software engineer." }, { role: "user", content: "hi" }],
+    })
+    const t = sysText(sent)
+    assert.ok(t.startsWith("You are an expert software engineer."), `the caller's instructions stay first: ${t}`)
+    assert.ok(t.includes("<env>"), "the gate needs the block")
+  })
+
+  test("a request with no system message gets one carrying the block", async () => {
+    cfg()
+    const sent = await sentFor({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] })
+    assert.equal(sent.messages[0].role, "system")
+    assert.ok(sysText(sent).includes("<env>"))
+  })
+
+  test("a caller that already carries an env block is left alone", async () => {
+    cfg()
+    const own = "You are opencode.\n<env>\n  Working directory: /srv/app\n</env>"
+    const sent = await sentFor({
+      model: "big-pickle",
+      messages: [{ role: "system", content: own }, { role: "user", content: "hi" }],
+    })
+    assert.equal(sysText(sent), own, "no second block on a prompt that has one")
+  })
+
+  test("envBlock: '' sends the caller's prompt exactly as the caller wrote it", async () => {
+    cfg({ envBlock: "" })
+    const sent = await sentFor({
+      model: "big-pickle",
+      messages: [{ role: "system", content: "You are an expert software engineer." }, { role: "user", content: "hi" }],
+    })
+    assert.equal(sysText(sent), "You are an expert software engineer.")
+  })
+
+  test("{platform} is filled with what the proxy runs on", async () => {
+    cfg({ envBlock: "<env>{platform}</env>" })
+    const sent = await sentFor({
+      model: "big-pickle",
+      messages: [{ role: "system", content: "prompt" }, { role: "user", content: "hi" }],
+    })
+    assert.ok(sysText(sent).includes(process.platform), `the placeholder must be substituted: ${sysText(sent)}`)
+  })
+
+  test("the block reaches the responses route through the input translation", async () => {
+    cfg({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5" })
+    const sent = await sentFor(
+      { model: "gpt-5.5", input: [{ type: "message", role: "user", content: "hi" }] },
+      "/responses",
+      true,
+    )
+    const sys = (sent.input ?? []).find((i) => i?.role === "system")
+    assert.ok(sys && JSON.stringify(sys).includes("<env>"), `the translated input must carry the block: ${JSON.stringify(sent)}`)
+  })
+
+  test("the Anthropic route appends the block to the caller's system prompt", async () => {
+    cfg()
+    let sent = null
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", (u, opts) => {
+        sent = JSON.parse(opts.body)
+        return jsonResponse({ ok: true }, 200)
+      }],
+    ])
+    const req = mockReq({ _body: JSON.stringify({ model: "big-pickle", system: "You are Claude Code.", messages: [{ role: "user", content: "hi" }], max_tokens: 64 }) })
+    const res = mockRes()
+    await zp.handleMessages(req, res)
+    const t = sysText(sent)
+    assert.ok(t.startsWith("You are Claude Code."), `the caller's system prompt stays first: ${t}`)
+    assert.ok(t.includes("<env>"))
+  })
+
+  test("health probes do not carry the block", async () => {
+    cfg()
+    assert.ok(!JSON.stringify(zp.agentProbePayload("big-pickle", "chat")).includes("<env>"), "a probe that passes the gate would spend quota on a model it only checks")
+    assert.ok(!JSON.stringify(zp.agentProbePayload("gpt-5.5", "responses")).includes("<env>"))
+  })
+})

@@ -1039,6 +1039,13 @@ const DEFAULT_CONFIG = {
   // Append opencode's own tools to Anthropic /v1/messages requests so the free
   // tier accepts them. Calls to them are renamed back to the caller's tools.
   agentTools: ENV.AGENT_TOOLS !== "0",
+  // The gate also reads the system prompt: without OpenCode's `<env>` block it
+  // answers 429 even with the captured hello (measured 2026-10-24, see
+  // docs/investigations/2026-10-24-free-tier-429.md). The tag is what is
+  // recognized, so the block carries only what the proxy can state truthfully;
+  // {platform} and {date} are filled per request. "" leaves the caller's prompt
+  // exactly as the caller wrote it.
+  envBlock: ENV.ENV_BLOCK ?? "<env>\n  Platform: {platform}\n  Today's date: {date}\n</env>",
   // opencode Zen serves each model on a specific endpoint family
   // (chat/completions | responses | messages). Patterns may end in `*`.
   // Source of truth: https://opencode.ai/docs/zen
@@ -2315,6 +2322,42 @@ function opencodeChatBody(payload) {
   return payload
 }
 
+// What the gate looks for in the system prompt. A caller prompt without the
+// `<env>` tag gets 429 even with OpenCode's headers and ClientHello; a one-line
+// block gets 200, so the tag is recognized and its contents are not read. A
+// caller that already carries one is left alone. Health probes never go through
+// here: a probe that passes the gate starts spending quota on a model it only
+// wanted to check.
+function envBlockText() {
+  const raw = String(config.envBlock ?? "")
+  if (!raw) return ""
+  return raw
+    .replace("{platform}", process.platform)
+    .replace("{date}", new Date().toISOString().slice(0, 10))
+}
+
+function withEnv(text) {
+  const block = envBlockText()
+  if (!block) return text
+  const s = String(text ?? "")
+  if (s.includes("<env>")) return s
+  return s ? `${s}\n\n${block}` : block
+}
+
+function applyEnvBlock(payload) {
+  if (!envBlockText() || !Array.isArray(payload?.messages)) return payload
+  const i = payload.messages.findIndex((m) => m?.role === "system")
+  if (i < 0) return { ...payload, messages: [{ role: "system", content: envBlockText() }, ...payload.messages] }
+  const c = payload.messages[i].content
+  const next = Array.isArray(c)
+    ? (c.some((p) => String(p?.text ?? "").includes("<env>")) ? c : [...c, { type: "text", text: envBlockText() }])
+    : withEnv(c)
+  if (next === c) return payload
+  const messages = [...payload.messages]
+  messages[i] = { ...payload.messages[i], content: next }
+  return { ...payload, messages }
+}
+
 function zenHeaders(req, auth) {
   const headers = opencodeHeaders(req, auth)
   const sess = sessionFor(req)
@@ -2460,7 +2503,7 @@ async function handleMessages(req, res) {
     // client asked for one decides how the reply is shaped, not what is sent.
     // The gate's read stub, when the caller needs one, rides inside the
     // translated body (see anthropicToChatBody) — this must not inject again.
-    const chatShaped = anthropicToChatBody(body, model)
+    const chatShaped = applyEnvBlock(anthropicToChatBody(body, model))
     const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : opencodeChatBody({ ...chatShaped, stream: true })
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
@@ -2676,7 +2719,7 @@ async function handleChat(req, res, responsesRoute = false) {
   const gateRead = bridged ? null : gateReadFor(chatBody)
   const gateReadName = gateRead ? gateRead.function.name : null
   const pin = bridged ? null : pinnedToolName(chatBody.tool_choice)
-  const requestBody = gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody
+  const requestBody = applyEnvBlock(gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody)
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -2692,10 +2735,10 @@ async function handleChat(req, res, responsesRoute = false) {
     // /responses caller sent is exactly what upstream wants, so it goes as-is,
     // with `instructions` taking the system slot the translated flow gives it.
     if (responsesRequestShape && format === "responses") {
-      payload.input =
-        typeof body.instructions === "string" && body.instructions
-          ? [{ type: "message", role: "system", content: body.instructions }, ...responsesInputItemArray(body.input)]
-          : responsesInputItemArray(body.input)
+      const slot = withEnv(typeof body.instructions === "string" ? body.instructions : "")
+      payload.input = slot
+        ? [{ type: "message", role: "system", content: slot }, ...responsesInputItemArray(body.input)]
+        : responsesInputItemArray(body.input)
     }
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
@@ -4745,6 +4788,9 @@ export {
   loadAgentTools,
   AGENT_TOOL_MAP,
   AGENT_PREAMBLE_TEXT,
+  envBlockText,
+  applyEnvBlock,
+  agentProbePayload,
   relayStream,
   relayAnthropicStream,
   relayResponsesStream,

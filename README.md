@@ -109,6 +109,7 @@ OpenCode's free models are served only to the OpenCode CLI itself. Everyone else
 ```
 
 > **Status, 2026-10-24.** The free tier is also gated by the TLS ClientHello: on one exit IP the same request answered `429 Free usage limit reached` with Node's own handshake and `200` with the handshake the OpenCode binary sends, and the refusal arrives before any quota is spent — on the free tier the handshake is part of the credential. `tlsImpersonate` (on by default) replays the ClientHello captured from OpenCode 1.19.4 through the *optional* `tls-impersonate` package; without that package, or on Node < 24.15, the proxy sends Node's own hello and the free tier answers 429 as before. On Node 24 two parts stay OpenSSL's, not ours: extension order (controllable only from 26.4) and the content of `ec_point_formats`. The gate accepted both. With your own key (`defaultZenKey`) the proxy works as before.
+> The same gate also reads the system prompt: a request whose system prompt carries no `<env>` block answers `429` even with OpenCode's headers and the captured handshake, on the same exit IP. The proxy appends the block (`envBlock`, on by default) — the tag is what is recognized, so the block carries only what the proxy can state truthfully. `""` sends the caller's prompt exactly as written.
 
 zen-proxy sits in front of that gateway and identifies your agent as a real session.
 
@@ -175,6 +176,7 @@ Where things live — outside the install dir, so a reinstall or `git pull` neve
 | `uaTail` | `ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4` | What the AI SDK appends to OpenCode's UA on the wire; with `autoUA` the Bun part follows the release's `packageManager`, provider-utils is set by hand (`""` = bare UA) |
 | `injectSession` | `true` | Mint and send the session header pair |
 | `agentTools` | `true` | Attach OpenCode's tools to `/v1/messages`, and to tool-less requests on the OpenAI-shaped routes |
+| `envBlock` | `<env>\n  Platform: {platform}\n  Today's date: {date}\n</env>` | Appended to the system prompt; the free tier refuses a prompt without the block. A caller that already has one is left alone, probes never carry it, `""` disables it |
 | `defaultModel` | `""` | Empty = auto-pick the first working free model |
 | `fallbackModels` | *(from [`models.json`](models.json))* | Tried in order on failure. Omit to follow the catalog; save once to pin your own list |
 | `modelAliases` | `{}` | e.g. `{"gpt-4o": "space-bunny-free"}` |
@@ -195,7 +197,7 @@ Where things live — outside the install dir, so a reinstall or `git pull` neve
 | `proxySessionMode` | `per-proxy` | `per-proxy`: each proxy gets its own session id. `per-client`: one session per client, only the IP rotates |
 | `tlsImpersonate` / `tlsHello` | `true` / *(the ClientHello captured from OpenCode 1.19.4)* | Shape of the handshake sent upstream; needs the optional `tls-impersonate` package, without which Node's own hello goes out |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_RETRIES` `PROXY_FIRST_BYTE_MS` `PROXY_HEALTH_CHECKS=direct` `PROXY_SESSION_MODE=per-client` `TLS_IMPERSONATE=0` `TLS_HELLO` (the fingerprint as JSON) `ZEN_PROXY_CONFIG` `ZEN_PROXY_STATS` (analytics file path)
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `ENV_BLOCK` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `PROXIES` (comma-separated) `PROXY_STRATEGY` `PROXY_COOLDOWN_MS` `PROXY_RETRIES` `PROXY_FIRST_BYTE_MS` `PROXY_HEALTH_CHECKS=direct` `PROXY_SESSION_MODE=per-client` `TLS_IMPERSONATE=0` `TLS_HELLO` (the fingerprint as JSON) `ZEN_PROXY_CONFIG` `ZEN_PROXY_STATS` (analytics file path)
 
 Anonymous `public` access shares a per-IP quota that is sometimes saturated. Set `defaultZenKey`, or send `x-zen-key` per request, for steadier service.
 </details>
