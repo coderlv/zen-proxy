@@ -340,8 +340,19 @@ function parseProxyList(input, scheme = "http") {
   return { proxies, errors }
 }
 
+// Cached: every pick walks the whole list, and 20000 sha1s per pick cost ~14 ms.
+const proxyMetaCache = new Map()
+function proxyMeta(url) {
+  let m = proxyMetaCache.get(url)
+  if (!m) {
+    let host = url
+    try { host = new URL(url).host } catch {}
+    proxyMetaCache.set(url, (m = { id: createHash("sha1").update(url).digest("hex").slice(0, 10), host }))
+  }
+  return m
+}
 function proxyId(url) {
-  return createHash("sha1").update(url).digest("hex").slice(0, 10)
+  return proxyMeta(url).id
 }
 
 function maskProxy(url) {
@@ -560,9 +571,33 @@ function recentProxyEvents(now = Date.now()) {
   return proxyEvents
 }
 
+// The entries of a rotating gateway share one host. Tunnels failing across
+// several of them at once mean the gateway is throttling the account (measured
+// on novaproxy: resets and 407 "plan expired" after ~100 parallel CONNECTs,
+// clean again after a quiet minute), so walking on to the next entry only
+// feeds the throttle: the whole host sits out a short pause instead.
+const HOST_TRIP = 3
+const HOST_WINDOW_MS = 10_000
+const HOST_PAUSE_MS = 60_000
+const hostState = new Map()
+function noteHostFailure(url, now = Date.now()) {
+  const { host } = proxyMeta(url)
+  let h = hostState.get(host)
+  if (!h) hostState.set(host, (h = { fails: [], pausedUntil: 0 }))
+  h.fails = h.fails.filter((f) => f.at > now - HOST_WINDOW_MS && f.url !== url)
+  h.fails.push({ at: now, url })
+  if (h.fails.length < HOST_TRIP) return
+  h.fails = []
+  h.pausedUntil = now + HOST_PAUSE_MS
+  log(`proxy host ${host} paused for ${HOST_PAUSE_MS / 1000}s: ${HOST_TRIP} entries failed to tunnel within ${HOST_WINDOW_MS / 1000}s, the gateway is throttling`)
+}
+const hostPaused = (url, now) => (hostState.get(proxyMeta(url).host)?.pausedUntil ?? 0) > now
+
 function proxyCooldown(url, why) {
   const st = proxyStat(url)
-  proxyEvents.push({ at: Date.now(), kind: cooldownKind(why) })
+  const kind = cooldownKind(why)
+  if (kind === "proxy auth (407)" || kind === "connection") noteHostFailure(url)
+  proxyEvents.push({ at: Date.now(), kind })
   recentProxyEvents()
   st.fails++
   st.lastError = why
@@ -584,10 +619,14 @@ function nextRoundRobin(list, live) {
 function pickProxy(key = "server", now = Date.now()) {
   const off = new Set(config.disabledProxies ?? [])
   const list = (config.proxies ?? []).filter((u) => !off.has(proxyId(u)))
-  const live = list.filter((u) => proxyStat(u).cooldownUntil <= now)
+  const live = list.filter((u) => proxyStat(u).cooldownUntil <= now && !hostPaused(u, now))
   if (!live.length) {
+    const paused = [...hostState].filter(([, h]) => h.pausedUntil > now).map(([host]) => host)
     // Disabling every proxy is not a way back to direct: that is "Remove all".
-    const err = new Error(list.length ? `all ${list.length} enabled proxies are cooling down` : "every proxy is disabled")
+    const err = new Error(
+      paused.length ? `proxy gateway ${paused.join(", ")} is throttling, paused for up to ${HOST_PAUSE_MS / 1000}s`
+      : list.length ? `all ${list.length} enabled proxies are cooling down` : "every proxy is disabled",
+    )
     err.code = "NO_PROXY"
     throw err
   }
@@ -4454,6 +4493,7 @@ export {
   proxyId,
   pickProxy,
   proxyStat,
+  hostState,
   proxyState,
   proxyStatus,
   cooldownKind,

@@ -3244,6 +3244,7 @@ describe("proxy rotation", () => {
   const A = "http://a:1", B = "http://b:1", C = "http://c:1"
   beforeEach(() => {
     zp.proxyState.clear()
+    zp.hostState.clear()
     zp.saveConfig({ proxies: [A, B, C], proxyCooldownMs: 60_000 })
   })
 
@@ -3308,6 +3309,7 @@ describe("proxy transport", () => {
   let rig
   beforeEach(async () => {
     zp.proxyState.clear()
+    zp.hostState.clear()
     rig ??= await startProxyRig()
   })
   after(() => rig?.close())
@@ -3335,6 +3337,15 @@ describe("proxy transport", () => {
     assert.equal(r.headers.get("content-type"), "text/event-stream")
     assert.equal(await r.text(), "data: one\n\ndata: [DONE]\n\n")
     assert.ok(rig.seen.socks >= 1)
+  })
+
+  test("tunnels failing on three entries of one host pause the host instead of walking on", async () => {
+    const bad = [1, 2, 3, 4].map((n) => rig.badHttpProxy.replace("wrong", "wrong" + n))
+    zp.saveConfig({ proxies: bad, proxyStrategy: "failover", proxyRetries: 10 })
+    await assert.rejects(zp.upstreamFetch(`${rig.upstreamUrl}/x`, {}, { req: mockReq(), model: DEFAULT_MODEL }), (e) => e.code === "NO_PROXY")
+    assert.deepEqual(bad.map((u) => zp.proxyStat(u).uses), [1, 1, 1, 0], "the fourth entry is never tried")
+    zp.proxyStat(bad[0]).cooldownUntil = 0
+    assert.throws(() => zp.pickProxy(), (e) => e.code === "NO_PROXY" && /throttling/.test(e.message), "the host stays paused")
   })
 
   test("a 407 cools the proxy down and surfaces the reason", async () => {
