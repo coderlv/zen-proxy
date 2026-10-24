@@ -108,6 +108,8 @@ OpenCode's free models are served only to the OpenCode CLI itself. Everyone else
 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode
 ```
 
+> **Status, 2026-10-24.** The free tier is now also gated by client fingerprint at Cloudflare: the same request from the same exit IP gets `200` from Bun's `fetch` (what the OpenCode binary runs on) and `429 Free usage limit reached` from Node. zen-proxy runs on Node and does not imitate another client's TLS handshake, so on the free tier expect that 429; with your own key (`defaultZenKey`) the proxy works as before.
+
 zen-proxy sits in front of that gateway and identifies your agent as a real session.
 
 <details>

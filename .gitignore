@@ -19,3 +19,6 @@ docs/discord-mcp-setup.md
 
 # brag video output (plan, brief, composition, renders) is local-only; the shipped copies live in assets/
 brag-output/
+
+# local investigation notes, never pushed
+docs/investigations/

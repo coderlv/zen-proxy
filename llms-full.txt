@@ -281,6 +281,8 @@ opencode serves its free models **only to genuine opencode traffic**. Verified b
 
 Body size is irrelevant: a realistic 1.5 kB agent prompt of our own wording is refused, and `'x' * 2000` is refused too. Only opencode's actual prompt text passes, so no synthetic probe can verify a free model — a retired model is refused with exactly the same 403, so probing cannot tell the two apart either. Which free models *exist* comes from opencode's public `/models` catalog instead, via `models.json`.
 
+**Since 2026-10-24 the free tier is also gated by client fingerprint.** opencode.ai is behind Cloudflare; the same bytes (a verbatim OpenCode request with fresh ids) from the same exit IP get `200` from Bun's `fetch` and `429 FreeUsageLimitError` ("Free usage limit reached. Subscribe to OpenCode Go") from Node's undici, from zen-proxy's own client, and from that client run under Bun. A fresh IP serves the real OpenCode CLI, then a Node request from it is refused. zen-proxy does not imitate another client's handshake; on the free tier this 429 is expected, a key (`defaultZenKey`) is the working route. Before any A/B against this gateway, check with the real OpenCode CLI that the exit IP is not already limited: an exhausted IP refuses everything and proves nothing.
+
 A bare `curl`, a health probe, or any non-agent client gets:
 
 ```
