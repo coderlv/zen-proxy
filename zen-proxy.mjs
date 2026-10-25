@@ -1017,6 +1017,10 @@ const DEFAULT_CONFIG = {
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
+  // Upstream counts free usage per session id. Measured 2026-10-25: one conversation id
+  // took 10 passes and then 429 while a fresh id on the same client still passed. 0 keeps
+  // one id per conversation, as before.
+  sessionMaxRequests: Number(ENV.SESSION_MAX_REQUESTS ?? 10),
   // Which credentials the auto-sync health probe uses:
   //   "auto"      — use defaultZenKey when set, otherwise anonymous `public`
   //   "key"       — always use defaultZenKey (probe fails if none is set)
@@ -1293,13 +1297,16 @@ function sessionFor(req, proxy) {
   let key = harness ? "harness:" + harness.trim() : req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
   if (proxy) key += "@" + proxyId(proxy)
   let hit = sessionPool.get(key)
-  if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS) {
-    hit = genSessionId()
+  // Past the cap the same id is one conversation hammering one bucket, so a conversation
+  // gets a fresh id; the age rule still covers sessions left running for days.
+  if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS || (config.sessionMaxRequests > 0 && hit.used >= config.sessionMaxRequests)) {
+    hit = { ...genSessionId(), used: 0 }
     sessionPool.delete(key)
     sessionPool.set(key, hit)
     // Oldest first: one key per conversation (times proxies) would otherwise pile up for good.
     if (sessionPool.size > SESSION_POOL_MAX) sessionPool.delete(sessionPool.keys().next().value)
   }
+  hit.used++
   if (req) req.zenSessionKey = key
   return { value: hit.value, injected: true }
 }
@@ -4352,7 +4359,7 @@ async function handleApiConfig(req, res) {
       cleaned.autoSync = toBool(cleaned.autoSync, config.autoSync)
       cleaned.autoUA = toBool(cleaned.autoUA, config.autoUA)
       if ("uaTail" in cleaned) cleaned.uaTail = String(cleaned.uaTail ?? "").trim()
-      cleaned.injectSession = toBool(cleaned.injectSession, config.injectSession)
+      cleaned.sessionMaxRequests = Math.max(0, Math.floor(num(cleaned.sessionMaxRequests ?? config.sessionMaxRequests, config.sessionMaxRequests)))
       cleaned.tlsImpersonate = toBool(cleaned.tlsImpersonate, config.tlsImpersonate)
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       // The list is only ever edited through /api/proxies: what GET returns here
@@ -4847,6 +4854,7 @@ export {
   maxBodyBytes,
   toBool,
   sessionFor,
+  sessionPool,
   rotateSession,
   opencodeHeaders,
   inferenceUrl,

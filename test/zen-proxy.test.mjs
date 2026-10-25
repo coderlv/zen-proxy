@@ -308,6 +308,7 @@ describe("ip handling", () => {
 })
 
 describe("session injection", () => {
+  beforeEach(() => zp.sessionPool.clear())
   test("zenHeaders injects a synthetic session when none is sent", () => {
     const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
     assert.ok(h["x-opencode-session"], "session header present")
@@ -360,6 +361,24 @@ describe("session injection", () => {
     zp.rotateSession(req, new Response(JSON.stringify({ error: { type: "MissingSessionID" } }), { status: 400 }))
     await new Promise((r) => setTimeout(r, 10))
     assert.notEqual(zp.sessionFor(conv("conv-a")).value, c, "a 400 about the session rotates")
+  })
+
+  test("a conversation gets a fresh id once its session hits the upstream allowance", () => {
+    zp.saveConfig({ sessionMaxRequests: 10 })
+    const conv = (id) => mockReq({ headers: { "x-session-id": id } })
+    const first = zp.sessionFor(conv("cap-a")).value // request 1 mints and counts
+    for (let i = 2; i <= 10; i++) assert.equal(zp.sessionFor(conv("cap-a")).value, first, `request ${i} keeps the id`)
+    const second = zp.sessionFor(conv("cap-a")).value
+    assert.notEqual(second, first, "the 11th request rotates to a fresh id")
+    assert.match(second, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    assert.notEqual(zp.sessionFor(conv("cap-b")).value, second, "the count is per conversation, not global")
+  })
+
+  test("sessionMaxRequests=0 keeps one session per conversation", () => {
+    zp.saveConfig({ sessionMaxRequests: 0 })
+    const conv = (id) => mockReq({ headers: { "x-session-id": id } })
+    const a = zp.sessionFor(conv("cap-off")).value
+    for (let i = 0; i < 12; i++) assert.equal(zp.sessionFor(conv("cap-off")).value, a, "no rotation when the cap is off")
   })
 
   test("a minted session id carries a decodable recent timestamp", () => {
@@ -3373,6 +3392,7 @@ describe("proxy transport", () => {
   beforeEach(async () => {
     zp.proxyState.clear()
     zp.hostState.clear()
+    zp.sessionPool.clear()
     rig ??= await startProxyRig()
   })
   after(() => rig?.close())
