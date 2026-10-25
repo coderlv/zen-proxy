@@ -539,9 +539,13 @@ async function openHelperStream(helper, proxy, host, port, signal) {
 // Node cannot send the hello below at all: OpenSSL refuses this group list ("no
 // suitable groups", every id is one it does not know), extension order is fixed
 // before 26.4, and raw extension payloads cannot be set. The Go helper
-// (helper/zen-hello.go) is what reproduces the hello byte for byte, JA3
-// 1523504b38f0fae0d881d4b6554aac1b included; without it Node's own hello goes out,
-// which is the shape the gate refuses. The capture and the A/B are in
+// (helper/zen-hello.go) is what reproduces the hello, JA3
+// 1523504b38f0fae0d881d4b6554aac1b included: every extension is the captured one,
+// and key_share has the captured shape too — entries 1216 + 32 bytes in the
+// binary's order, verified 2026-10-25 against a raw listener, whole hello 1493
+// bytes. Only the key bytes inside key_share are ours, because the shared secret
+// has to be computed here. Without the helper Node's own hello goes out, which is
+// the shape the gate refuses. The capture and the A/B are in
 // docs/investigations/2026-10-24-free-tier-429.md.
 const OPENCODE_HELLO = {
   ciphers: [
@@ -639,9 +643,10 @@ function agentFor(proxy, secure) {
   // use Node's own createConnection, which is Node's own hello.
   agent.createConnection = (opts, done) => {
     const hello = secure ? tlsHelloOptions() : null
-    // The helper already ran the handshake, so its stream carries plain HTTP and
-    // must not be wrapped in TLS a second time.
-    if (secure && config.helloHelper && proxy) {
+    // The helper owns the hello, so its stream carries plain HTTP and must not be
+    // wrapped in TLS a second time. A direct secure connection needs it just as
+    // much as a proxied one: without the helper that connection is Node's own hello.
+    if (secure && config.helloHelper) {
       openHelperStream(config.helloHelper, proxy, opts.host, opts.port, opts.signal).then((sock) => {
         sock.resume()
         done(null, sock)
@@ -1158,6 +1163,13 @@ const DEFAULT_CONFIG = {
   // `host:port` or `http://host:port`; empty keeps the hello above. The helper has to
   // be running, and zen-proxy still chooses the entry, which it names in `X-Proxy`.
   helloHelper: ENV.HELLO_HELPER ?? "",
+  // What the 2.1.4 binary puts on the wire, captured 2026-10-25: its tracer
+  // headers, the session-affinity mirror, and its own UA form
+  // (`opencode/<channel>/<version>/<client>`, from opencode's source). Measured:
+  // none of these alone changes the gate's answer — the class is the whole set —
+  // but this is what the real client sends, so the proxy sends it too.
+  // CLI_SHAPE=0 keeps the AI SDK UA tail and the 1.19.4 header set.
+  cliShape: ENV.CLI_SHAPE !== "0",
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -1327,19 +1339,55 @@ function genSessionId(now = Date.now()) {
   return { value: opencodeId("ses_", true, now), at: now }
 }
 
-// The rest of what opencode 1.19.4 puts on every model request (captured on
-// the wire, 2026-10-24). A client that sends its own x-opencode-* keeps them.
-function opencodeHeaders(req, auth) {
+// The rest of what opencode puts on every model request. The 1.19.4 wire capture
+// (2026-10-24) is the AI SDK shape; the 2.1.4 binary adds its tracer headers, the
+// session-affinity mirror, and the UA its own source builds. A client that names
+// its own x-opencode-* keeps them. Header order is not the class key (measured
+// 2026-10-25, 35 header variants changed nothing), so this keeps the readable order.
+function traceIds(session) {
+  // opencode mints one trace id per conversation and a fresh span per request
+  // (captured: the same trace id on two requests, different span ids). Deriving
+  // both from the session keeps them stable per conversation without holding
+  // state; the bytes themselves are not checked.
+  const h = createHash("sha256").update(String(session)).digest()
+  return { trace: h.subarray(0, 16).toString("hex"), root: h.subarray(16, 24).toString("hex") }
+}
+function cliUserAgent() {
+  const ua = String(config.ua ?? "")
+  if (/^opencode\/[^/]+\/[^/]+\/cli$/.test(ua)) return ua
+  const version = (ua.match(/^opencode\/(\d[^\s]*)/) ?? [])[1]
+  return version ? `opencode/latest/${version}/cli` : ua
+}
+function opencodeHeaders(req, auth, session) {
   const own = (h) => (typeof req?.headers?.[h] === "string" && req.headers[h]) || undefined
-  return {
+  const traced = config.cliShape && session
+  const headers = {
     "content-type": "application/json",
     accept: "*/*",
     authorization: auth,
-    "user-agent": /^opencode\/[\d.]+$/.test(config.ua) && config.uaTail ? `${config.ua} ${config.uaTail}` : config.ua,
-    "x-opencode-client": own("x-opencode-client") ?? "cli",
-    "x-opencode-project": own("x-opencode-project") ?? "global",
-    "x-opencode-request": own("x-opencode-request") ?? opencodeId("msg_", false),
+    "user-agent": config.cliShape
+      ? cliUserAgent()
+      : /^opencode\/[\d.]+$/.test(config.ua) && config.uaTail
+        ? `${config.ua} ${config.uaTail}`
+        : config.ua,
   }
+  if (traced) {
+    const { trace, root } = traceIds(session)
+    const span = randomBytes(8).toString("hex")
+    headers.b3 = `${trace}-${span}-1-${root}`
+    headers.traceparent = `00-${trace}-${span}-01`
+  }
+  headers["x-opencode-client"] = own("x-opencode-client") ?? "cli"
+  headers["x-opencode-project"] = own("x-opencode-project") ?? "global"
+  headers["x-opencode-request"] = own("x-opencode-request") ?? opencodeId("msg_", false)
+  // The binary mirrors the counted session into two more headers. Only the value
+  // upstream would accept goes out: a harness's own id is not opencode-shaped, and
+  // upstream decodes the leading 12 hex characters as a creation timestamp.
+  if (traced) {
+    headers["x-session-affinity"] = session
+    headers["x-session-id"] = session
+  }
+  return headers
 }
 // With a proxy, the minted id is per client *and* per proxy: a new exit IP
 // that kept the old session would still read as the same client upstream.
@@ -2454,14 +2502,13 @@ function applyEnvBlock(payload) {
 }
 
 function zenHeaders(req, auth) {
-  const headers = opencodeHeaders(req, auth)
   const sess = sessionFor(req)
   // Send both session headers whenever we are allowed to supply one. A client
   // that brings its own session keeps it; we just mirror it into the second
   // header so the pair upstream expects is always complete.
-  if (!sess.injected || config.injectSession) {
-    for (const h of SESSION_HEADERS) headers[h] = sess.value
-  }
+  const send = !sess.injected || config.injectSession
+  const headers = opencodeHeaders(req, auth, send ? sess.value : undefined)
+  if (send) for (const h of SESSION_HEADERS) headers[h] = sess.value
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
   return headers
@@ -3625,7 +3672,7 @@ function agentProbePayload(id, format) {
 // actually lives on. Returns the raw Response so sync can classify it.
 async function probeModel(id, auth, session) {
   const format = modelFormat(id)
-  const headers = opencodeHeaders(null, auth)
+  const headers = opencodeHeaders(null, auth, session)
   if (session) for (const h of SESSION_HEADERS) headers[h] = session
   const r = await upstreamFetch(inferenceUrl(format), {
     method: "POST",
@@ -4420,6 +4467,7 @@ async function handleApiConfig(req, res) {
       if ("uaTail" in cleaned) cleaned.uaTail = String(cleaned.uaTail ?? "").trim()
       cleaned.sessionMaxRequests = Math.max(0, Math.floor(num(cleaned.sessionMaxRequests ?? config.sessionMaxRequests, config.sessionMaxRequests)))
       cleaned.tlsImpersonate = toBool(cleaned.tlsImpersonate, config.tlsImpersonate)
+      cleaned.cliShape = toBool(cleaned.cliShape, config.cliShape)
       if ("helloHelper" in cleaned) cleaned.helloHelper = String(cleaned.helloHelper ?? "").trim()
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       // The list is only ever edited through /api/proxies: what GET returns here
@@ -4534,8 +4582,8 @@ async function handleTest(req, res) {
     const upstreamRes = await upstreamFetch(inferenceUrl(format), {
       method: "POST",
       headers: (() => {
-        const h = opencodeHeaders(null, auth)
         const sess = sessionHeader(req)
+        const h = opencodeHeaders(null, auth, sess)
         if (sess) for (const name of SESSION_HEADERS) h[name] = sess
         const ip = req.socket.remoteAddress ?? ""
         if (!ipOmit(ip)) h["x-real-ip"] = ip
@@ -4917,6 +4965,7 @@ export {
   sessionPool,
   rotateSession,
   opencodeHeaders,
+  traceIds,
   inferenceUrl,
   sessionHeader,
   MAX_BODY,

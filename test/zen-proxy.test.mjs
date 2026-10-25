@@ -269,16 +269,18 @@ describe("ip handling", () => {
   test("zenHeaders sends x-real-ip for public IPs, omits for loopback", () => {
     const pub = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
     assert.equal(pub["x-real-ip"], "8.8.8.8")
-    assert.ok(pub["user-agent"].startsWith(zp.config.ua))
     const loop = zp.zenHeaders(mockReq({ remoteAddress: "127.0.0.1" }), "Bearer public")
     assert.equal(loop["x-real-ip"], undefined)
   })
 
   test("upstream requests carry opencode's own header set", () => {
-    const keepUa = zp.config.ua
+    const keepUa = zp.config.ua, keepShape = zp.config.cliShape
     zp.saveConfig({ ua: "opencode/1.19.4" })
     const h = zp.zenHeaders(mockReq(), "Bearer public")
-    assert.equal(h["user-agent"], "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4")
+    assert.equal(h["user-agent"], "opencode/latest/1.19.4/cli", "the UA form the 2.1.4 binary sends is the default")
+    zp.saveConfig({ cliShape: false })
+    assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "opencode/1.19.4 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4", "with the shape off the AI SDK tail is what goes out")
+    zp.saveConfig({ cliShape: keepShape })
     assert.equal(h.accept, "*/*")
     assert.equal(h["x-opencode-client"], "cli")
     assert.equal(h["x-opencode-project"], "global")
@@ -288,7 +290,7 @@ describe("ip handling", () => {
     assert.deepEqual([own["x-opencode-client"], own["x-opencode-project"]], ["desktop", "abc"])
     zp.saveConfig({ ua: "custom-agent/2" })
     assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "custom-agent/2", "a hand-set UA is sent as is")
-    zp.saveConfig({ ua: keepUa })
+    zp.saveConfig({ ua: keepUa, cliShape: keepShape })
   })
 
   test("generation goes to opencode's /inference/openai/v1 on the default upstream", () => {
@@ -416,6 +418,61 @@ describe("session injection", () => {
   })
 })
 
+describe("the request shape of the opencode binary (captured 2026-10-25)", () => {
+  beforeEach(() => zp.sessionPool.clear())
+
+  test("b3 and traceparent name one trace, a fresh span per request, and the conversation's root span", () => {
+    const req = mockReq({ remoteAddress: "6.6.6.6" })
+    const a = zp.zenHeaders(req, "Bearer public")
+    const b = zp.zenHeaders(req, "Bearer public")
+    assert.match(a.b3, /^[0-9a-f]{32}-[0-9a-f]{16}-1-[0-9a-f]{16}$/)
+    assert.match(a.traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/)
+    const parts = (h) => ({ trace: h.b3.split("-")[0], span: h.b3.split("-")[1], parent: h.b3.split("-")[3] })
+    const pa = parts(a), pb = parts(b)
+    assert.equal(pa.trace, a.traceparent.split("-")[1], "both headers carry the same trace id")
+    assert.equal(pa.span, a.traceparent.split("-")[2], "traceparent names the same span as b3")
+    assert.equal(pb.trace, pa.trace, "the conversation keeps its trace id")
+    assert.equal(pb.parent, pa.parent, "the root span stays the parent")
+    assert.notEqual(pb.span, pa.span, "every request gets its own span")
+  })
+
+  test("the counted session is mirrored into the affinity headers the binary sends", () => {
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "6.6.6.7" }), "Bearer public")
+    assert.equal(h["x-session-affinity"], h["x-opencode-session"])
+    assert.equal(h["x-session-id"], h["x-opencode-session"], "the mirror carries the minted id, not the caller's")
+    // A harness keys the pool with its own id, which is not opencode-shaped, so the
+    // minted value is what goes upstream.
+    const harness = zp.zenHeaders(mockReq({ headers: { "x-session-id": "conv-42" } }), "Bearer public")
+    assert.equal(harness["x-session-id"], harness["x-opencode-session"])
+    assert.notEqual(harness["x-session-id"], "conv-42")
+  })
+
+  test("a client that brings its own session keeps it in the mirror headers", () => {
+    const h = zp.zenHeaders(mockReq({ headers: { "x-opencode-session": "ses_fromclient01" } }), "Bearer public")
+    assert.equal(h["x-session-affinity"], "ses_fromclient01")
+    assert.equal(h["x-session-id"], "ses_fromclient01")
+    assert.equal(h.b3.split("-")[0], zp.traceIds("ses_fromclient01").trace, "the trace id follows the session")
+  })
+
+  test("the UA is the form opencode's own source builds; CLI_SHAPE=0 keeps the AI SDK tail", () => {
+    zp.saveConfig({ ua: "opencode/1.18.30", uaTail: "ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4" })
+    assert.equal(zp.opencodeHeaders(null, "Bearer public", "ses_test0000000000000000000000")["user-agent"], "opencode/latest/1.18.30/cli")
+    zp.saveConfig({ cliShape: false })
+    assert.equal(zp.opencodeHeaders(null, "Bearer public", "ses_test0000000000000000000000")["user-agent"], "opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4")
+    zp.saveConfig({ cliShape: true, ua: "opencode/latest/2.1.4/cli", uaTail: "x/y" })
+    assert.equal(zp.opencodeHeaders(null, "Bearer public", "ses_test0000000000000000000000")["user-agent"], "opencode/latest/2.1.4/cli", "a UA already in the wire form is sent as written")
+  })
+
+  test("nothing is invented when injection is off and the client sends no session", () => {
+    zp.saveConfig({ injectSession: false, cliShape: true })
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "6.6.6.8" }), "Bearer public")
+    assert.equal(h["x-opencode-session"], undefined)
+    assert.equal(h["x-session-affinity"], undefined)
+    assert.equal(h.b3, undefined, "no trace without the session it belongs to")
+    assert.equal(h["user-agent"], "opencode/latest/1.18.30/cli", "the UA shape does not need a session")
+  })
+})
+
 describe("retryableUpstream", () => {
   test("429 and 5xx are always retryable", () => {
     assert.equal(zp.retryableUpstream(429, {}), true)
@@ -521,9 +578,12 @@ describe("auto-UA tracking", () => {
     ])
     await zp.refreshUA(true)
     assert.equal(zp.config.uaTail, "ai-sdk/provider-utils/4.0.23 runtime/bun/7.7.7", "only the Bun part follows the release")
-    assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "opencode/9.9.9 ai-sdk/provider-utils/4.0.23 runtime/bun/7.7.7")
+    assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "opencode/latest/9.9.9/cli", "with the binary shape on the tracked version goes out in opencode's own form")
+    zp.saveConfig({ cliShape: false })
+    assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "opencode/9.9.9 ai-sdk/provider-utils/4.0.23 runtime/bun/7.7.7", "with the shape off the tail is what goes out")
     zp.saveConfig({ uaTail: "" })
     assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "opencode/9.9.9", "an empty tail sends the bare UA")
+    zp.saveConfig({ cliShape: true })
   })
 
   test("refreshUA leaves custom User-Agents untouched", async () => {
@@ -3723,6 +3783,20 @@ describe("proxy transport", () => {
     assert.equal(r.status, 200)
     assert.ok(rig.seen.connect > tunnelBefore, "CONNECT through the proxy")
     assert.equal(helperHit.length, hitBefore, "an empty helloHelper never reaches the helper")
+  })
+
+  test("a direct secure connection goes through the helper too, because otherwise it is Node's own hello", async () => {
+    helperPort ??= await listen(helper)
+    const hitBefore = helperHit.length
+    const tunnelBefore = rig.seen.connect
+    zp.saveConfig({ proxies: [], helloHelper: `127.0.0.1:${helperPort}` })
+    const r = await zp.upstreamFetch(`https://127.0.0.1:${new URL(rig.upstreamUrl).port}/chat`, {})
+    assert.equal(r.status, 200)
+    assert.deepEqual(helperHit[hitBefore], {
+      target: `127.0.0.1:${new URL(rig.upstreamUrl).port}`,
+      proxy: "",
+    }, "no entry to name: the helper dialed by itself")
+    assert.equal(rig.seen.connect, tunnelBefore, "no tunnel was built for a direct request")
   })
 })
 

@@ -30,3 +30,13 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm test
+
+  helper:
+    name: helper / go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.24
+      - run: cd helper && go vet ./... && go test ./...

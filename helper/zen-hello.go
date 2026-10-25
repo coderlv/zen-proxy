@@ -12,10 +12,12 @@ package main
 //	go build -o zen-hello . && ./zen-hello            # listens on 127.0.0.1:18901
 //	ZEN_HELLO_PORT=18901 ZEN_HELLO_PROXY=<entry> go run .
 //
-// One part of the hello cannot be replayed: key_share. We have to compute the
-// shared secret, so its content and length are ours, not the binary's. Everything
-// else — ciphers, extension order, group ids, point formats, signature algorithms,
-// ALPN, and every extension payload — is the 2026-10-25 capture byte for byte.
+// One part of the hello cannot be replayed: key_share, because the shared secret
+// has to be computed here. Its shape is still the capture's: uTLS builds the
+// ML-KEM-768 share from crypto/mlkem (1184 + 32 = 1216 bytes) and the X25519 share
+// (32), in the binary's order, so the extension comes out the captured length.
+// Verified 2026-10-25 by reading what this program puts on the wire: every
+// extension matches the capture, and the whole hello is the captured 1493 bytes.
 // Extension order here is the wire order, so nothing sorts or rewrites it.
 
 import (
