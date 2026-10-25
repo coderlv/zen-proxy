@@ -1986,6 +1986,13 @@ describe("handleApiConfig", () => {
     assert.equal(zp.config.port, before)
   })
 
+  test("PUT normalizes the helper address", async () => {
+    const req = mockReq({ method: "PUT", _body: JSON.stringify({ helloHelper: " 127.0.0.1:18901 " }) })
+    const res = mockRes()
+    await zp.handleApiConfig(req, res)
+    assert.equal(zp.config.helloHelper, "127.0.0.1:18901")
+  })
+
   test("PUT rejects masked proxyKey (keeps existing)", async () => {
     zp.saveConfig({ proxyKey: "real-key-123" })
     const req = mockReq({
@@ -3671,6 +3678,51 @@ describe("proxy transport", () => {
     await zp.handleProxies(mockReq({ method: "DELETE", _body: JSON.stringify({ id: badId }) }), res)
     assert.deepEqual(zp.config.proxies, [rig.httpProxy])
     assert.deepEqual(zp.config.disabledProxies, [], "a removed proxy leaves no disabled id behind")
+  })
+
+  // Stands in for helper/zen-hello.go: it takes the CONNECT, names the entry it was
+  // handed, and pipes. What matters here is that zen-proxy still chooses the proxy
+  // and that the stream it gets back is used as-is, not wrapped in TLS again.
+  const helperHit = []
+  const helper = net.createServer((client) => {
+    client.once("data", (greet) => {
+      const head = String(greet)
+      helperHit.push({ target: head.split(" ")[1], proxy: (/X-Proxy: ([^\r]*)/.exec(head) ?? [])[1] })
+      client.write("HTTP/1.1 200 Connection established\r\n\r\n")
+      const out = net.connect(new URL(rig.upstreamUrl).port, "127.0.0.1")
+      client.pipe(out)
+      out.pipe(client)
+      out.on("error", () => client.destroy())
+      client.on("error", () => out.destroy())
+    })
+  })
+  let helperPort = null
+  after(() => helper.close())
+
+  test("a hello helper is told which entry to use and its stream carries the request", async () => {
+    helperHit.length = 0
+    helperPort ??= await listen(helper)
+    const tunnelBefore = rig.seen.connect
+    zp.saveConfig({ proxies: [rig.httpProxy], helloHelper: `127.0.0.1:${helperPort}` })
+    const r = await zp.upstreamFetch(`https://127.0.0.1:${new URL(rig.upstreamUrl).port}/chat`, {})
+    assert.equal(r.status, 200)
+    assert.deepEqual(await r.json(), { ok: true, echo: "" })
+    assert.deepEqual(helperHit[0], {
+      target: `127.0.0.1:${new URL(rig.upstreamUrl).port}`,
+      proxy: rig.httpProxy,
+    })
+    assert.equal(rig.seen.connect, tunnelBefore, "the helper built the upstream connection, not the tunnel path")
+  })
+
+  test("without a helper the proxy tunnel is still what carries the request", async () => {
+    helperPort ??= await listen(helper)
+    const hitBefore = helperHit.length
+    const tunnelBefore = rig.seen.connect
+    zp.saveConfig({ proxies: [rig.httpProxy], helloHelper: "" })
+    const r = await zp.upstreamFetch(rig.upstreamUrl + "/chat", {})
+    assert.equal(r.status, 200)
+    assert.ok(rig.seen.connect > tunnelBefore, "CONNECT through the proxy")
+    assert.equal(helperHit.length, hitBefore, "an empty helloHelper never reaches the helper")
   })
 })
 

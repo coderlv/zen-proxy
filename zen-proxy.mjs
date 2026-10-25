@@ -308,6 +308,8 @@ const PROXY_SCHEMES = new Set(["http:", "https:", "socks5:", "socks5h:"])
 const PROXY_STRATEGIES = ["round-robin", "random", "sticky", "least-used", "failover"]
 // shortcut: fixed cap on TCP connect + proxy handshake, make it a config key if slow proxies need more
 const PROXY_CONNECT_TIMEOUT_MS = 10_000
+// Default port of the optional Go hello helper (helper/zen-hello.go).
+const HELPER_DEFAULT_PORT = 18901
 
 // Accepts `scheme://user:pass@host:port`, `user:pass@host:port`, `host:port`
 // and the `host:port:user:pass` export most proxy sellers use. Returns a
@@ -487,6 +489,44 @@ async function openTunnel(proxy, host, port, signal) {
   }
 }
 
+// The optional Go helper (helper/zen-hello.go) owns the ClientHello Node cannot
+// build: OpenSSL refuses the captured group list, and Node 24 cannot order the
+// extensions or set raw extension payloads. zen-proxy still picks the entry and the
+// session; the helper dials, handshakes, and pipes, so what comes back is a plain
+// stream that must not be wrapped in TLS again.
+async function openHelperStream(helper, proxy, host, port, signal) {
+  const target = `${net.isIPv6(host) ? `[${host}]` : host}:${port}`
+  const [h, p] = String(helper).trim().split("://").pop().split(":")
+  const sock = net.connect(Number(p) || HELPER_DEFAULT_PORT, h || "127.0.0.1")
+  let reject
+  const failed = new Promise((_, j) => (reject = j))
+  failed.catch(() => {})
+  const onError = (err) => reject(err)
+  const onClose = () => reject(new Error("hello helper closed the connection"))
+  const onAbort = () => reject(signal.reason ?? new Error("aborted"))
+  const timer = setTimeout(() => reject(new Error("hello helper did not answer")), PROXY_CONNECT_TIMEOUT_MS)
+  sock.once("error", onError)
+  sock.once("close", onClose)
+  signal?.addEventListener("abort", onAbort, { once: true })
+  try {
+    await Promise.race([new Promise((r) => sock.once("connect", r)), failed])
+    sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nX-Proxy: ${proxy ?? ""}\r\n\r\n`)
+    const r = socketReader(sock)
+    const reply = (await r.readUntil("\r\n\r\n")).toString("latin1")
+    r.done()
+    if (Number(reply.split(" ")[1]) !== 200) throw new Error(`hello helper CONNECT failed: ${reply.split("\r\n")[0]}`)
+    return sock
+  } catch (err) {
+    sock.destroy()
+    throw err
+  } finally {
+    clearTimeout(timer)
+    sock.off("error", onError)
+    sock.off("close", onClose)
+    signal?.removeEventListener("abort", onAbort)
+  }
+}
+
 // ---- the ClientHello we send -------------------------------------------------
 // Since 2026-10-24 opencode's free-tier gate reads the shape of the ClientHello
 // Cloudflare hands it. On one proxy entry (one resident IP, one sticky session),
@@ -495,11 +535,13 @@ async function openTunnel(proxy, host, port, signal) {
 // binary, and the refusal comes before any quota is spent: on the free tier the
 // handshake is part of the credential, so upstream connections send that hello.
 //
-// tls-impersonate is optional (optionalDependencies). Without it, on Node
-// < 24.15, or for what it cannot mirror, we send Node's own hello and say so. Two
-// known gaps on Node 24: extension order (controllable only from 26.4) and the
-// content of ec_point_formats (OpenSSL decides it) — the gate accepted both.
-// Ids are hex in wire order, exactly as captured; the capture and the A/B are in
+// tls-impersonate is optional (optionalDependencies) and mirrors only part of this.
+// Node cannot send the hello below at all: OpenSSL refuses this group list ("no
+// suitable groups", every id is one it does not know), extension order is fixed
+// before 26.4, and raw extension payloads cannot be set. The Go helper
+// (helper/zen-hello.go) is what reproduces the hello byte for byte, JA3
+// 1523504b38f0fae0d881d4b6554aac1b included; without it Node's own hello goes out,
+// which is the shape the gate refuses. The capture and the A/B are in
 // docs/investigations/2026-10-24-free-tier-429.md.
 const OPENCODE_HELLO = {
   ciphers: [
@@ -552,7 +594,10 @@ async function initTlsHello() {
   }
   let note = "Node's own hello"
   helloOptions = null
-  if (config.tlsImpersonate && impersonator) {
+  if (config.helloHelper) {
+    // The helper runs the handshake, so nothing below is what goes out.
+    note = `hello helper at ${config.helloHelper} sends the captured hello`
+  } else if (config.tlsImpersonate && impersonator) {
     if (!impersonator.isSupported?.()) {
       note = "Node's own hello (this Node cannot control the ClientHello)"
     } else {
@@ -594,6 +639,15 @@ function agentFor(proxy, secure) {
   // use Node's own createConnection, which is Node's own hello.
   agent.createConnection = (opts, done) => {
     const hello = secure ? tlsHelloOptions() : null
+    // The helper already ran the handshake, so its stream carries plain HTTP and
+    // must not be wrapped in TLS a second time.
+    if (secure && config.helloHelper && proxy) {
+      openHelperStream(config.helloHelper, proxy, opts.host, opts.port, opts.signal).then((sock) => {
+        sock.resume()
+        done(null, sock)
+      }, (err) => done(err))
+      return
+    }
     if (!proxy) return done(null, secure ? tls.connect({ ...opts, ...(hello ?? {}) }) : net.connect(opts))
     openTunnel(proxy, opts.host, opts.port, opts.signal).then((sock) => {
       // The reader left it paused; nothing arrives before our request is written.
@@ -1099,6 +1153,11 @@ const DEFAULT_CONFIG = {
   // TLS_IMPERSONATE=0 sends Node's hello on purpose; TLS_HELLO takes the spec as JSON.
   tlsImpersonate: ENV.TLS_IMPERSONATE !== "0",
   tlsHello: JSON.parse(ENV.TLS_HELLO ?? JSON.stringify(OPENCODE_HELLO)),
+  // Give the ClientHello to the Go helper (helper/zen-hello.go), the only way to
+  // send the captured one: OpenSSL refuses its group list, so Node cannot build it.
+  // `host:port` or `http://host:port`; empty keeps the hello above. The helper has to
+  // be running, and zen-proxy still chooses the entry, which it names in `X-Proxy`.
+  helloHelper: ENV.HELLO_HELPER ?? "",
 }
 
 // True when the user's own config carries an explicit model list. While it is
@@ -4361,6 +4420,7 @@ async function handleApiConfig(req, res) {
       if ("uaTail" in cleaned) cleaned.uaTail = String(cleaned.uaTail ?? "").trim()
       cleaned.sessionMaxRequests = Math.max(0, Math.floor(num(cleaned.sessionMaxRequests ?? config.sessionMaxRequests, config.sessionMaxRequests)))
       cleaned.tlsImpersonate = toBool(cleaned.tlsImpersonate, config.tlsImpersonate)
+      if ("helloHelper" in cleaned) cleaned.helloHelper = String(cleaned.helloHelper ?? "").trim()
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       // The list is only ever edited through /api/proxies: what GET returns here
       // is masked, and round-tripping it would overwrite the real credentials.
@@ -4865,4 +4925,6 @@ export {
   helloToArgs,
   initTlsHello,
   tlsHelloOptions,
+  openHelperStream,
+  HELPER_DEFAULT_PORT,
 }
