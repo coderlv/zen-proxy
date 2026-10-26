@@ -25,6 +25,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	utls "github.com/refraction-networking/utls"
 	"io"
 	"log"
 	"net"
@@ -33,8 +34,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	utls "github.com/refraction-networking/utls"
+	"time"
 )
 
 // Captured ClientHello, from the opencode 2.1.4 binary through one proxy entry.
@@ -147,6 +147,16 @@ func entryFrom(r *http.Request) (*url.Userinfo, string, error) {
 	return u.User, u.Host, nil
 }
 
+// The window zen-proxy gives the helper for one connection. The helper has to give up
+// on the same window, otherwise an entry that accepts and then hangs keeps this
+// goroutine and the proxy connection open long after the proxy stopped caring.
+func handshakeWindow() time.Duration {
+	if ms, err := strconv.Atoi(os.Getenv("HELLO_HANDSHAKE_TIMEOUT_MS")); err == nil && ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return 30 * time.Second
+}
+
 func main() {
 	port := os.Getenv("ZEN_HELLO_PORT")
 	if port == "" {
@@ -166,20 +176,35 @@ func main() {
 	}
 }
 
+// The reply gets its own short window: the proxy stops waiting at the handshake window,
+// so writing after the window expired finds a socket the proxy already closed and the
+// caller sees a dropped connection instead of the reason.
+func answer(client net.Conn, status string) {
+	client.SetDeadline(time.Now().Add(2 * time.Second))
+	client.Write([]byte("HTTP/1.1 " + status + "\r\n\r\n"))
+}
+
 func serve(client net.Conn) {
 	defer client.Close()
 
+	// Measured 2026-10-26 through the pool: 0.5-2 s usually, 7.1 s and 9.2 s on two
+	// entries, so the window is not a formality.
+	window := handshakeWindow()
+	deadline := time.Now().Add(window)
+	if err := client.SetDeadline(deadline); err != nil {
+		return
+	}
 	req, err := http.ReadRequest(bufio.NewReader(client))
 	if err != nil {
 		return
 	}
 	if req.Method != "CONNECT" {
-		client.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
+		answer(client, "405 Method Not Allowed")
 		return
 	}
 	host, portstr, err := net.SplitHostPort(req.URL.Host)
 	if err != nil {
-		client.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		answer(client, "400 Bad Request")
 		return
 	}
 	port := portstr
@@ -189,18 +214,19 @@ func serve(client net.Conn) {
 
 	user, proxyHost, err := entryFrom(req)
 	if err != nil {
-		client.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		answer(client, "400 Bad Request")
 		return
 	}
-	up, err := net.Dial("tcp", proxyHost)
+	up, err := net.DialTimeout("tcp", proxyHost, time.Until(deadline))
 	if proxyHost == "" {
-		up, err = net.Dial("tcp", net.JoinHostPort(host, port))
+		up, err = net.DialTimeout("tcp", net.JoinHostPort(host, port), time.Until(deadline))
 	}
 	if err != nil {
-		client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		answer(client, "502 Bad Gateway")
 		return
 	}
 	// A proxy needs a CONNECT first; a direct dial already is the stream.
+	up.SetDeadline(deadline)
 	if proxyHost != "" {
 		if user != nil {
 			fmt.Fprintf(up, "CONNECT %s:%s HTTP/1.1\r\nHost: %s:%s\r\nProxy-Authorization: Basic %s\r\n\r\n", host, port, host, port, basic(user))
@@ -208,10 +234,16 @@ func serve(client net.Conn) {
 			fmt.Fprintf(up, "CONNECT %s:%s HTTP/1.1\r\nHost: %s:%s\r\n\r\n", host, port, host, port)
 		}
 		line, err := bufio.NewReader(up).ReadString('\n')
-		if err != nil || !strings.Contains(line, "200") {
+		if err != nil {
+			log.Printf("%s: entry gave no answer within %s: %v", host, window, err)
+			up.Close()
+			answer(client, "502 Bad Gateway")
+			return
+		}
+		if !strings.Contains(line, "200") {
 			log.Printf("%s: proxy said %s", host, strings.TrimSpace(line))
 			up.Close()
-			client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			answer(client, "502 Bad Gateway")
 			return
 		}
 	}
@@ -225,17 +257,20 @@ func serve(client net.Conn) {
 	if err := tlsConn.ApplyPreset(specFor(host)); err != nil {
 		log.Printf("%s: preset: %v", host, err)
 		up.Close()
-		client.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
+		answer(client, "500 Internal Server Error")
 		return
 	}
 	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("%s: handshake: %v", host, err)
+		log.Printf("%s: handshake failed within %s: %v", host, window, err)
 		up.Close()
-		client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		answer(client, "502 Bad Gateway")
 		return
 	}
 
-	client.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	// The pipe after the answer runs with no deadline.
+	answer(client, "200 Connection established")
+	client.SetDeadline(time.Time{})
+	up.SetDeadline(time.Time{})
 	log.Printf("%s via %s", net.JoinHostPort(host, port), masked(user, proxyHost))
 	done := make(chan struct{})
 	go func() {

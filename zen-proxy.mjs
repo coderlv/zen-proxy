@@ -505,7 +505,7 @@ async function openHelperStream(helper, proxy, host, port, signal) {
   const onError = (err) => reject(err)
   const onClose = () => reject(new Error("hello helper closed the connection"))
   const onAbort = () => reject(signal.reason ?? new Error("aborted"))
-  const timer = setTimeout(() => reject(new Error("hello helper did not answer")), PROXY_CONNECT_TIMEOUT_MS)
+  const timer = setTimeout(() => reject(new Error("hello helper did not answer")), helperWindowMs())
   sock.once("error", onError)
   sock.once("close", onClose)
   signal?.addEventListener("abort", onAbort, { once: true })
@@ -513,7 +513,11 @@ async function openHelperStream(helper, proxy, host, port, signal) {
     await Promise.race([new Promise((r) => sock.once("connect", r)), failed])
     sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nX-Proxy: ${proxy ?? ""}\r\n\r\n`)
     const r = socketReader(sock)
-    const reply = (await r.readUntil("\r\n\r\n")).toString("latin1")
+    // The helper answers only after it has dialled the entry and finished the
+    // handshake, so the window has to cover the read as in openTunnel: without the
+    // race a slow helper hangs the request to `timeoutMs` instead of failing at the
+    // window, and the entry is never blamed.
+    const reply = (await Promise.race([r.readUntil("\r\n\r\n"), failed])).toString("latin1")
     r.done()
     if (Number(reply.split(" ")[1]) !== 200) throw new Error(`hello helper CONNECT failed: ${reply.split("\r\n")[0]}`)
     return sock
@@ -539,6 +543,13 @@ const HELPER_READY_MS = 8000
 const HELPER_RESPAWN_MS = 8000
 const HELPER_MAX_RESTARTS = 5
 const HELPER_SOURCE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "helper")
+
+// The helper answers CONNECT only after it has dialled the entry and finished the
+// uTLS handshake, so this window is not the plain connect time: measured 2026-10-26
+// through the pool it is usually 0.5–2 s but reached 7.1 s and 9.2 s on two entries.
+// With the fixed 10 s window such an entry is blamed and parked in cooldown while the
+// handshake is fine, so the window follows the slow-proxy knob.
+const helperWindowMs = () => Math.max(PROXY_CONNECT_TIMEOUT_MS, config.proxyFirstByteMs)
 
 // `host:port` or `http://host:port`; an empty host means this machine.
 function helperTarget(helper) {
@@ -626,12 +637,13 @@ async function ensureHelperForKey(key, readyMs = HELPER_READY_MS) {
     detached: true,
   })
   helperChild = child
+  // The cap counts restarts of one helper, not every spawn: resetting the counter on
+  // each spawn would make a helper that dies immediately restart forever.
+  if (helperKey !== key) helperRestarts = 0
   helperKey = key
-  helperRestarts = 0
   child.on("exit", (code, signal) => {
     if (helperChild !== child) return
     helperChild = null
-    helperKey = ""
     if (helperShuttingDown) return
     if (helperRestarts >= HELPER_MAX_RESTARTS) {
       log(`hello helper gave up after ${HELPER_MAX_RESTARTS} restarts`)
@@ -639,7 +651,9 @@ async function ensureHelperForKey(key, readyMs = HELPER_READY_MS) {
     }
     helperRestarts++
     log(`hello helper exited (${signal ?? `code ${code}`}), restarting in ${HELPER_RESPAWN_MS}ms`)
-    setTimeout(() => ensureHelperForKey(key, readyMs), HELPER_RESPAWN_MS).unref?.()
+    // The address may have changed while the helper was down, so the restart reads it
+    // from the config again instead of the key this child was started for.
+    setTimeout(() => ensureHelperForKey(String(config.helloHelper ?? "").trim(), readyMs), HELPER_RESPAWN_MS).unref?.()
   })
   child.on("error", (err) => log(`hello helper could not start: ${err.message}`))
   if (await waitForHelper(host, port, readyMs)) log(`hello helper started on ${host}:${port} (${[cmd.file, ...cmd.args].join(" ")})`)
@@ -5152,4 +5166,5 @@ export {
   HELPER_LOCAL_HOSTS,
   HELPER_RESPAWN_MS,
   resetHelloHelper,
+  helperWindowMs,
 }

@@ -5921,7 +5921,7 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
 
 describe("the proxy starts the hello helper process itself", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hello-helper-"))
-  const saved = { helloHelper: zp.config.helloHelper, helloHelperAuto: zp.config.helloHelperAuto, helloHelperBinary: zp.config.helloHelperBinary }
+  const saved = { helloHelper: zp.config.helloHelper, helloHelperAuto: zp.config.helloHelperAuto, helloHelperBinary: zp.config.helloHelperBinary, proxyFirstByteMs: zp.config.proxyFirstByteMs }
   const fake = (name, body) => {
     const file = path.join(dir, name)
     fs.writeFileSync(file, `#!/usr/bin/env node\n${body}`)
@@ -6006,5 +6006,28 @@ describe("the proxy starts the hello helper process itself", () => {
     assert.equal(zp.helperState().restarts, 1, "the exit schedules one restart")
     zp.stopHelloHelper()
     assert.equal(await zp.ensureHelloHelper(400), null, "once the proxy is shutting down nothing is started again")
+  })
+
+  test("the helper window follows the slow-proxy knob, not the fixed connect window", () => {
+    zp.saveConfig({ proxyFirstByteMs: 30000 })
+    assert.equal(zp.helperWindowMs(), 30000)
+    zp.saveConfig({ proxyFirstByteMs: 4000 })
+    assert.equal(zp.helperWindowMs(), 10000, "a fast proxy still gets the plain connect window")
+  })
+
+  test("an entry that needs more than the fixed window is not blamed", async () => {
+    const script = fake("slow-answer.mjs", 'import net from "node:net"\nnet.createServer((sock) => sock.once("data", () => setTimeout(() => sock.write("HTTP/1.1 200 Connection established\\r\\n\\r\\n"), Number(process.env.FAKE_HELPER_DELAY)))).listen(Number(process.env.ZEN_HELLO_PORT), "127.0.0.1")')
+    const port = await freePort()
+    process.env.FAKE_HELPER_DELAY = "11000"
+    zp.saveConfig({ helloHelper: `127.0.0.1:${port}`, helloHelperAuto: true, helloHelperBinary: script, proxyFirstByteMs: 15000 })
+    const child = await zp.ensureHelloHelper(4000)
+    assert.ok(child)
+    const t0 = Date.now()
+    const sock = await zp.openHelperStream(`127.0.0.1:${port}`, "http://u:p@h:1", "opencode.ai", 443)
+    assert.ok(Date.now() - t0 > 10000, "the answer arrived after the old fixed window, so the window had to grow")
+    sock.destroy()
+    zp.saveConfig({ proxyFirstByteMs: 10000 })
+    await assert.rejects(() => zp.openHelperStream(`127.0.0.1:${port}`, "http://u:p@h:1", "opencode.ai", 443), /did not answer/, "the entry is still blamed when the window is the plain connect window")
+    zp.stopHelloHelper()
   })
 })

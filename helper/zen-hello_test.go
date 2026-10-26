@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/hex"
+	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,5 +154,69 @@ func checkHello(t *testing.T, record []byte) {
 	}
 	if len(body) != 1493 {
 		t.Errorf("hello body is %d bytes, the capture is 1493", len(body))
+	}
+}
+
+// zen-proxy stops waiting for the helper at its own window, so a helper that hangs on
+// an entry keeps a proxy connection open after the proxy already gave up. The helper
+// has to release the entry on the same window.
+func TestHungEntryIsReleasedAtTheWindow(t *testing.T) {
+	t.Setenv("HELLO_HANDSHAKE_TIMEOUT_MS", "1200")
+
+	// An entry that accepts the CONNECT and then never answers.
+	entry, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer entry.Close()
+	released := make(chan time.Duration, 1)
+	go func() {
+		conn, err := entry.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+			return
+		}
+		start := time.Now()
+		buf := make([]byte, 1)
+		conn.Read(buf)
+		released <- time.Since(start)
+	}()
+
+	helper, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer helper.Close()
+	go func() {
+		conn, err := helper.Accept()
+		if err != nil {
+			return
+		}
+		serve(conn)
+	}()
+
+	client, err := net.Dial("tcp", helper.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	fmt.Fprintf(client, "CONNECT opencode.ai:443 HTTP/1.1\r\nHost: opencode.ai:443\r\nX-Proxy: http://u:p@%s\r\n\r\n", entry.Addr().String())
+	reply, err := bufio.NewReader(client).ReadString('\n')
+	if err != nil {
+		t.Fatalf("no answer from the helper: %v", err)
+	}
+	if !strings.Contains(reply, "502") {
+		t.Fatalf("expected the helper to give up with 502, got %q", strings.TrimSpace(reply))
+	}
+	select {
+	case d := <-released:
+		if d < time.Second || d > 2*time.Second {
+			t.Fatalf("the entry was held for %v, the window is 1.2s", d)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("the entry is still open after the window")
 	}
 }
