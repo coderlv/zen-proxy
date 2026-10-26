@@ -5918,3 +5918,93 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
     assert.ok(!JSON.stringify(zp.agentProbePayload("gpt-5.5", "responses")).includes("<env>"))
   })
 })
+
+describe("the proxy starts the hello helper process itself", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hello-helper-"))
+  const saved = { helloHelper: zp.config.helloHelper, helloHelperAuto: zp.config.helloHelperAuto, helloHelperBinary: zp.config.helloHelperBinary }
+  const fake = (name, body) => {
+    const file = path.join(dir, name)
+    fs.writeFileSync(file, `#!/usr/bin/env node\n${body}`)
+    fs.chmodSync(file, 0o755)
+    return file
+  }
+  const freePort = async () => {
+    const server = net.createServer()
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const port = server.address().port
+    server.close()
+    return port
+  }
+  const answers = (port) => new Promise((resolve) => {
+    const sock = net.connect({ host: "127.0.0.1", port }, () => { sock.destroy(); resolve(true) })
+    sock.once("error", () => { sock.destroy(); resolve(false) })
+  })
+  beforeEach(() => zp.resetHelloHelper())
+  after(() => {
+    zp.stopHelloHelper()
+    zp.saveConfig(saved)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  test("the address in the config names the port the process has to listen on", () => {
+    assert.deepEqual(zp.helperTarget("127.0.0.1:19010"), { host: "127.0.0.1", port: 19010 })
+    assert.deepEqual(zp.helperTarget("http://helper.internal:18901"), { host: "helper.internal", port: 18901 })
+    assert.deepEqual(zp.helperTarget(""), { host: "127.0.0.1", port: zp.HELPER_DEFAULT_PORT })
+    assert.ok(zp.isLocalHelperHost("localhost") && zp.isLocalHelperHost("::1"))
+    assert.ok(!zp.isLocalHelperHost("helper.internal"), "a remote helper is not a process this install can start")
+  })
+
+  test("the process is the explicit binary, then the built one, then go run, then nothing", () => {
+    const binDir = fs.mkdtempSync(path.join(dir, "bins"))
+    const srcDir = fs.mkdtempSync(path.join(dir, "src"))
+    const env = { PATH: "/nothing-here" }
+    assert.equal(zp.helperCommand({ env, dir: srcDir, binary: "" }), null, "with nothing installed the helper stays external")
+    const built = path.join(srcDir, "zen-hello")
+    fs.writeFileSync(built, "#!/bin/sh\n")
+    fs.chmodSync(built, 0o755)
+    assert.equal(zp.helperCommand({ env, dir: srcDir, binary: "" }).file, built)
+    assert.equal(zp.helperCommand({ env, dir: srcDir, binary: "/opt/zen-hello" }).file, "/opt/zen-hello", "an explicit path wins over the built binary")
+    fs.writeFileSync(path.join(binDir, "go"), "#!/bin/sh\n")
+    fs.chmodSync(path.join(binDir, "go"), 0o755)
+    assert.equal(zp.helperCommand({ env: { PATH: binDir }, dir: binDir, binary: "" }).file, "go", "go run is the last resort")
+    assert.equal(zp.helperCommand({ env: { PATH: binDir, HELLO_HELPER_GO_RUN: "0" }, dir: binDir, binary: "" }), null)
+  })
+
+  test("a local address starts the helper on that port and the proxy waits for the listener", async () => {
+    const script = fake("listen.mjs", 'import net from "node:net"\nimport fs from "node:fs"\nconst port = Number(process.env.ZEN_HELLO_PORT)\nfs.writeFileSync(process.env.HELPER_PORT_FILE, String(port))\nsetTimeout(() => net.createServer().listen(port, "127.0.0.1"), 600)')
+    const port = await freePort()
+    const file = path.join(dir, "port")
+    process.env.HELPER_PORT_FILE = file
+    zp.saveConfig({ helloHelper: `127.0.0.1:${port}`, helloHelperAuto: true, helloHelperBinary: script })
+    const child = await zp.ensureHelloHelper(4000)
+    assert.ok(child, "the helper was started")
+    assert.equal(fs.readFileSync(file, "utf8"), String(port), "the port comes from the address in the config")
+    assert.ok(await answers(port), "the first connection waits for the listener instead of failing with ECONNREFUSED")
+    assert.equal(zp.helperState().child, child)
+    zp.stopHelloHelper()
+    await new Promise((resolve) => child.on("exit", resolve))
+    assert.ok(!(await answers(port)), "the port is free again when the proxy stops")
+  })
+
+  test("something already answering on the port is left alone", async () => {
+    const server = net.createServer()
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const port = server.address().port
+    zp.saveConfig({ helloHelper: `127.0.0.1:${port}`, helloHelperAuto: true, helloHelperBinary: fake("would-start.mjs", 'import net from "node:net"\nnet.createServer().listen(Number(process.env.ZEN_HELLO_PORT), "127.0.0.1")') })
+    assert.equal(await zp.ensureHelloHelper(1000), null)
+    assert.equal(zp.helperState().child, null, "an existing helper is not replaced by a second process")
+    server.close()
+  })
+
+  test("a helper that dies is started again, and the proxy stops trying after five", async () => {
+    const script = fake("dies.mjs", 'import fs from "node:fs"\nfs.writeFileSync(process.env.HELPER_PORT_FILE, "died")\nprocess.exit(0)')
+    const port = await freePort()
+    zp.saveConfig({ helloHelper: `127.0.0.1:${port}`, helloHelperAuto: true, helloHelperBinary: script })
+    const first = await zp.ensureHelloHelper(400)
+    assert.ok(first, "the child is returned even when the port never answers")
+    await new Promise((resolve) => first.on("exit", resolve))
+    assert.equal(zp.helperState().restarts, 1, "the exit schedules one restart")
+    zp.stopHelloHelper()
+    assert.equal(await zp.ensureHelloHelper(400), null, "once the proxy is shutting down nothing is started again")
+  })
+})

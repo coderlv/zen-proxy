@@ -10,6 +10,7 @@ import os from "node:os"
 import path from "node:path"
 import { randomBytes, createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
+import { spawn } from "node:child_process"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // realpath, not resolve: through a symlinked path (macOS /tmp, a linked checkout)
@@ -496,8 +497,8 @@ async function openTunnel(proxy, host, port, signal) {
 // stream that must not be wrapped in TLS again.
 async function openHelperStream(helper, proxy, host, port, signal) {
   const target = `${net.isIPv6(host) ? `[${host}]` : host}:${port}`
-  const [h, p] = String(helper).trim().split("://").pop().split(":")
-  const sock = net.connect(Number(p) || HELPER_DEFAULT_PORT, h || "127.0.0.1")
+  const { host: helperHost, port: helperPort } = helperTarget(helper)
+  const sock = net.connect(helperPort, helperHost)
   let reject
   const failed = new Promise((_, j) => (reject = j))
   failed.catch(() => {})
@@ -525,6 +526,163 @@ async function openHelperStream(helper, proxy, host, port, signal) {
     sock.off("close", onClose)
     signal?.removeEventListener("abort", onAbort)
   }
+}
+
+// ---- starting the helper process itself ------------------------------------
+// The config names the address; when it is this machine the proxy can also start
+// the process on that port, so an install that only sets `helloHelper` does not
+// need a second terminal. Nothing is started when something already answers there,
+// and a remote address is left alone. `HELLO_HELPER_AUTO=0` keeps the helper
+// external, which is what a systemd or launchd unit wants.
+const HELPER_LOCAL_HOSTS = new Set(["", "127.0.0.1", "localhost", "::1"])
+const HELPER_READY_MS = 8000
+const HELPER_RESPAWN_MS = 8000
+const HELPER_MAX_RESTARTS = 5
+const HELPER_SOURCE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "helper")
+
+// `host:port` or `http://host:port`; an empty host means this machine.
+function helperTarget(helper) {
+  const [host, port] = String(helper ?? "").trim().split("://").pop().split(":")
+  return { host: host || "127.0.0.1", port: Number(port) || HELPER_DEFAULT_PORT }
+}
+
+const isLocalHelperHost = (host) => HELPER_LOCAL_HOSTS.has(String(host ?? "").trim())
+
+const onPath = (name, env = process.env) => String(env.PATH ?? "").split(path.delimiter)
+  .some((dir) => { try { fs.accessSync(path.join(dir, name), fs.constants.X_OK); return true } catch { return false } })
+
+// Which process to start: the explicit binary, the one built next to the source,
+// or `go run` when Go is installed. Null means the helper has to be started by hand.
+function helperCommand({ env = process.env, dir = HELPER_SOURCE_DIR, binary = config.helloHelperBinary } = {}) {
+  const bin = String(binary ?? env.HELLO_HELPER_BIN ?? "").trim()
+  if (bin) return { file: bin, args: [] }
+  const built = path.join(dir, "zen-hello")
+  try { fs.accessSync(built, fs.constants.X_OK); return { file: built, args: [] } } catch {}
+  if (env.HELLO_HELPER_GO_RUN !== "0" && onPath("go", env)) return { file: "go", args: ["run", "."], cwd: dir }
+  return null
+}
+
+const listening = (host, port, timeoutMs = 1200) => new Promise((resolve) => {
+  const sock = net.connect({ host, port })
+  let settled = false
+  const finish = (answer) => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    sock.destroy()
+    resolve(answer)
+  }
+  const timer = setTimeout(() => finish(false), Math.max(1, timeoutMs))
+  sock.once("connect", () => finish(true))
+  sock.once("error", () => finish(false))
+})
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// `go run` has to compile before the port answers, so the first connection waits
+// for the listener instead of failing with ECONNREFUSED.
+async function waitForHelper(host, port, timeoutMs = HELPER_READY_MS) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await listening(host, port, Math.max(1, deadline - Date.now()))) return true
+    await delay(200)
+  }
+  return false
+}
+
+let helperChild = null
+let helperKey = ""
+let helperRestarts = 0
+let helperShuttingDown = false
+
+// Start the helper on the configured port when the address is local and nothing
+// answers there, and restart it when it dies: every secure upstream connection
+// needs it, so a dead helper is not a fallback to Node's hello.
+async function ensureHelloHelper(readyMs = HELPER_READY_MS) {
+  const key = String(config.helloHelper ?? "").trim()
+  if (!key || !config.helloHelperAuto || helperShuttingDown) return null
+  return await ensureHelperForKey(key, readyMs)
+}
+
+async function ensureHelperForKey(key, readyMs = HELPER_READY_MS) {
+  if (helperShuttingDown) return null
+  const { host, port } = helperTarget(key)
+  if (!isLocalHelperHost(host)) {
+    log(`hello helper address ${key} is not this machine — nothing to start here`)
+    return null
+  }
+  if (helperChild && helperKey === key) return helperChild
+  if (helperChild) killHelper(helperChild)
+  const cmd = helperCommand()
+  if (!cmd) {
+    log(`hello helper at ${key} is not running and nothing here can start it (set helloHelperBinary / HELLO_HELPER_BIN, or build helper/zen-hello)`)
+    return null
+  }
+  if (await listening(host, port)) return null
+  const child = spawn(cmd.file, cmd.args, {
+    cwd: cmd.cwd ?? process.cwd(),
+    env: { ...process.env, ZEN_HELLO_PORT: String(port) },
+    stdio: "inherit",
+    detached: true,
+  })
+  helperChild = child
+  helperKey = key
+  helperRestarts = 0
+  child.on("exit", (code, signal) => {
+    if (helperChild !== child) return
+    helperChild = null
+    helperKey = ""
+    if (helperShuttingDown) return
+    if (helperRestarts >= HELPER_MAX_RESTARTS) {
+      log(`hello helper gave up after ${HELPER_MAX_RESTARTS} restarts`)
+      return
+    }
+    helperRestarts++
+    log(`hello helper exited (${signal ?? `code ${code}`}), restarting in ${HELPER_RESPAWN_MS}ms`)
+    setTimeout(() => ensureHelperForKey(key, readyMs), HELPER_RESPAWN_MS).unref?.()
+  })
+  child.on("error", (err) => log(`hello helper could not start: ${err.message}`))
+  if (await waitForHelper(host, port, readyMs)) log(`hello helper started on ${host}:${port} (${[cmd.file, ...cmd.args].join(" ")})`)
+  else log(`hello helper did not answer on ${host}:${port} within ${readyMs}ms`)
+  return child
+}
+
+function stopHelloHelper() {
+  helperShuttingDown = true
+  const child = helperChild
+  helperChild = null
+  helperKey = ""
+  helperRestarts = 0
+  killHelper(child)
+}
+
+// `go run` is a wrapper: the program it compiled lives in the same process group,
+// so the group has to be signalled and not only the wrapper, otherwise the helper
+// keeps answering on the old port after a config reload.
+function killHelper(child) {
+  if (!child || child.killed) return
+  if (process.platform === "win32") {
+    child.kill()
+    return
+  }
+  try {
+    process.kill(-child.pid, "SIGTERM")
+  } catch {
+    child.kill("SIGTERM")
+  }
+}
+
+// Test seam: what the auto-start currently holds.
+function helperState() {
+  return { child: helperChild, key: helperKey, restarts: helperRestarts, shuttingDown: helperShuttingDown }
+}
+
+// Test seam: clear what the auto-start holds, so a test can start a helper again.
+function resetHelloHelper() {
+  helperShuttingDown = false
+  helperChild = null
+  helperKey = ""
+  helperRestarts = 0
 }
 
 // ---- the ClientHello we send -------------------------------------------------
@@ -1163,6 +1321,11 @@ const DEFAULT_CONFIG = {
   // `host:port` or `http://host:port`; empty keeps the hello above. The helper has to
   // be running, and zen-proxy still chooses the entry, which it names in `X-Proxy`.
   helloHelper: ENV.HELLO_HELPER ?? "",
+  // Start the helper process on that port when the address is local: an explicit
+  // binary, the one built next to helper/zen-hello.go, or `go run` when Go is
+  // installed. HELLO_HELPER_AUTO=0 keeps it external.
+  helloHelperAuto: ENV.HELLO_HELPER_AUTO !== "0",
+  helloHelperBinary: ENV.HELLO_HELPER_BIN ?? "",
   // What the 2.1.4 binary puts on the wire, captured 2026-10-25: its tracer
   // headers, the session-affinity mirror, and its own UA form
   // (`opencode/<channel>/<version>/<client>`, from opencode's source). Measured:
@@ -1245,6 +1408,7 @@ if (isMain) {
       setTimeout(() => {
         config = loadConfig()
         initTlsHello()
+        ensureHelloHelper()
         reloading = false
         scheduleSync()
         scheduleUA()
@@ -2351,7 +2515,7 @@ function handleAnalytics(req, res) {
 loadUsage()
 if (isMain) {
   setInterval(() => saveUsage(), 30_000).unref()
-  process.on("exit", () => saveUsage())
+  process.on("exit", () => { helperShuttingDown = true; stopHelloHelper(); saveUsage() })
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0))
 }
 
@@ -4469,6 +4633,8 @@ async function handleApiConfig(req, res) {
       cleaned.tlsImpersonate = toBool(cleaned.tlsImpersonate, config.tlsImpersonate)
       cleaned.cliShape = toBool(cleaned.cliShape, config.cliShape)
       if ("helloHelper" in cleaned) cleaned.helloHelper = String(cleaned.helloHelper ?? "").trim()
+      cleaned.helloHelperAuto = toBool(cleaned.helloHelperAuto, config.helloHelperAuto)
+      if ("helloHelperBinary" in cleaned) cleaned.helloHelperBinary = String(cleaned.helloHelperBinary ?? "").trim()
       if (cleaned.proxyKey === "••••••••") cleaned.proxyKey = config.proxyKey
       // The list is only ever edited through /api/proxies: what GET returns here
       // is masked, and round-tripping it would overwrite the real credentials.
@@ -4835,6 +5001,7 @@ if (isMain) {
   // The hello is what the free tier reads, so the first upstream connection must
   // already carry the configured one — resolve it before anything can connect.
   await initTlsHello()
+  await ensureHelloHelper()
   server.listen(config.port, config.host, () => {
     log(`zen-proxy listening on http://${config.host}:${config.port}`)
     log(`upstream ${config.upstream}  UA ${config.ua}  default ${config.defaultModel || "(auto)"}`)
@@ -4976,4 +5143,13 @@ export {
   tlsHelloOptions,
   openHelperStream,
   HELPER_DEFAULT_PORT,
+  helperTarget,
+  isLocalHelperHost,
+  helperCommand,
+  ensureHelloHelper,
+  stopHelloHelper,
+  helperState,
+  HELPER_LOCAL_HOSTS,
+  HELPER_RESPAWN_MS,
+  resetHelloHelper,
 }
