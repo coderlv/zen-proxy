@@ -1620,6 +1620,9 @@ function conversationKey(req, proxy) {
   return key;
 }
 function projectFor(req, proxy) {
+  // One id per request: the header and the env block have to name the same bucket, and
+  // the block is what the gate counts the workspace on.
+  if (req?.zenProject) return req.zenProject
   const own = req?.headers?.["x-opencode-project"];
   const key = conversationKey(req, proxy);
   let hit = projectPool.get(key);
@@ -1641,7 +1644,9 @@ function projectFor(req, proxy) {
   }
   hit.used++;
   if (req) req.zenConversationKey = key;
-  return { value: hit.value, injected: true };
+  const out = { value: hit.value, injected: true };
+  if (req) req.zenProject = out;
+  return out;
 }
 function sessionFor(req, proxy) {
   const incoming = req?.headers?.["x-opencode-session"];
@@ -1664,22 +1669,32 @@ function rotateSession(req, r) {
   const key = req?.zenConversationKey;
   if (!key || r.ok) return;
   if (r.status !== 429 && r.status !== 403 && r.status !== 400) return;
-  const drop = (pool, name, why) => pool.delete(key) && log(`${name} ${key.split("@")[0]} rotated after ${why}`);
-  if (r.status === 400) {
-    r.clone().text().then((t) => /MissingSessionID|session/i.test(t) && drop(sessionPool, "session", "400 session error"), () => {});
-    return;
-  }
-  drop(sessionPool, "session", r.status);
+  // The id that went upstream can be the per-proxy copy (proxySessionMode per-proxy) or
+  // the plain conversation key, whichever the request built first; both have to move,
+  // otherwise the conversation sits on the bucket that just got 429 for the whole window.
+  const keys = key.includes("@") ? [key, key.split("@")[0]] : [key];
+  const drop = (pool, k, name, why) => pool.delete(k) && log(`${name} ${k.split("@")[0]} rotated after ${why}`);
   // A project the caller named has to stay rotated: deleting the entry would hand the
   // spent id back on the next request, so the entry keeps its generation and takes a
-  // minted id instead.
-  const proj = projectPool.get(key);
-  if (proj) {
+  // minted id instead. The request that still holds this id (its header and env block)
+  // moves with it, otherwise a retry inside the same request names the spent workspace.
+  const rotateProject = (k) => {
+    const proj = projectPool.get(k);
+    if (!proj) return;
     proj.gen = (proj.gen ?? 0) + 1;
-    proj.value = opencodeProjectId(`${key}#${proj.gen}`);
+    proj.value = opencodeProjectId(`${k}#${proj.gen}`);
     proj.used = 0;
     proj.at = Date.now();
-    log(`project ${key.split("@")[0]} rotated after ${r.status}`);
+    if (req?.zenProject) req.zenProject.value = proj.value;
+    log(`project ${k.split("@")[0]} rotated after ${r.status}`);
+  };
+  if (r.status === 400) {
+    r.clone().text().then((t) => /MissingSessionID|session/i.test(t) && keys.forEach((k) => drop(sessionPool, k, "session", "400 session error")), () => {});
+    return;
+  }
+  for (const k of keys) {
+    drop(sessionPool, k, "session", r.status);
+    rotateProject(k);
   }
 }
 function sessionHeader(req) {
@@ -2740,15 +2755,17 @@ function gitRootAt(dir) {
 // block the proxy writes names the conversation, with the same id as the minted project
 // header so the two agree. A caller that names its own repo is left alone: that block is
 // already its bucket.
-function envBlockText(key) {
+function envBlockText(req) {
   const raw = String(config.envBlock ?? "")
   if (!raw) return ""
-  const conv = key ? opencodeProjectId(key) : ""
+  // The project the gate counts this conversation on, not the first one it was given:
+  // after a 429 the bucket is spent, and the block has to move with it.
+  const proj = req ? projectFor(req).value : ""
   const git = gitRootAt(process.cwd())
   return raw
-    .replace("{cwd}", conv ? `/conv/${conv}` : process.cwd())
-    .replace("{root}", conv ? `/conv/${conv}` : git || process.cwd())
-    .replace("{git}", conv ? "yes" : git ? "yes" : "no")
+    .replace("{cwd}", proj ? `/conv/${proj}` : process.cwd())
+    .replace("{root}", proj ? `/conv/${proj}` : git || process.cwd())
+    .replace("{git}", proj ? "yes" : git ? "yes" : "no")
     .replace("{platform}", process.platform)
     .replace("{date}", new Date().toISOString().slice(0, 10))
 }
@@ -2766,8 +2783,8 @@ function partialEnvBlock(text) {
   return ENV_FIELDS.every((f) => block.includes(f)) ? null : block;
 }
 
-function withEnv(text, key) {
-  const block = envBlockText(key)
+function withEnv(text, req) {
+  const block = envBlockText(req)
   if (!block) return text
   const s = String(text ?? "")
   const partial = partialEnvBlock(s)
@@ -2777,8 +2794,7 @@ function withEnv(text, key) {
 }
 
 function applyEnvBlock(payload, req) {
-  const key = req ? conversationKey(req) : null
-  const block = envBlockText(key)
+  const block = envBlockText(req)
   if (!block || !Array.isArray(payload?.messages)) return payload
   const i = payload.messages.findIndex((m) => m?.role === "system")
   if (i < 0) return { ...payload, messages: [{ role: "system", content: block }, ...payload.messages] }
@@ -2790,7 +2806,7 @@ function applyEnvBlock(payload, req) {
         return partial ? { ...p, text: String(p.text).replace(partial, block) } : p
       })
       : [...c, { type: "text", text: block }])
-    : withEnv(c, key)
+    : withEnv(c, req)
   if (next === c) return payload
   const messages = [...payload.messages]
   messages[i] = { ...payload.messages[i], content: next }
@@ -3196,7 +3212,7 @@ async function handleChat(req, res, responsesRoute = false) {
     // /responses caller sent is exactly what upstream wants, so it goes as-is,
     // with `instructions` taking the system slot the translated flow gives it.
     if (responsesRequestShape && format === "responses") {
-      const slot = withEnv(typeof body.instructions === "string" ? body.instructions : "", req ? conversationKey(req) : null)
+      const slot = withEnv(typeof body.instructions === "string" ? body.instructions : "", req)
       payload.input = slot
         ? [{ type: "message", role: "system", content: slot }, ...responsesInputItemArray(body.input)]
         : responsesInputItemArray(body.input)

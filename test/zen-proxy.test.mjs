@@ -6133,16 +6133,29 @@ describe("the counted identity: minted project, mirrored session, announced wind
     assert.equal(zp.projectFor(req).value, rotated, "the rotated id stays the conversation's");
   })
 
+  test("the id upstream counted moves even when it was keyed per proxy", () => {
+    zp.projectPool.clear();
+    const req = mockReq({ headers: { "x-session-id": "per-proxy-rot" } });
+    const first = zp.projectFor(req).value;
+    zp.projectFor(req, "http://p1:6969");
+    zp.rotateSession(req, { ok: false, status: 429 });
+    const next = mockReq({ headers: { "x-session-id": "per-proxy-rot" } });
+    assert.notEqual(zp.projectFor(next).value, first, "deleting the entry hands the same spent id back: the generation has to advance");
+    assert.equal(zp.projectFor(req).value, zp.projectFor(next).value, "the request that got 429 retries on the new bucket, not the spent one");
+  })
+
   test("the block names the conversation's workspace, so conversations do not share one exhausted bucket", () => {
     zp.saveConfig({ envBlock: DEFAULT_ENV_BLOCK });
     const a = mockReq({ headers: { "x-session-id": "block-a" } });
     const b = mockReq({ headers: { "x-session-id": "block-b" } });
-    const blockA = zp.withEnv("expert.", zp.conversationKey(a));
-    const blockB = zp.withEnv("expert.", zp.conversationKey(b));
+    const blockA = zp.withEnv("expert.", a);
+    const blockB = zp.withEnv("expert.", b);
     assert.ok(blockA.includes(`Workspace root folder: /conv/${zp.projectFor(a).value}`), "the block and the project header name the same bucket");
     assert.notEqual(blockA, blockB, "another conversation gets its own workspace");
     assert.notEqual(blockA, zp.withEnv("expert.", null), "and not the proxy's own repo, the bucket this machine hammered all day");
+    zp.rotateSession(a, { ok: false, status: 429 });
+    assert.ok(zp.withEnv("expert.", a).includes(`/conv/${zp.projectFor(a).value}`), "the block moves with the rotated bucket, otherwise the conversation stays on its spent workspace");
     const own = "expert.\n\n<env>\n  Working directory: /srv/app\n  Workspace root folder: /srv/app\n  Is directory a git repo: yes\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
-    assert.ok(zp.withEnv(own, "k").includes("Working directory: /srv/app"), "a caller that names its own repo keeps it: that block is already its bucket");
+    assert.ok(zp.withEnv(own, b).includes("Working directory: /srv/app"), "a caller that names its own repo keeps it: that block is already its bucket");
   })
 })
