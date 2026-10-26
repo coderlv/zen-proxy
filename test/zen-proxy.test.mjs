@@ -283,7 +283,8 @@ describe("ip handling", () => {
     zp.saveConfig({ cliShape: keepShape })
     assert.equal(h.accept, "*/*")
     assert.equal(h["x-opencode-client"], "cli")
-    assert.equal(h["x-opencode-project"], "global")
+    assert.match(h["x-opencode-project"], /^[0-9a-f]{40}$/, "the project id is minted in the shape upstream derives from a commit hash")
+    assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["x-opencode-project"], h["x-opencode-project"], "one bucket per conversation, not per request")
     assert.match(h["x-opencode-request"], /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     assert.notEqual(zp.zenHeaders(mockReq(), "Bearer public")["x-opencode-request"], h["x-opencode-request"], "one id per request")
     const own = zp.zenHeaders(mockReq({ headers: { "x-opencode-client": "desktop", "x-opencode-project": "abc" } }), "Bearer public")
@@ -1624,15 +1625,21 @@ describe("handleChat", () => {
     assert.equal(JSON.parse(res.body).model, "gpt-4o")
   })
 
-  test("chat bodies carry opencode's stream_options and 32000-token default, a client's own budget wins", async () => {
+  test("chat bodies carry opencode's stream_options, its budget name, and the caller's own budget", async () => {
     const sent = []
     globalThis.fetch = routeFetch([["/chat/completions", (u, opts) => (sent.push(JSON.parse(opts.body)), jsonResponse({ error: { message: "stop" } }, 400))]])
     await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "whatever", messages: [{ role: "user", content: "hi" }] }) }), mockRes())
-    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "whatever", messages: [{ role: "user", content: "hi" }], max_completion_tokens: 777 }) }), mockRes())
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "whatever", messages: [{ role: "user", content: "hi" }], max_completion_tokens: 777, reasoning_effort: "high" }) }), mockRes())
     assert.deepEqual(sent[0].stream_options, { include_usage: true })
-    assert.equal(sent[0].max_tokens, 32000)
+    assert.equal(sent[0].max_completion_tokens, 32000, "the default goes out under the name the binary uses")
+    assert.equal(sent[0].max_tokens, undefined, "one budget, one name")
+    assert.equal(sent[1].max_completion_tokens, 777, "the client's own number wins")
     assert.equal(sent[1].max_tokens, undefined, "no second budget next to the client's")
-    assert.equal(sent[1].max_completion_tokens, 777)
+    assert.equal(sent[1].reasoning_effort, "high", "what the caller asked for is forwarded")
+    zp.saveConfig({ reasoningEffort: "max" })
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: "whatever", messages: [{ role: "user", content: "hi" }] }) }), mockRes())
+    assert.equal(sent[2].reasoning_effort, "max", "the knob fills the field for callers that did not name it")
+    zp.saveConfig({ reasoningEffort: "" })
   })
 
   test("falls back to next candidate on 429", async () => {
@@ -6029,5 +6036,58 @@ describe("the proxy starts the hello helper process itself", () => {
     zp.saveConfig({ proxyFirstByteMs: 10000 })
     await assert.rejects(() => zp.openHelperStream(`127.0.0.1:${port}`, "http://u:p@h:1", "opencode.ai", 443), /did not answer/, "the entry is still blamed when the window is the plain connect window")
     zp.stopHelloHelper()
+  })
+})
+
+describe("the counted identity: minted project, mirrored session, announced window", () => {
+  test("a conversation gets its own project bucket, rotated like a session", () => {
+    const conv = (id) => mockReq({ headers: { "x-session-id": id } })
+    const a = zp.projectFor(conv("bucket-a")).value
+    assert.match(a, /^[0-9a-f]{40}$/, "40 hex, the shape upstream derives from a commit hash")
+    assert.equal(zp.projectFor(conv("bucket-a")).value, a, "same conversation → same bucket")
+    assert.notEqual(zp.projectFor(conv("bucket-b")).value, a, "another conversation gets its own")
+    assert.equal(zp.projectFor(mockReq({ headers: { "x-opencode-project": "abc" } })).value, "abc", "a client that names its own keeps it")
+    const cap = zp.config.projectMaxRequests
+    zp.saveConfig({ projectMaxRequests: 2 })
+    const first = zp.projectFor(conv("bucket-c")).value
+    zp.projectFor(conv("bucket-c"))
+    assert.notEqual(zp.projectFor(conv("bucket-c")).value, first, "past the cap the conversation gets a fresh bucket")
+    zp.saveConfig({ projectMaxRequests: cap })
+  })
+
+  test("the counted session is mirrored into every header the binary mirrors", () => {
+    const h = zp.zenHeaders(mockReq(), "Bearer public")
+    assert.equal(h["x-session-id"], h["x-opencode-session"])
+    assert.equal(h["x-session-affinity"], h["x-opencode-session"])
+    zp.saveConfig({ cliShape: false })
+    const off = zp.zenHeaders(mockReq(), "Bearer public")
+    assert.equal(off["x-session-id"], off["x-opencode-session"], "the mirror is not gated by the shape switch")
+    assert.equal(off.b3, undefined, "the tracer stays with the shape switch")
+    zp.saveConfig({ cliShape: true })
+  })
+
+  async function longWindowAnswer(url, route, shape) {
+    const calls = []
+    globalThis.fetch = async (u) => {
+      calls.push(String(u))
+      return jsonResponse({ type: "error", error: { type: "rate_limit_error", message: "Free usage limit reached" } }, 429, { "retry-after": "41268" })
+    }
+    const res = mockRes()
+    await zp[route](mockReq({ url: shape, _body: JSON.stringify({ model: "big-pickle", max_tokens: 8, messages: [{ role: "user", content: "hi" }] }) }), res)
+    return { res, calls }
+  }
+
+  test("a 429 with a window beyond this request's budget is answered, not walked", async () => {
+    const { res, calls } = await longWindowAnswer("http://x/v1/chat/completions", "handleChat", "/v1/chat/completions")
+    assert.equal(res.state.status, 429)
+    assert.equal(res.state.headers["retry-after"], "41268", "the announced window reaches the client")
+    assert.equal(calls.length, 1, "further candidates would spend slots of the same exhausted bucket")
+  })
+
+  test("the same rule holds on /v1/messages", async () => {
+    const { res, calls } = await longWindowAnswer("http://x/v1/messages", "handleMessages", "/v1/messages")
+    assert.equal(res.state.status, 429)
+    assert.equal(res.state.headers["retry-after"], "41268")
+    assert.equal(calls.length, 1)
   })
 })

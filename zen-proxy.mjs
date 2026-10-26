@@ -1119,6 +1119,10 @@ async function proxyAttempt(chosen, url, init, req, peek) {
     if (sess.injected) {
       const headers = { ...init.headers }
       for (const h of SESSION_HEADERS) headers[h] = sess.value
+      // The mirror carries the id this proxy counted, not the one the request was
+      // built with: upstream sees one conversation, not two.
+      headers["x-session-id"] = sess.value
+      headers["x-session-affinity"] = sess.value
       init = { ...init, headers }
     }
   }
@@ -1252,6 +1256,13 @@ const DEFAULT_CONFIG = {
   // took 10 passes and then 429 while a fresh id on the same client still passed. 0 keeps
   // one id per conversation, as before.
   sessionMaxRequests: Number(ENV.SESSION_MAX_REQUESTS ?? 10),
+  // Upstream counts free usage per (class, project). Measured 2026-10-26 through one
+  // entry with byte-identical ClientHello: the genuine client, whose project id is the
+  // repo's git hash, answered 200 while the proxy sending `global` got 429 in the same
+  // window — `global` is the anonymous bucket every client shares. So mint one stable
+  // id per conversation in the format upstream derives from git (40 hex) and rotate it
+  // after a limit, like a session. 0 keeps one project id per conversation forever.
+  projectMaxRequests: Number(ENV.PROJECT_MAX_REQUESTS ?? 200),
   // Which credentials the auto-sync health probe uses:
   //   "auto"      — use defaultZenKey when set, otherwise anonymous `public`
   //   "key"       — always use defaultZenKey (probe fails if none is set)
@@ -1284,6 +1295,10 @@ const DEFAULT_CONFIG = {
   // not required once the block is right. "" leaves the caller's prompt exactly as
   // the caller wrote it.
   envBlock: ENV.ENV_BLOCK ?? "<env>\n  Working directory: {cwd}\n  Workspace root folder: {root}\n  Is directory a git repo: {git}\n  Platform: {platform}\n  Today's date: {date}\n</env>",
+  // The binary names the token budget `max_completion_tokens` and sends
+  // `reasoning_effort` when the model takes one. Forward what the caller asked for;
+  // this only fills the field for callers that did not name it. "" sends nothing.
+  reasoningEffort: ENV.REASONING_EFFORT ?? "",
   // opencode Zen serves each model on a specific endpoint family
   // (chat/completions | responses | messages). Patterns may end in `*`.
   // Source of truth: https://opencode.ai/docs/zen
@@ -1295,6 +1310,11 @@ const DEFAULT_CONFIG = {
   // How many extra attempts a request gets against the *same* model when it
   // fails transiently (429/5xx/network) before the fallback chain moves on.
   retriesPerModel: Number(ENV.RETRIES_PER_MODEL ?? 2),
+  // A 429 whose window ends long after this request could ever finish is not worth
+  // walking the fallback chain: the bucket is keyed by class+project, not by model, so
+  // every further candidate spends more slots of the same exhausted one. Answer with
+  // the upstream Retry-After instead of hammering it.
+  stopChainOnLongRetryAfter: ENV.STOP_CHAIN_ON_LONG_RETRY_AFTER !== "0",
   retryBackoffMs: Number(ENV.RETRY_BACKOFF_MS ?? 500),
   rateLimitMax: Number(ENV.RATE_LIMIT_MAX ?? 0),
   rateLimitWindowMs: Number(ENV.RATE_LIMIT_WINDOW_MS ?? 60_000),
@@ -1536,7 +1556,7 @@ function cliUserAgent() {
   const version = (ua.match(/^opencode\/(\d[^\s]*)/) ?? [])[1]
   return version ? `opencode/latest/${version}/cli` : ua
 }
-function opencodeHeaders(req, auth, session) {
+function opencodeHeaders(req, auth, session, project) {
   const own = (h) => (typeof req?.headers?.[h] === "string" && req.headers[h]) || undefined
   const traced = config.cliShape && session
   const headers = {
@@ -1556,53 +1576,85 @@ function opencodeHeaders(req, auth, session) {
     headers.traceparent = `00-${trace}-${span}-01`
   }
   headers["x-opencode-client"] = own("x-opencode-client") ?? "cli"
-  headers["x-opencode-project"] = own("x-opencode-project") ?? "global"
+  headers["x-opencode-project"] = own("x-opencode-project") ?? project ?? "global";
   headers["x-opencode-request"] = own("x-opencode-request") ?? opencodeId("msg_", false)
-  // The binary mirrors the counted session into two more headers. Only the value
-  // upstream would accept goes out: a harness's own id is not opencode-shaped, and
-  // upstream decodes the leading 12 hex characters as a creation timestamp.
-  if (traced) {
-    headers["x-session-affinity"] = session
-    headers["x-session-id"] = session
+  // The binary mirrors the counted session into two more headers on every call, so the
+  // mirror is not gated by the shape switch: only the value upstream would accept goes
+  // out, because upstream decodes the leading 12 hex characters as a creation timestamp
+  // and a harness's own id is not opencode-shaped.
+  if (session) {
+    headers["x-session-affinity"] = session;
+    headers["x-session-id"] = session;
   }
   return headers
 }
-// With a proxy, the minted id is per client *and* per proxy: a new exit IP
-// that kept the old session would still read as the same client upstream.
-// Harnesses that name their own conversation (ZCode, Claude Code, Codex): the
-// minted session follows it, so parallel conversations on one machine stop
-// sharing one upstream identity. Their ids are not opencode-shaped, so they key
-// the pool and never go upstream themselves.
-const HARNESS_SESSION_HEADERS = ["x-session-id", "x-claude-code-session-id", "session_id"]
-const SESSION_POOL_MAX = 10_000
-function sessionFor(req, proxy) {
-  const incoming = req?.headers?.["x-opencode-session"]
-  if (typeof incoming === "string" && incoming.trim()) return { value: incoming.trim(), injected: false }
-  const harness = HARNESS_SESSION_HEADERS.map((h) => req?.headers?.[h]).find((v) => typeof v === "string" && v.trim())
-  let key = harness ? "harness:" + harness.trim() : req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server"
-  if (proxy) key += "@" + proxyId(proxy)
-  let hit = sessionPool.get(key)
-  // Past the cap the same id is one conversation hammering one bucket, so a conversation
-  // gets a fresh id; the age rule still covers sessions left running for days.
-  if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS || (config.sessionMaxRequests > 0 && hit.used >= config.sessionMaxRequests)) {
-    hit = { ...genSessionId(), used: 0 }
-    sessionPool.delete(key)
-    sessionPool.set(key, hit)
-    // Oldest first: one key per conversation (times proxies) would otherwise pile up for good.
-    if (sessionPool.size > SESSION_POOL_MAX) sessionPool.delete(sessionPool.keys().next().value)
-  }
-  hit.used++
-  if (req) req.zenSessionKey = key
-  return { value: hit.value, injected: true }
+// opencode derives the project id from the repo (a `.git/opencode` file, else the first
+// commit hash), so what upstream accepts is 40 hex. The proxy has no repo of its own:
+// it hashes the conversation key into the same shape and keeps it stable per
+// conversation, which is what puts a conversation in its own bucket instead of `global`.
+function opencodeProjectId(seed) {
+  return createHash("sha256").update(String(seed)).digest("hex").slice(0, 40);
 }
-// A limit or a refused session belongs to the id upstream saw: drop it, so the
-// next attempt and the rest of the conversation run on a fresh one.
+const projectPool = new Map();
+// The rest of what opencode puts on every model request: one conversation identity,
+// shared by the session and the project bucket. With a proxy the key is per client
+// *and* per proxy: a new exit IP that kept the old id would still read as the same
+// client upstream. Harnesses that name their own conversation (ZCode, Claude Code,
+// Codex) key the pool but their ids never go upstream themselves.
+const HARNESS_SESSION_HEADERS = ["x-session-id", "x-claude-code-session-id", "session_id"];
+const SESSION_POOL_MAX = 10_000;
+function conversationKey(req, proxy) {
+  const harness = HARNESS_SESSION_HEADERS.map((h) => req?.headers?.[h]).find((v) => typeof v === "string" && v.trim());
+  let key = harness ? "harness:" + harness.trim() : req ? (ipOmit(clientIp(req)) ? "local" : clientIp(req)) : "server";
+  if (proxy) key += "@" + proxyId(proxy);
+  return key;
+}
+function projectFor(req, proxy) {
+  const own = req?.headers?.["x-opencode-project"];
+  if (typeof own === "string" && own.trim()) return { value: own.trim(), injected: false };
+  const key = conversationKey(req, proxy);
+  let hit = projectPool.get(key);
+  // Same rule as a session: past the cap the id is one conversation hammering one
+  // bucket, so the conversation gets a fresh one, in the same 40-hex format.
+  if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS || (config.projectMaxRequests > 0 && hit.used >= config.projectMaxRequests)) {
+    const gen = (hit?.gen ?? 0) + 1;
+    hit = { value: gen === 1 ? opencodeProjectId(key) : opencodeProjectId(`${key}#${gen}`), at: Date.now(), used: 0, gen };
+    projectPool.delete(key);
+    projectPool.set(key, hit);
+    if (projectPool.size > SESSION_POOL_MAX) projectPool.delete(projectPool.keys().next().value);
+  }
+  hit.used++;
+  if (req) req.zenConversationKey = key;
+  return { value: hit.value, injected: true };
+}
+function sessionFor(req, proxy) {
+  const incoming = req?.headers?.["x-opencode-session"];
+  if (typeof incoming === "string" && incoming.trim()) return { value: incoming.trim(), injected: false };
+  const key = conversationKey(req, proxy);
+  let hit = sessionPool.get(key);
+  if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS || (config.sessionMaxRequests > 0 && hit.used >= config.sessionMaxRequests)) {
+    hit = { ...genSessionId(), used: 0 };
+    sessionPool.delete(key);
+    sessionPool.set(key, hit);
+    if (sessionPool.size > SESSION_POOL_MAX) sessionPool.delete(sessionPool.keys().next().value);
+  }
+  hit.used++;
+  if (req) req.zenConversationKey = key;
+  return { value: hit.value, injected: true };
+}
+// A limit or a refused identity belongs to the ids upstream saw: drop both, so the
+// next attempt and the rest of the conversation run on a fresh pair.
 function rotateSession(req, r) {
-  const key = req?.zenSessionKey
-  if (!key || r.ok || !sessionPool.has(key)) return
-  const drop = (why) => sessionPool.delete(key) && log(`session ${key.split("@")[0]} rotated after ${why}`)
-  if (r.status === 429 || r.status === 403) drop(r.status)
-  else if (r.status === 400) r.clone().text().then((t) => /MissingSessionID|session/i.test(t) && drop("400 session error"), () => {})
+  const key = req?.zenConversationKey;
+  if (!key || r.ok) return;
+  if (r.status !== 429 && r.status !== 403 && r.status !== 400) return;
+  const drop = (pool, name, why) => pool.delete(key) && log(`${name} ${key.split("@")[0]} rotated after ${why}`);
+  if (r.status === 400) {
+    r.clone().text().then((t) => /MissingSessionID|session/i.test(t) && drop(sessionPool, "session", "400 session error"), () => {});
+    return;
+  }
+  drop(sessionPool, "session", r.status);
+  drop(projectPool, "project", r.status);
 }
 function sessionHeader(req) {
   if (!config.injectSession) return undefined
@@ -1808,6 +1860,7 @@ function anthropicToChatBody(body, model) {
   if (Number.isFinite(mt) && mt > 0) payload.max_tokens = Math.floor(mt)
   if (body?.temperature != null) payload.temperature = body.temperature
   if (body?.top_p != null) payload.top_p = body.top_p
+  if (body?.reasoning_effort != null) payload.reasoning_effort = body.reasoning_effort
   if (Array.isArray(body?.stop_sequences) && body.stop_sequences.length) payload.stop = body.stop_sequences.slice(0, 4)
   const tools = anthropicToolsToChat(body?.tools)
   // Ship opencode's own tools ahead of the caller's. Without them the free tier
@@ -2613,7 +2666,16 @@ function ipOmit(ip) {
 const OPENCODE_MAX_TOKENS = 32000
 function opencodeChatBody(payload) {
   payload.stream_options = { include_usage: true }
-  if (payload.max_tokens == null && payload.max_completion_tokens == null) payload.max_tokens = OPENCODE_MAX_TOKENS
+  // The binary names the token budget `max_completion_tokens`; keep the caller's number
+  // under the name it used, and use the same name when the proxy has to supply one.
+  const budget = payload.max_completion_tokens ?? payload.max_tokens
+  if (budget != null) {
+    payload.max_completion_tokens = budget
+    delete payload.max_tokens
+  } else {
+    payload.max_completion_tokens = OPENCODE_MAX_TOKENS
+  }
+  if (payload.reasoning_effort == null && config.reasoningEffort) payload.reasoning_effort = config.reasoningEffort
   return payload
 }
 
@@ -2681,11 +2743,14 @@ function applyEnvBlock(payload) {
 
 function zenHeaders(req, auth) {
   const sess = sessionFor(req)
+  const proj = projectFor(req)
   // Send both session headers whenever we are allowed to supply one. A client
   // that brings its own session keeps it; we just mirror it into the second
-  // header so the pair upstream expects is always complete.
+  // header so the pair upstream expects is always complete. The project id is the
+  // other half of the counted identity: a caller that names its own keeps it,
+  // otherwise the minted bucket id goes out.
   const send = !sess.injected || config.injectSession
-  const headers = opencodeHeaders(req, auth, send ? sess.value : undefined)
+  const headers = opencodeHeaders(req, auth, send ? sess.value : undefined, proj.value)
   if (send) for (const h of SESSION_HEADERS) headers[h] = sess.value
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
@@ -2815,6 +2880,9 @@ async function handleMessages(req, res) {
   const gateRead = bridged ? null : gateReadFor(body)
   const gateReadName = gateRead ? gateRead.function.name : null
   const pin = bridged ? null : pinnedToolName(body.tool_choice)
+  let stopWalk = false
+  let firstRetryAfter = 0
+  let lastRetryAfter = 0
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -2928,13 +2996,21 @@ async function handleMessages(req, res) {
       }
       lastStatus = upstreamRes.status
       noteAttempt(req, model, attempt, `${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
-      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-      if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
+      const retryAfterSec = parseRetryAfter(upstreamRes.headers.get("retry-after"))
+      lastRetryAfter = retryAfterSec
+      const retryAfterMs = Math.min(retryAfterSec * 1000, 3000)
+      // A window that ends beyond this request's budget is not worth a second slot:
+      // the counter is per class + project, so every further attempt — same model or
+      // next candidate — spends the same exhausted bucket. Answer with what the gate
+      // announced instead of hammering it.
+      const longWindow = config.stopChainOnLongRetryAfter && retryAfterSec > config.timeoutMs / 1000
+      if (!longWindow && transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
       }
       recordObserved(model, false)
       if (retryableUpstream(upstreamRes.status, lastErr)) {
+        if (longWindow) { stopWalk = true; break }
         if (retryAfterMs > 0) await new Promise((r) => setTimeout(r, retryAfterMs))
         break
       }
@@ -2942,14 +3018,18 @@ async function handleMessages(req, res) {
       // as-is rather than masking it with the rest of the chain.
       recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
       const e = anthropicError(lastStatus, lastErr)
-      res.writeHead(e.status, { "content-type": "application/json" })
+      const hdr = { "content-type": "application/json" }
+      if (retryAfterSec > 0) hdr["retry-after"] = String(retryAfterSec)
+      res.writeHead(e.status, hdr)
       res.end(JSON.stringify(e.body))
       return
     }
     if (chosen && firstErr == null) {
       firstErr = lastErr
       firstStatus = lastStatus
+      firstRetryAfter = lastRetryAfter
     }
+    if (stopWalk) break
   }
 
   // Every candidate failed. Surface the error from the model the client asked
@@ -2959,7 +3039,9 @@ async function handleMessages(req, res) {
   const finalStatus = firstErr ? firstStatus : lastStatus
   recordReq(req, requested, Date.now() - start, finalStatus)
   const e = anthropicError(finalStatus, finalErr ?? { error: { type: "api_error", message: "all free models are unavailable" } })
-  res.writeHead(e.status, { "content-type": "application/json" })
+  const hdr = { "content-type": "application/json" }
+  if (finalStatus === 429 && firstRetryAfter > 0) hdr["retry-after"] = String(firstRetryAfter)
+  res.writeHead(e.status, hdr)
   res.end(JSON.stringify(e.body))
 }
 
@@ -3040,6 +3122,9 @@ async function handleChat(req, res, responsesRoute = false) {
   const gateReadName = gateRead ? gateRead.function.name : null
   const pin = bridged ? null : pinnedToolName(chatBody.tool_choice)
   const requestBody = applyEnvBlock(gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody)
+  let stopWalk = false
+  let firstRetryAfter = 0
+  let lastRetryAfter = 0
   for (const model of candidates) {
     const chosen = model === candidates[0]
     used = model
@@ -3203,8 +3288,13 @@ async function handleChat(req, res, responsesRoute = false) {
         attempt--
         continue
       }
-      const retryAfterMs = Math.min(parseRetryAfter(upstreamRes.headers.get("retry-after")) * 1000, 3000)
-      if (transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
+      const retryAfterSec = parseRetryAfter(upstreamRes.headers.get("retry-after"))
+      lastRetryAfter = retryAfterSec
+      const retryAfterMs = Math.min(retryAfterSec * 1000, 3000)
+      // Same rule as /v1/messages: a window that ends beyond this request's budget is
+      // answered, not walked, because the bucket is per class + project.
+      const longWindow = config.stopChainOnLongRetryAfter && retryAfterSec > config.timeoutMs / 1000
+      if (!longWindow && transientUpstream(upstreamRes.status, lastErr) && attempt < retries) {
         delayMs = Math.max(config.retryBackoffMs * (attempt + 1), retryAfterMs)
         continue
       }
@@ -3214,20 +3304,25 @@ async function handleChat(req, res, responsesRoute = false) {
       // id) so one dead model doesn't brick the whole request.
       recordObserved(model, false)
       if (retryableUpstream(upstreamRes.status, lastErr)) {
+        if (longWindow) { stopWalk = true; break }
         if (retryAfterMs > 0) await new Promise((r) => setTimeout(r, retryAfterMs))
         break
       }
       // A deterministic client-visible error (bad request, auth, …): report it
       // as-is rather than masking it with the rest of the chain.
       recordReq(req, `${requested}→${used}`, Date.now() - start, lastStatus)
-      res.writeHead(lastStatus, { "content-type": "application/json" })
+      const hdr = { "content-type": "application/json" }
+      if (retryAfterSec > 0) hdr["retry-after"] = String(retryAfterSec)
+      res.writeHead(lastStatus, hdr)
       res.end(JSON.stringify(lastErr))
       return
     }
     if (chosen && firstErr == null) {
       firstErr = lastErr
       firstStatus = lastStatus
+      firstRetryAfter = lastRetryAfter
     }
+    if (stopWalk) break
   }
 
   // Every candidate failed. Surface the error from the model the client asked
@@ -3239,7 +3334,9 @@ async function handleChat(req, res, responsesRoute = false) {
   // tried is an implementation detail and used to read as "another model
   // answered" while the error shown actually came from the requested one.
   recordReq(req, requested, Date.now() - start, finalStatus)
-  res.writeHead(finalStatus, { "content-type": "application/json" })
+  const hdr = { "content-type": "application/json" }
+  if (finalStatus === 429 && firstRetryAfter > 0) hdr["retry-after"] = String(firstRetryAfter)
+  res.writeHead(finalStatus, hdr)
   res.end(
     JSON.stringify(finalErr ?? { error: { type: "free_usage_limit_error", message: "all free models are rate-limited" } }),
   )
@@ -3850,7 +3947,7 @@ function agentProbePayload(id, format) {
 // actually lives on. Returns the raw Response so sync can classify it.
 async function probeModel(id, auth, session) {
   const format = modelFormat(id)
-  const headers = opencodeHeaders(null, auth, session)
+  const headers = opencodeHeaders(null, auth, session, projectFor(null).value)
   if (session) for (const h of SESSION_HEADERS) headers[h] = session
   const r = await upstreamFetch(inferenceUrl(format), {
     method: "POST",
@@ -4763,7 +4860,7 @@ async function handleTest(req, res) {
       method: "POST",
       headers: (() => {
         const sess = sessionHeader(req)
-        const h = opencodeHeaders(null, auth, sess)
+        const h = opencodeHeaders(null, auth, sess, projectFor(null).value)
         if (sess) for (const name of SESSION_HEADERS) h[name] = sess
         const ip = req.socket.remoteAddress ?? ""
         if (!ipOmit(ip)) h["x-real-ip"] = ip
@@ -5144,6 +5241,9 @@ export {
   toBool,
   sessionFor,
   sessionPool,
+  projectFor,
+  projectPool,
+  opencodeProjectId,
   rotateSession,
   opencodeHeaders,
   traceIds,
