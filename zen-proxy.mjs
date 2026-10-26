@@ -2732,15 +2732,23 @@ function gitRootAt(dir) {
   return found
 }
 
-function envBlockText() {
+// The bucket is keyed by the workspace the block names, not by the field structure
+// alone: measured 2026-10-26 on one entry, four requests whose block named the proxy's
+// own repo got 429 with the same window end while four whose block named another repo
+// passed in the same seconds, and a made-up path behaved like a repo — the value is the
+// key. The proxy's own repo is the bucket this machine has been hammering all day, so a
+// block the proxy writes names the conversation, with the same id as the minted project
+// header so the two agree. A caller that names its own repo is left alone: that block is
+// already its bucket.
+function envBlockText(key) {
   const raw = String(config.envBlock ?? "")
   if (!raw) return ""
-  const cwd = process.cwd()
-  const git = gitRootAt(cwd)
+  const conv = key ? opencodeProjectId(key) : ""
+  const git = gitRootAt(process.cwd())
   return raw
-    .replace("{cwd}", cwd)
-    .replace("{root}", git || cwd)
-    .replace("{git}", git ? "yes" : "no")
+    .replace("{cwd}", conv ? `/conv/${conv}` : process.cwd())
+    .replace("{root}", conv ? `/conv/${conv}` : git || process.cwd())
+    .replace("{git}", conv ? "yes" : git ? "yes" : "no")
     .replace("{platform}", process.platform)
     .replace("{date}", new Date().toISOString().slice(0, 10))
 }
@@ -2758,8 +2766,8 @@ function partialEnvBlock(text) {
   return ENV_FIELDS.every((f) => block.includes(f)) ? null : block;
 }
 
-function withEnv(text) {
-  const block = envBlockText()
+function withEnv(text, key) {
+  const block = envBlockText(key)
   if (!block) return text
   const s = String(text ?? "")
   const partial = partialEnvBlock(s)
@@ -2768,19 +2776,21 @@ function withEnv(text) {
   return s ? `${s}\n\n${block}` : block
 }
 
-function applyEnvBlock(payload) {
-  if (!envBlockText() || !Array.isArray(payload?.messages)) return payload
+function applyEnvBlock(payload, req) {
+  const key = req ? conversationKey(req) : null
+  const block = envBlockText(key)
+  if (!block || !Array.isArray(payload?.messages)) return payload
   const i = payload.messages.findIndex((m) => m?.role === "system")
-  if (i < 0) return { ...payload, messages: [{ role: "system", content: envBlockText() }, ...payload.messages] }
+  if (i < 0) return { ...payload, messages: [{ role: "system", content: block }, ...payload.messages] }
   const c = payload.messages[i].content
   const next = Array.isArray(c)
     ? (c.some((p) => String(p?.text ?? "").includes("<env>"))
       ? c.map((p) => {
         const partial = partialEnvBlock(String(p?.text ?? ""))
-        return partial ? { ...p, text: String(p.text).replace(partial, envBlockText()) } : p
+        return partial ? { ...p, text: String(p.text).replace(partial, block) } : p
       })
-      : [...c, { type: "text", text: envBlockText() }])
-    : withEnv(c)
+      : [...c, { type: "text", text: block }])
+    : withEnv(c, key)
   if (next === c) return payload
   const messages = [...payload.messages]
   messages[i] = { ...payload.messages[i], content: next }
@@ -2937,7 +2947,7 @@ async function handleMessages(req, res) {
     // client asked for one decides how the reply is shaped, not what is sent.
     // The gate's read stub, when the caller needs one, rides inside the
     // translated body (see anthropicToChatBody) — this must not inject again.
-    const chatShaped = applyEnvBlock(anthropicToChatBody(body, model))
+    const chatShaped = applyEnvBlock(anthropicToChatBody(body, model), req)
     const payload = format === "responses" ? responsesRequest(chatShaped, model, true) : opencodeChatBody({ ...chatShaped, stream: true })
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
@@ -3167,7 +3177,7 @@ async function handleChat(req, res, responsesRoute = false) {
   const gateRead = bridged ? null : gateReadFor(chatBody)
   const gateReadName = gateRead ? gateRead.function.name : null
   const pin = bridged ? null : pinnedToolName(chatBody.tool_choice)
-  const requestBody = applyEnvBlock(gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody)
+  const requestBody = applyEnvBlock(gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody, req)
   let stopWalk = false
   let firstRetryAfter = 0
   let lastRetryAfter = 0
@@ -3186,7 +3196,7 @@ async function handleChat(req, res, responsesRoute = false) {
     // /responses caller sent is exactly what upstream wants, so it goes as-is,
     // with `instructions` taking the system slot the translated flow gives it.
     if (responsesRequestShape && format === "responses") {
-      const slot = withEnv(typeof body.instructions === "string" ? body.instructions : "")
+      const slot = withEnv(typeof body.instructions === "string" ? body.instructions : "", req ? conversationKey(req) : null)
       payload.input = slot
         ? [{ type: "message", role: "system", content: slot }, ...responsesInputItemArray(body.input)]
         : responsesInputItemArray(body.input)
@@ -5261,6 +5271,7 @@ export {
   applyEnvBlock,
   withEnv,
   partialEnvBlock,
+  conversationKey,
   agentProbePayload,
   relayStream,
   relayAnthropicStream,

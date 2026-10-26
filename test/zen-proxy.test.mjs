@@ -5899,23 +5899,19 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
     for (const field of ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"])
       assert.ok(t.includes(field), `the gate reads the field structure, not just the tag: missing ${field} in ${t}`)
     assert.ok(!t.includes("{"), `every placeholder must be filled: ${t}`)
-    assert.ok(t.includes(`Working directory: ${process.cwd()}`), `the block states where the proxy really runs: ${t}`)
+    assert.ok(t.includes("Working directory: /conv/"), `the block names the conversation's own bucket, not the proxy's repo: ${t}`)
   })
 
-  test("the git field walks up to the repo the working directory sits in", async () => {
+  test("with no conversation key the block states where the proxy really runs, walking up to the repo", async () => {
     fs.mkdirSync(path.join(tmpDir, "fake-repo", ".git"), { recursive: true })
     const repo = fs.realpathSync(path.join(tmpDir, "fake-repo"))
     const deep = path.join(repo, "src", "deep")
     fs.mkdirSync(deep, { recursive: true })
     const before = process.cwd()
+    cfg({ envBlock: DEFAULT_ENV_BLOCK })
     process.chdir(deep)
     try {
-      cfg({ envBlock: DEFAULT_ENV_BLOCK })
-      const sent = await sentFor({
-        model: "big-pickle",
-        messages: [{ role: "system", content: "prompt" }, { role: "user", content: "hi" }],
-      })
-      const t = sysText(sent)
+      const t = zp.envBlockText(null)
       assert.ok(t.includes(`Working directory: ${deep}`), `the working directory is the caller's, not the repo root: ${t}`)
       assert.ok(t.includes(`Workspace root folder: ${repo}`), `the root line names the repo the call runs in: ${t}`)
       assert.ok(t.includes("Is directory a git repo: yes"), `inside a repo the answer is yes: ${t}`)
@@ -6135,5 +6131,18 @@ describe("the counted identity: minted project, mirrored session, announced wind
     assert.match(rotated, /^[0-9a-f]{40}$/);
     assert.notEqual(rotated, own, "a spent project is rotated: a caller cannot sit on its spent bucket for the whole window");
     assert.equal(zp.projectFor(req).value, rotated, "the rotated id stays the conversation's");
+  })
+
+  test("the block names the conversation's workspace, so conversations do not share one exhausted bucket", () => {
+    zp.saveConfig({ envBlock: DEFAULT_ENV_BLOCK });
+    const a = mockReq({ headers: { "x-session-id": "block-a" } });
+    const b = mockReq({ headers: { "x-session-id": "block-b" } });
+    const blockA = zp.withEnv("expert.", zp.conversationKey(a));
+    const blockB = zp.withEnv("expert.", zp.conversationKey(b));
+    assert.ok(blockA.includes(`Workspace root folder: /conv/${zp.projectFor(a).value}`), "the block and the project header name the same bucket");
+    assert.notEqual(blockA, blockB, "another conversation gets its own workspace");
+    assert.notEqual(blockA, zp.withEnv("expert.", null), "and not the proxy's own repo, the bucket this machine hammered all day");
+    const own = "expert.\n\n<env>\n  Working directory: /srv/app\n  Workspace root folder: /srv/app\n  Is directory a git repo: yes\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
+    assert.ok(zp.withEnv(own, "k").includes("Working directory: /srv/app"), "a caller that names its own repo keeps it: that block is already its bucket");
   })
 })
