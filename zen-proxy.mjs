@@ -2719,10 +2719,25 @@ function envBlockText() {
     .replace("{date}", new Date().toISOString().slice(0, 10))
 }
 
+// The gate recognizes the block by its field structure: the five fields in one block.
+// A caller that brings a partial block — harnesses usually write two or three fields —
+// is recognized as no block at all. Measured 2026-10-26 on one entry: three fresh
+// conversations with a two-field block all got 429 with the same window (they share one
+// anonymous bucket), the same prompt with the five fields got 200. So a partial block is
+// completed in place, not left alone and not appended next to it.
+const ENV_FIELDS = ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"];
+function partialEnvBlock(text) {
+  const block = /<env>[\s\S]*?<\/env>/.exec(String(text ?? ""))?.[0];
+  if (!block) return null;
+  return ENV_FIELDS.every((f) => block.includes(f)) ? null : block;
+}
+
 function withEnv(text) {
   const block = envBlockText()
   if (!block) return text
   const s = String(text ?? "")
+  const partial = partialEnvBlock(s)
+  if (partial) return s.replace(partial, block)
   if (s.includes("<env>")) return s
   return s ? `${s}\n\n${block}` : block
 }
@@ -2733,7 +2748,12 @@ function applyEnvBlock(payload) {
   if (i < 0) return { ...payload, messages: [{ role: "system", content: envBlockText() }, ...payload.messages] }
   const c = payload.messages[i].content
   const next = Array.isArray(c)
-    ? (c.some((p) => String(p?.text ?? "").includes("<env>")) ? c : [...c, { type: "text", text: envBlockText() }])
+    ? (c.some((p) => String(p?.text ?? "").includes("<env>"))
+      ? c.map((p) => {
+        const partial = partialEnvBlock(String(p?.text ?? ""))
+        return partial ? { ...p, text: String(p.text).replace(partial, envBlockText()) } : p
+      })
+      : [...c, { type: "text", text: envBlockText() }])
     : withEnv(c)
   if (next === c) return payload
   const messages = [...payload.messages]
@@ -5213,6 +5233,8 @@ export {
   envBlockText,
   gitRootAt,
   applyEnvBlock,
+  withEnv,
+  partialEnvBlock,
   agentProbePayload,
   relayStream,
   relayAnthropicStream,

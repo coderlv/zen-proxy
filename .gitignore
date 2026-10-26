@@ -22,3 +22,6 @@ brag-output/
 
 # local investigation notes, never pushed
 docs/investigations/
+
+# the built hello helper binary; the proxy prefers it over `go run`
+helper/zen-hello

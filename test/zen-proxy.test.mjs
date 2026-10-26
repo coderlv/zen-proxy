@@ -2588,6 +2588,19 @@ describe("Anthropic Messages API layer", () => {
     assert.match(sys, /CALLER PROMPT MARKER/)
   })
 
+  test("a caller's partial env block is completed to the five fields the gate recognizes", () => {
+    zp.saveConfig({ envBlock: DEFAULT_ENV_BLOCK });
+    const partial = "CALLER PROMPT\n\n<env>\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
+    const filled = zp.withEnv(partial);
+    assert.match(filled, /^CALLER PROMPT/, "the caller's text stays");
+    assert.equal((filled.match(/<env>/g) ?? []).length, 1, "the block is completed in place, not added next to it");
+    for (const f of ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"]) assert.ok(filled.includes(f), `missing ${f}`);
+    const complete = "CALLER PROMPT\n\n<env>\n  Working directory: /x\n  Workspace root folder: /x\n  Is directory a git repo: no\n  Platform: linux\n  Today's date: 2026-01-01\n</env>";
+    assert.equal(zp.withEnv(complete), complete, "a block that already has all five fields is left alone");
+    assert.equal(zp.partialEnvBlock(complete), null, "a complete block is not partial");
+    assert.ok(zp.partialEnvBlock(partial), "a two-field block is");
+  })
+
   test("tool_use and tool_result become chat tool_calls and role:tool", () => {
     const out = zp.anthropicToChatBody(
       {
@@ -5828,14 +5841,16 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
     assert.ok(sysText(sent).includes("<env>"))
   })
 
-  test("a caller that already carries an env block is left alone", async () => {
-    cfg()
-    const own = "You are opencode.\n<env>\n  Working directory: /srv/app\n</env>"
-    const sent = await sentFor({
-      model: "big-pickle",
-      messages: [{ role: "system", content: own }, { role: "user", content: "hi" }],
-    })
-    assert.equal(sysText(sent), own, "no second block on a prompt that has one")
+  test("a caller's complete env block is left alone, a partial one is completed in place", async () => {
+    cfg({ envBlock: DEFAULT_ENV_BLOCK })
+    const fields = ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"];
+    const own = "You are opencode.\n<env>\n  Working directory: /srv/app\n  Workspace root folder: /srv/app\n  Is directory a git repo: yes\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
+    const sent = await sentFor({ model: "big-pickle", messages: [{ role: "system", content: own }, { role: "user", content: "hi" }] });
+    assert.equal(sysText(sent), own, "no second block on a prompt that already has the five fields");
+    const filled = sysText(await sentFor({ model: "big-pickle", messages: [{ role: "system", content: "You are opencode.\n<env>\n  Platform: darwin\n</env>" }, { role: "user", content: "hi" }] }));
+    assert.match(filled, /^You are opencode\./, "the caller's text stays");
+    assert.equal((filled.match(/<env>/g) ?? []).length, 1, "the block is completed, not added next to it");
+    for (const f of fields) assert.ok(filled.includes(f), `missing ${f}`);
   })
 
   test("envBlock: '' sends the caller's prompt exactly as the caller wrote it", async () => {
