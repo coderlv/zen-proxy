@@ -3277,6 +3277,11 @@ async function startProxyRig() {
       res.writeHead(429, { "content-type": "application/json" })
       return res.end('{"error":{"type":"rate_limit"}}')
     }
+    if (req.url.startsWith("/closed")) {
+      // A window that ends beyond the request's budget: the class's, not this entry's.
+      res.writeHead(429, { "content-type": "application/json", "retry-after": "41268" })
+      return res.end('{"error":{"type":"rate_limit"}}')
+    }
     if (req.url.startsWith("/flaky")) {
       // The first `cutsLeft` calls lose the connection right after the headers
       // (or after one chunk, with `cutAfterFirst`), as a dying proxy does.
@@ -3589,6 +3594,19 @@ describe("proxy transport", () => {
     const r = await zp.upstreamFetch(`${rig.upstreamUrl}/limited`, {}, { req, model: DEFAULT_MODEL })
     await r.body?.cancel()
     assert.equal(rig.seen.upstream.length - before, 1)
+  })
+
+  test("a window that ends beyond the budget is not chased to another entry", async () => {
+    zp.saveConfig({ proxies: [rig.httpProxy, rig.socksProxy], proxyStrategy: "failover", proxyRetries: 3, proxyCooldownMs: 0 });
+    const before = rig.seen.upstream.length;
+    const r = await zp.upstreamFetch(`${rig.upstreamUrl}/closed`, {}, { req: mockReq(), model: DEFAULT_MODEL });
+    await r.body?.cancel();
+    assert.equal(rig.seen.upstream.length - before, 1, "another entry would spend another counted slot on the same closed window");
+    assert.equal(r.headers.get("retry-after"), "41268", "the announced window still reaches the caller");
+    const open = rig.seen.upstream.length;
+    const r2 = await zp.upstreamFetch(`${rig.upstreamUrl}/limited`, {}, { req: mockReq(), model: DEFAULT_MODEL });
+    await r2.body?.cancel();
+    assert.ok(rig.seen.upstream.length > open, "a window inside the budget still moves to the next entry");
   })
 
   test("compressed replies are asked for like opencode does and decoded for the caller", async () => {
@@ -6061,7 +6079,9 @@ describe("the counted identity: minted project, mirrored session, announced wind
     assert.match(a, /^[0-9a-f]{40}$/, "40 hex, the shape upstream derives from a commit hash")
     assert.equal(zp.projectFor(conv("bucket-a")).value, a, "same conversation → same bucket")
     assert.notEqual(zp.projectFor(conv("bucket-b")).value, a, "another conversation gets its own")
-    assert.equal(zp.projectFor(mockReq({ headers: { "x-opencode-project": "abc" } })).value, "abc", "a client that names its own keeps it")
+    zp.projectPool.clear();
+    const named = mockReq({ headers: { "x-session-id": "named-own", "x-opencode-project": "abc" } });
+    assert.equal(zp.projectFor(named).value, "abc", "a client that names its own keeps it while its bucket is fresh");
     const cap = zp.config.projectMaxRequests
     zp.saveConfig({ projectMaxRequests: 2 })
     const first = zp.projectFor(conv("bucket-c")).value
@@ -6104,5 +6124,16 @@ describe("the counted identity: minted project, mirrored session, announced wind
     assert.equal(res.state.status, 429)
     assert.equal(res.state.headers["retry-after"], "41268")
     assert.equal(calls.length, 1)
+  })
+
+  test("a project the caller named is kept until it is the bucket that got 429", () => {
+    const req = mockReq({ headers: { "x-session-id": "named-project", "x-opencode-project": "66f795e5997304fbd9a59c8264e3e3a997865ec3" } });
+    const own = zp.projectFor(req).value;
+    assert.equal(own, "66f795e5997304fbd9a59c8264e3e3a997865ec3", "the caller names its bucket and gets it");
+    zp.rotateSession(req, { ok: false, status: 429 });
+    const rotated = zp.projectFor(req).value;
+    assert.match(rotated, /^[0-9a-f]{40}$/);
+    assert.notEqual(rotated, own, "a spent project is rotated: a caller cannot sit on its spent bucket for the whole window");
+    assert.equal(zp.projectFor(req).value, rotated, "the rotated id stays the conversation's");
   })
 })

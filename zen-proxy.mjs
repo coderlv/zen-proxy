@@ -1081,10 +1081,20 @@ async function routeUpstream(url, init, { req, health = false, proxy } = {}, ev)
   for (let i = 1; ; i++) {
     let r, failed
     try {
-      r = await proxyAttempt(chosen, url, init, req, !health)
+      r = await proxyAttempt(chosen, url, init, req, !health);
+      // A window that ends beyond this request's budget is the class's, not this
+      // entry's: the next entry only spends another counted slot on the same bucket,
+      // and benching an entry for nine hours is churn. Answer this attempt as it is.
+      if (r.status === 429 && config.stopChainOnLongRetryAfter && parseRetryAfter(r.headers.get("retry-after")) > config.timeoutMs / 1000) {
+        if (req) {
+          req.zenLimited = true;
+          req.zenProxy = maskProxy(chosen);
+        }
+        return r;
+      }
       if (r.status !== 429) {
-        if (req) req.zenProxy = maskProxy(chosen)
-        return r
+        if (req) req.zenProxy = maskProxy(chosen);
+        return r;
       }
     } catch (err) {
       if (init.signal?.aborted) throw err
@@ -1611,14 +1621,20 @@ function conversationKey(req, proxy) {
 }
 function projectFor(req, proxy) {
   const own = req?.headers?.["x-opencode-project"];
-  if (typeof own === "string" && own.trim()) return { value: own.trim(), injected: false };
   const key = conversationKey(req, proxy);
   let hit = projectPool.get(key);
   // Same rule as a session: past the cap the id is one conversation hammering one
-  // bucket, so the conversation gets a fresh one, in the same 40-hex format.
+  // bucket, so the conversation gets a fresh one, in the same 40-hex format. A project
+  // the caller named is a bucket too and has to be rotatable: measured 2026-10-26, a
+  // caller that kept its own spent id got 429 on every request while the same
+  // conversation on a fresh id passed in the same window, so the caller's id is kept
+  // only until it is the thing that got 429.
   if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS || (config.projectMaxRequests > 0 && hit.used >= config.projectMaxRequests)) {
     const gen = (hit?.gen ?? 0) + 1;
-    hit = { value: gen === 1 ? opencodeProjectId(key) : opencodeProjectId(`${key}#${gen}`), at: Date.now(), used: 0, gen };
+    const value = gen === 1 && typeof own === "string" && own.trim()
+      ? own.trim()
+      : opencodeProjectId(gen === 1 ? key : `${key}#${gen}`);
+    hit = { value, at: Date.now(), used: 0, gen };
     projectPool.delete(key);
     projectPool.set(key, hit);
     if (projectPool.size > SESSION_POOL_MAX) projectPool.delete(projectPool.keys().next().value);
@@ -1654,7 +1670,17 @@ function rotateSession(req, r) {
     return;
   }
   drop(sessionPool, "session", r.status);
-  drop(projectPool, "project", r.status);
+  // A project the caller named has to stay rotated: deleting the entry would hand the
+  // spent id back on the next request, so the entry keeps its generation and takes a
+  // minted id instead.
+  const proj = projectPool.get(key);
+  if (proj) {
+    proj.gen = (proj.gen ?? 0) + 1;
+    proj.value = opencodeProjectId(`${key}#${proj.gen}`);
+    proj.used = 0;
+    proj.at = Date.now();
+    log(`project ${key.split("@")[0]} rotated after ${r.status}`);
+  }
 }
 function sessionHeader(req) {
   if (!config.injectSession) return undefined
