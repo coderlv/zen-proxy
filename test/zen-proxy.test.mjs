@@ -2592,17 +2592,32 @@ describe("Anthropic Messages API layer", () => {
     assert.match(sys, /CALLER PROMPT MARKER/)
   })
 
-  test("a caller's partial env block is completed to the five fields the gate recognizes", () => {
+  test("the caller's env block is rewritten to the bucket the header names, wherever it sits", () => {
     zp.saveConfig({ envBlock: DEFAULT_ENV_BLOCK });
+    const req = mockReq({ headers: { "x-session-id": "block-rewrite" } });
+    const bucket = zp.projectFor(req).value;
+    const fields = ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"];
     const partial = "CALLER PROMPT\n\n<env>\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
-    const filled = zp.withEnv(partial);
+    const filled = zp.withEnv(partial, req);
     assert.match(filled, /^CALLER PROMPT/, "the caller's text stays");
     assert.equal((filled.match(/<env>/g) ?? []).length, 1, "the block is completed in place, not added next to it");
-    for (const f of ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"]) assert.ok(filled.includes(f), `missing ${f}`);
-    const complete = "CALLER PROMPT\n\n<env>\n  Working directory: /x\n  Workspace root folder: /x\n  Is directory a git repo: no\n  Platform: linux\n  Today's date: 2026-01-01\n</env>";
-    assert.equal(zp.withEnv(complete), complete, "a block that already has all five fields is left alone");
-    assert.equal(zp.partialEnvBlock(complete), null, "a complete block is not partial");
-    assert.ok(zp.partialEnvBlock(partial), "a two-field block is");
+    for (const f of fields) assert.ok(filled.includes(f), `missing ${f}`);
+    assert.ok(filled.includes(`Working directory: /conv/${bucket}`), "the values name the bucket the header carries");
+    const complete = "CALLER PROMPT\n\n<env>\n  Working directory: /srv/app\n  Workspace root folder: /srv/app\n  Is directory a git repo: no\n  Platform: linux\n  Today's date: 2026-01-01\n</env>";
+    const moved = zp.withEnv(complete, req);
+    assert.ok(!moved.includes("/srv/app"), "a complete block naming the caller's own workspace is not left alone: the gate counts it, and that workspace is spent");
+    assert.ok(moved.includes(`/conv/${bucket}`), "its values move to the bucket the header carries");
+    assert.equal((moved.match(/<env>/g) ?? []).length, 1, "rewritten in place, never doubled");
+    // ZCode writes the same fields as plain label lines, with no <env> around them.
+    const bare = "Environment information:\n\nWorking directory: /srv/app\nWorkspace root folder: /srv/app\nIs a git repository: true\nPlatform: darwin\nShell: zsh\nToday's date: 2026-01-01\n\nWhen using Bash...";
+    assert.ok(zp.envLabelRun(bare), "the plain label run is the block the gate counts");
+    const rewritten = zp.withEnv(bare, req);
+    assert.ok(rewritten.startsWith("Environment information:"), "the caller's prose stays");
+    assert.ok(rewritten.includes("When using Bash..."), "the prose after the block stays");
+    assert.match(rewritten, /<env>[\s\S]*Working directory: \/conv\/[0-9a-f]{40}[\s\S]*<\/env>/, "the run is replaced by the canonical block, which is the shape the gate keys on");
+    assert.ok(!rewritten.includes("/srv/app"), "the caller's own workspace does not go out");
+    assert.ok(!rewritten.includes("Shell: zsh"), "the caller's shape is what the gate keys on, so the whole run goes, not only its values");
+    assert.ok(zp.withEnv("Working directory: /srv/app\nprose\nPlatform: darwin\nToday's date: 2026-01-01", req).includes("<env>"), "labels spread over a prompt are prose, not a block, so the proxy block is added");
   })
 
   test("tool_use and tool_result become chat tool_calls and role:tool", () => {
@@ -5863,18 +5878,29 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
     assert.ok(sysText(sent).includes("<env>"))
   })
 
-  test("a caller's complete env block is left alone, a partial one is completed in place", async () => {
-    cfg({ envBlock: DEFAULT_ENV_BLOCK })
+  test("the caller's block is rewritten in place in any message, so it names the bucket the header carries", async () => {
+    cfg({ envBlock: DEFAULT_ENV_BLOCK });
     const fields = ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"];
     const own = "You are opencode.\n<env>\n  Working directory: /srv/app\n  Workspace root folder: /srv/app\n  Is directory a git repo: yes\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
     const key = { "x-session-id": "caller-own-block" };
+    const bucket = zp.projectFor(mockReq({ headers: key })).value;
     const sent = await sentFor({ model: "big-pickle", messages: [{ role: "system", content: own }, { role: "user", content: "hi" }] }, "/chat/completions", false, key);
-    assert.equal(sysText(sent), own, "no second block on a prompt that already has the five fields");
+    const t = sysText(sent);
+    assert.equal((t.match(/<env>/g) ?? []).length, 1, "the block is rewritten in place, not added next to it");
+    assert.ok(t.includes(`/conv/${bucket}`), "the header and the block name the same bucket");
+    assert.ok(!t.includes("/srv/app"), "the workspace the caller named is not sent again");
+    const inUser = await sentFor(
+      { model: "big-pickle", messages: [{ role: "system", content: "You are opencode." }, { role: "user", content: `hi\n\n${own.slice(own.indexOf("<env>"))}` }] },
+      "/chat/completions", false, key,
+    );
+    const u = String((inUser.messages ?? []).find((m) => m?.role === "user")?.content ?? "");
+    assert.ok(u.includes(`/conv/${bucket}`) && !u.includes("/srv/app"), `the gate counts the block wherever the bundle carries it: ${u}`);
+    assert.ok(!(inUser.messages ?? []).some((m) => String(m?.content ?? "").includes("<env>") && m?.role === "system"), "no second block when the bundle already has one");
     const named = mockReq({ headers: key });
     zp.projectFor(named);
     zp.rotateSession(named, { ok: false, status: 429 });
     const moved = sysText(await sentFor({ model: "big-pickle", messages: [{ role: "system", content: own }, { role: "user", content: "hi" }] }, "/chat/completions", false, key));
-    assert.ok(moved.includes(`/conv/${zp.projectFor(mockReq({ headers: key })).value}`), "once that block's bucket got 429 it names the rotated one, the same the header carries");
+    assert.ok(moved.includes(`/conv/${zp.projectFor(mockReq({ headers: key })).value}`), "once that bucket got 429 it names the rotated one, the same the header carries");
     assert.ok(!moved.includes("/srv/app"), "the spent workspace does not go out again");
     const filled = sysText(await sentFor({ model: "big-pickle", messages: [{ role: "system", content: "You are opencode.\n<env>\n  Platform: darwin\n</env>" }, { role: "user", content: "hi" }] }));
     assert.match(filled, /^You are opencode\./, "the caller's text stays");
@@ -5939,7 +5965,22 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
       true,
     )
     const sys = (sent.input ?? []).find((i) => i?.role === "system")
-    assert.ok(sys && JSON.stringify(sys).includes("<env>"), `the translated input must carry the block: ${JSON.stringify(sent)}`)
+    assert.ok(sys && JSON.stringify(sys).includes("<env>"), `the translated input must carry the block: ${JSON.stringify(sent)}`);
+  })
+
+  test("a Responses caller that put the block in an input item gets it rewritten, not doubled", async () => {
+    cfg({ responsesModels: ["gpt-5*"], fallbackModels: ["gpt-5.5"], defaultModel: "gpt-5.5", envBlock: DEFAULT_ENV_BLOCK });
+    const key = { "x-session-id": "responses-input-block" };
+    const bucket = zp.projectFor(mockReq({ headers: key })).value;
+    const item = { type: "message", role: "user", content: "hi\n\nWorking directory: /srv/app\nWorkspace root folder: /srv/app\nIs a git repository: true\nPlatform: darwin\nShell: zsh\nToday's date: 2026-01-01" };
+    const sent = await sentFor({ model: "gpt-5.5", input: [item] }, "/responses", true, key);
+    const items = sent.input ?? [];
+    const user = items.find((i) => i?.role === "user");
+    const t = typeof user?.content === "string" ? user.content : JSON.stringify(user);
+    assert.ok(t.includes(`Working directory: /conv/${bucket}`), `the item is rewritten in place: ${t}`);
+    assert.ok(!t.includes("/srv/app"), "the workspace the caller named does not go out");
+    assert.ok(!t.includes("Shell: zsh"), "the run's shape is what the gate keys on, so the caller's wording goes with it");
+    assert.ok(!items.some((i) => i?.role === "system"), "no second block when the bundle already carries one");
   })
 
   test("the Anthropic route appends the block to the caller's system prompt", async () => {
@@ -6169,7 +6210,7 @@ describe("the counted identity: minted project, mirrored session, announced wind
     zp.rotateSession(a, { ok: false, status: 429 });
     assert.ok(zp.withEnv("expert.", a).includes(`/conv/${zp.projectFor(a).value}`), "the block moves with the rotated bucket, otherwise the conversation stays on its spent workspace");
     const own = "expert.\n\n<env>\n  Working directory: /srv/app\n  Workspace root folder: /srv/app\n  Is directory a git repo: yes\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
-    assert.ok(zp.withEnv(own, b).includes("Working directory: /srv/app"), "a caller that names its own repo keeps it while that repo is still its bucket");
+    assert.ok(zp.withEnv(own, b).includes(`Working directory: /conv/${zp.projectFor(b).value}`), "a caller that names its own repo still has to name the bucket the header carries, because the gate counts the block it is given");
     zp.rotateSession(b, { ok: false, status: 429 });
     const moved = zp.withEnv(own, b);
     assert.ok(moved.includes(`/conv/${zp.projectFor(b).value}`), "once that bucket got 429 the caller's block names the same bucket as the header");

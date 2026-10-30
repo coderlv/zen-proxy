@@ -2763,21 +2763,31 @@ function gitRootAt(dir) {
 // passed in the same seconds, and a made-up path behaved like a repo — the value is the
 // key. The proxy's own repo is the bucket this machine has been hammering all day, so a
 // block the proxy writes names the conversation, with the same id as the minted project
-// header so the two agree. A caller that names its own repo is left alone: that block is
-// already its bucket.
-function envBlockText(req) {
-  const raw = String(config.envBlock ?? "")
-  if (!raw) return ""
+// header so the two agree.
+function envValues(req) {
   // The project the gate counts this conversation on, not the first one it was given:
   // after a 429 the bucket is spent, and the block has to move with it.
   const proj = req ? projectFor(req).value : ""
   const git = gitRootAt(process.cwd())
+  return {
+    cwd: proj ? `/conv/${proj}` : process.cwd(),
+    root: proj ? `/conv/${proj}` : git || process.cwd(),
+    git: proj ? "yes" : git ? "yes" : "no",
+    platform: process.platform,
+    date: new Date().toISOString().slice(0, 10),
+  }
+}
+
+function envBlockText(req) {
+  const raw = String(config.envBlock ?? "")
+  if (!raw) return ""
+  const v = envValues(req)
   return raw
-    .replace("{cwd}", proj ? `/conv/${proj}` : process.cwd())
-    .replace("{root}", proj ? `/conv/${proj}` : git || process.cwd())
-    .replace("{git}", proj ? "yes" : git ? "yes" : "no")
-    .replace("{platform}", process.platform)
-    .replace("{date}", new Date().toISOString().slice(0, 10))
+    .replace("{cwd}", v.cwd)
+    .replace("{root}", v.root)
+    .replace("{git}", v.git)
+    .replace("{platform}", v.platform)
+    .replace("{date}", v.date)
 }
 
 // The gate recognizes the block by its field structure: the five fields in one block.
@@ -2786,36 +2796,84 @@ function envBlockText(req) {
 // conversations with a two-field block all got 429 with the same window (they share one
 // anonymous bucket), the same prompt with the five fields got 200. So a partial block is
 // completed in place, not left alone and not appended next to it.
-const ENV_FIELDS = ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"];
+//
+// Harnesses word the fields differently — ZCode writes `Is a git repository:` and adds
+// `Shell:` — and it does not wrap the block in <env> at all. Measured 2026-10-30 on the live
+// instance: the same five fields naming the caller's workspace passed in a system message under
+// <env> and got 429 as a plain label block wherever it appeared, and the block the proxy appends
+// does not override the one the caller already put in the bundle. So the caller's block is
+// replaced wherever it sits, and the proxy block is added only when the bundle carries no block
+// anywhere.
+const ENV_LABELS = [
+  { key: "cwd", labels: ["Working directory:"] },
+  { key: "root", labels: ["Workspace root folder:"] },
+  { key: "git", labels: ["Is directory a git repo:", "Is a git repository:"] },
+  { key: "platform", labels: ["Platform:"] },
+  { key: "date", labels: ["Today's date:"] },
+];
 function envBlockMatch(text) {
   return /<env>[\s\S]*?<\/env>/.exec(String(text ?? ""))?.[0] ?? null;
 }
-function partialEnvBlock(text) {
-  const block = envBlockMatch(text);
-  if (!block) return null;
-  return ENV_FIELDS.every((f) => block.includes(f)) ? null : block;
+
+function envLabel(line) {
+  const t = String(line ?? "");
+  for (const entry of ENV_LABELS) {
+    for (const label of entry.labels) {
+      const at = t.indexOf(label);
+      if (at >= 0) return { entry, label, at };
+    }
+  }
+  return null;
 }
 
-// The block and the project header have to name the same bucket for one request, because the
-// block is what the gate counts the workspace on. A caller that brings all five fields names
-// its own bucket, so its wording is kept while the pool still holds the id that caller named;
-// past the first 429 the conversation has moved to a fresh bucket and the block has to move
-// with it, otherwise the header goes out on that fresh bucket while the gate still counts the
-// spent one — live 2026-10-30, one ZCode conversation: `project harness:… rotated after 429`
-// on every attempt, `429` on every request of the conversation.
+// A run of field lines: consecutive, because labels spread across a prompt are prose. ZCode
+// writes `Shell:` among them, so a line that reads as `Label: value` belongs to the block even
+// when it is not one of the gate's five. Fewer than three of the gate's fields in one run is
+// read as no block at all (measured 2026-10-26), so a two-field run stays prose.
+function envFieldLine(line) {
+  const t = String(line ?? "");
+  return envLabel(t) !== null || /^\s*(?:- )?[A-Za-z][A-Za-z' -]{1,25}:\s+\S/.test(t);
+}
+
+function envLabelRun(text) {
+  const lines = String(text ?? "").split("\n");
+  const runs = [];
+  let run = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (envFieldLine(lines[i])) run.push(i);
+    else if (run.length) { runs.push(run); run = []; }
+  }
+  if (run.length) runs.push(run);
+  for (const r of runs) {
+    const keys = new Set(r.map((i) => envLabel(lines[i])?.entry.key).filter(Boolean));
+    if (keys.size >= 3) return { lines, run: r };
+  }
+  return null;
+}
+
+// The gate keys a bare label run differently from a wrapped block: measured 2026-10-30 on one
+// entry, the same five fields naming a fresh path passed inside <env> and got 429 as a bare run
+// with a fresh key, so keeping the caller's wording keeps it in the bucket its shape pins. The
+// whole run is swapped for the canonical block.
 function renderEnvText(text, req, block) {
   const s = String(text ?? "");
   const found = envBlockMatch(s);
-  if (!found) return null;
-  return partialEnvBlock(s) || req?.zenProject?.gen > 1 ? s.replace(found, block) : s;
+  if (found) return s.replace(found, block);
+  const run = envLabelRun(s);
+  if (!run) return null;
+  return [...run.lines.slice(0, run.run[0]), block, ...run.lines.slice(run.run.at(-1) + 1)].join("\n");
 }
 
-function withEnv(text, req) {
+// `withEnv` writes the block into a prompt. `counted` says the bundle already carries one
+// somewhere, so this text is left alone: the gate counts one block per request, and a second one
+// here would only duplicate it.
+function withEnv(text, req, counted = false) {
   const block = envBlockText(req)
   if (!block) return text
   const s = String(text ?? "")
   const rendered = renderEnvText(s, req, block)
   if (rendered !== null) return rendered
+  if (counted) return text
   return s ? `${s}\n\n${block}` : block
 }
 
@@ -2826,25 +2884,41 @@ const DEBUG_WIRE = process.env.ZEN_DEBUG === "1";
 function applyEnvBlock(payload, req) {
   const block = envBlockText(req)
   if (!block || !Array.isArray(payload?.messages)) return payload
+  let where = null
+  const messages = payload.messages.map((m, i) => {
+    const c = m?.content
+    const render = (text) => {
+      const rendered = renderEnvText(String(text ?? ""), req, block)
+      if (rendered === null) return null
+      if (!where) where = { i, role: String(m?.role ?? "") }
+      return rendered
+    }
+    if (Array.isArray(c)) {
+      const parts = c.map((p) => {
+        const rendered = render(p?.text)
+        return rendered === null ? p : { ...p, text: rendered }
+      })
+      return where?.i === i ? { ...m, content: parts } : m
+    }
+    const rendered = render(c)
+    return rendered === null ? m : { ...m, content: rendered }
+  })
+  if (where) {
+    if (DEBUG_WIRE) log(`wire block ${conversationKey(req)}: rewrote the caller's block in message ${where.i} (${where.role}) -> ${block.replace(/\n/g, " ")}`)
+    return { ...payload, messages }
+  }
+  // Nothing in the bundle names a workspace: the gate needs the block, so the first system
+  // message carries the one the proxy writes.
   const i = payload.messages.findIndex((m) => m?.role === "system")
   if (i < 0) return { ...payload, messages: [{ role: "system", content: block }, ...payload.messages] }
   const c = payload.messages[i].content
   const next = Array.isArray(c)
-    ? (c.some((p) => String(p?.text ?? "").includes("<env>"))
-      ? c.map((p) => {
-        const rendered = renderEnvText(String(p?.text ?? ""), req, block)
-        return rendered === null ? p : { ...p, text: rendered }
-      })
-      : [...c, { type: "text", text: block }])
-    : withEnv(c, req)
-  if (DEBUG_WIRE && block) {
-    const kept = next === c
-    log(`wire block ${conversationKey(req)}: ${kept ? "kept the caller's own block" : "sent the proxy block"}${kept ? "" : ` -> ${block.replace(/\n/g, " ")}`}`)
-  }
-  if (next === c) return payload
-  const messages = [...payload.messages]
-  messages[i] = { ...payload.messages[i], content: next }
-  return { ...payload, messages }
+    ? [...c, { type: "text", text: block }]
+    : String(c ?? "") ? `${c}\n\n${block}` : block
+  if (DEBUG_WIRE) log(`wire block ${conversationKey(req)}: no block anywhere -> sent the proxy block ${block.replace(/\n/g, " ")}`)
+  const out = [...payload.messages]
+  out[i] = { ...payload.messages[i], content: next }
+  return { ...payload, messages: out }
 }
 
 function zenHeaders(req, auth) {
@@ -3156,6 +3230,34 @@ async function handleMessages(req, res) {
 // A content-free outline of a chat history for the log: s/u/t per message, and
 // per assistant message its tool calls, whether reasoning_content is there
 // (rc+ text, rc0 empty, rc- absent) and any other keys. Repeats collapse to xN.
+// A Responses caller that put the block inside an input item is counted there just the same, so
+// the item is rewritten in place; `counted` reports whether the bundle carried one anywhere.
+function normalizeEnvInput(input, req) {
+  const block = envBlockText(req)
+  if (!block || !Array.isArray(input)) return { input, counted: false }
+  let counted = false
+  const items = input.map((item) => {
+    const c = item?.content
+    if (typeof c === "string") {
+      const rendered = renderEnvText(c, req, block)
+      if (rendered === null) return item
+      counted = true
+      return { ...item, content: rendered }
+    }
+    if (Array.isArray(c)) {
+      const parts = c.map((p) => {
+        const rendered = renderEnvText(p?.text, req, block)
+        if (rendered === null) return p
+        counted = true
+        return { ...p, text: rendered }
+      })
+      return counted ? { ...item, content: parts } : item
+    }
+    return item
+  })
+  return { input: items, counted }
+}
+
 function messageShape(messages) {
   const known = new Set(["role", "content", "tool_calls", "reasoning_content", "tool_call_id", "name"])
   const tokens = (Array.isArray(messages) ? messages : []).map((m) => {
@@ -3247,11 +3349,12 @@ async function handleChat(req, res, responsesRoute = false) {
     // input_text comes back flattened to the text alone, measured. What a
     // /responses caller sent is exactly what upstream wants, so it goes as-is,
     // with `instructions` taking the system slot the translated flow gives it.
+    // The one thing that cannot stay verbatim is the block: wherever the caller put it, the
+    // gate counts it there, so its values are rewritten to the bucket the header names.
     if (responsesRequestShape && format === "responses") {
-      const slot = withEnv(typeof body.instructions === "string" ? body.instructions : "", req)
-      payload.input = slot
-        ? [{ type: "message", role: "system", content: slot }, ...responsesInputItemArray(body.input)]
-        : responsesInputItemArray(body.input)
+      const { input, counted } = normalizeEnvInput(responsesInputItemArray(body.input), req)
+      const slot = withEnv(typeof body.instructions === "string" ? body.instructions : "", req, counted)
+      payload.input = slot ? [{ type: "message", role: "system", content: slot }, ...input] : input
     }
     if (bridged) {
       payload.tools = format === "responses" ? chatToolsToResponses(bridge) : bridge
@@ -5322,7 +5425,8 @@ export {
   gitRootAt,
   applyEnvBlock,
   withEnv,
-  partialEnvBlock,
+  envBlockMatch,
+  envLabelRun,
   conversationKey,
   agentProbePayload,
   relayStream,
