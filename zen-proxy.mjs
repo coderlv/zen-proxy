@@ -2845,8 +2845,9 @@ function zenHeaders(req, auth) {
   // Send both session headers whenever we are allowed to supply one. A client
   // that brings its own session keeps it; we just mirror it into the second
   // header so the pair upstream expects is always complete. The project id is the
-  // other half of the counted identity: a caller that names its own keeps it,
-  // otherwise the minted bucket id goes out.
+  // other half of the counted identity: a caller that names its own keeps it only while
+  // that id is still the conversation's bucket, otherwise the pool value goes out — the
+  // same one the env block names.
   const send = !sess.injected || config.injectSession
   const headers = opencodeHeaders(req, auth, send ? sess.value : undefined, proj.value)
   if (send) for (const h of SESSION_HEADERS) headers[h] = sess.value
