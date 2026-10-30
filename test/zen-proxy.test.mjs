@@ -287,8 +287,12 @@ describe("ip handling", () => {
     assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["x-opencode-project"], h["x-opencode-project"], "one bucket per conversation, not per request")
     assert.match(h["x-opencode-request"], /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     assert.notEqual(zp.zenHeaders(mockReq(), "Bearer public")["x-opencode-request"], h["x-opencode-request"], "one id per request")
-    const own = zp.zenHeaders(mockReq({ headers: { "x-opencode-client": "desktop", "x-opencode-project": "abc" } }), "Bearer public")
-    assert.deepEqual([own["x-opencode-client"], own["x-opencode-project"]], ["desktop", "abc"])
+    const named = mockReq({ headers: { "x-session-id": "own-project-header", "x-opencode-client": "desktop", "x-opencode-project": "abc" } });
+    const own = zp.zenHeaders(named, "Bearer public")
+    assert.deepEqual([own["x-opencode-client"], own["x-opencode-project"]], ["desktop", "abc"], "the id the caller names is its bucket while it is fresh")
+    zp.rotateSession(named, { ok: false, status: 429 })
+    assert.equal(zp.zenHeaders(named, "Bearer public")["x-opencode-project"], zp.projectFor(named).value,
+      "after that bucket got 429 the conversation goes out on the rotated id, not the one the caller keeps sending")
     zp.saveConfig({ ua: "custom-agent/2" })
     assert.equal(zp.zenHeaders(mockReq(), "Bearer public")["user-agent"], "custom-agent/2", "a hand-set UA is sent as is")
     zp.saveConfig({ ua: keepUa, cliShape: keepShape })
@@ -5829,13 +5833,13 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
     const c = (sent.messages ?? []).find((m) => m?.role === "system")?.content
     return Array.isArray(c) ? c.map((p) => p?.text ?? "").join("") : String(c ?? "")
   }
-  const sentFor = async (body, route = "/chat/completions", responsesRoute = false) => {
+  const sentFor = async (body, route = "/chat/completions", responsesRoute = false, headers = {}) => {
     let sent = null
     globalThis.fetch = routeFetch([[route, (u, opts) => {
       sent = JSON.parse(opts.body)
       return jsonResponse({ ok: true }, 200)
     }]])
-    const req = mockReq({ _body: JSON.stringify(body) })
+    const req = mockReq({ headers, _body: JSON.stringify(body) })
     const res = mockRes()
     await zp.handleChat(req, res, responsesRoute)
     return sent
@@ -5863,8 +5867,15 @@ describe("the gate reads the system prompt for opencode's <env> block", () => {
     cfg({ envBlock: DEFAULT_ENV_BLOCK })
     const fields = ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"];
     const own = "You are opencode.\n<env>\n  Working directory: /srv/app\n  Workspace root folder: /srv/app\n  Is directory a git repo: yes\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
-    const sent = await sentFor({ model: "big-pickle", messages: [{ role: "system", content: own }, { role: "user", content: "hi" }] });
+    const key = { "x-session-id": "caller-own-block" };
+    const sent = await sentFor({ model: "big-pickle", messages: [{ role: "system", content: own }, { role: "user", content: "hi" }] }, "/chat/completions", false, key);
     assert.equal(sysText(sent), own, "no second block on a prompt that already has the five fields");
+    const named = mockReq({ headers: key });
+    zp.projectFor(named);
+    zp.rotateSession(named, { ok: false, status: 429 });
+    const moved = sysText(await sentFor({ model: "big-pickle", messages: [{ role: "system", content: own }, { role: "user", content: "hi" }] }, "/chat/completions", false, key));
+    assert.ok(moved.includes(`/conv/${zp.projectFor(mockReq({ headers: key })).value}`), "once that block's bucket got 429 it names the rotated one, the same the header carries");
+    assert.ok(!moved.includes("/srv/app"), "the spent workspace does not go out again");
     const filled = sysText(await sentFor({ model: "big-pickle", messages: [{ role: "system", content: "You are opencode.\n<env>\n  Platform: darwin\n</env>" }, { role: "user", content: "hi" }] }));
     assert.match(filled, /^You are opencode\./, "the caller's text stays");
     assert.equal((filled.match(/<env>/g) ?? []).length, 1, "the block is completed, not added next to it");
@@ -6131,6 +6142,8 @@ describe("the counted identity: minted project, mirrored session, announced wind
     assert.match(rotated, /^[0-9a-f]{40}$/);
     assert.notEqual(rotated, own, "a spent project is rotated: a caller cannot sit on its spent bucket for the whole window");
     assert.equal(zp.projectFor(req).value, rotated, "the rotated id stays the conversation's");
+    assert.equal(zp.zenHeaders(req, "Bearer public")["x-opencode-project"], rotated,
+      "the header goes out on the rotated bucket, not on the spent id the caller keeps sending");
   })
 
   test("the id upstream counted moves even when it was keyed per proxy", () => {
@@ -6156,6 +6169,10 @@ describe("the counted identity: minted project, mirrored session, announced wind
     zp.rotateSession(a, { ok: false, status: 429 });
     assert.ok(zp.withEnv("expert.", a).includes(`/conv/${zp.projectFor(a).value}`), "the block moves with the rotated bucket, otherwise the conversation stays on its spent workspace");
     const own = "expert.\n\n<env>\n  Working directory: /srv/app\n  Workspace root folder: /srv/app\n  Is directory a git repo: yes\n  Platform: darwin\n  Today's date: 2026-10-26\n</env>";
-    assert.ok(zp.withEnv(own, b).includes("Working directory: /srv/app"), "a caller that names its own repo keeps it: that block is already its bucket");
+    assert.ok(zp.withEnv(own, b).includes("Working directory: /srv/app"), "a caller that names its own repo keeps it while that repo is still its bucket");
+    zp.rotateSession(b, { ok: false, status: 429 });
+    const moved = zp.withEnv(own, b);
+    assert.ok(moved.includes(`/conv/${zp.projectFor(b).value}`), "once that bucket got 429 the caller's block names the same bucket as the header");
+    assert.ok(!moved.includes("/srv/app"), "the spent workspace does not go out with it");
   })
 })

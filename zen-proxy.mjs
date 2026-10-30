@@ -1586,7 +1586,11 @@ function opencodeHeaders(req, auth, session, project) {
     headers.traceparent = `00-${trace}-${span}-01`
   }
   headers["x-opencode-client"] = own("x-opencode-client") ?? "cli"
-  headers["x-opencode-project"] = own("x-opencode-project") ?? project ?? "global";
+  // The pool value, not the header the caller brought: projectFor already keeps a
+  // caller-named id while its bucket is fresh and moves it after the first 429. Reading the
+  // caller's header here instead would send the spent id upstream again and leave the
+  // conversation on that bucket for the whole window.
+  headers["x-opencode-project"] = project ?? own("x-opencode-project") ?? "global";
   headers["x-opencode-request"] = own("x-opencode-request") ?? opencodeId("msg_", false)
   // The binary mirrors the counted session into two more headers on every call, so the
   // mirror is not gated by the shape switch: only the value upstream would accept goes
@@ -1644,7 +1648,10 @@ function projectFor(req, proxy) {
   }
   hit.used++;
   if (req) req.zenConversationKey = key;
-  const out = { value: hit.value, injected: true };
+  // gen is what tells a caller-named bucket (generation 1) from one the pool moved to:
+  // the block the gate counts has to agree with the header, so the caller's own wording is
+  // only kept while its own bucket is still the conversation's.
+  const out = { value: hit.value, injected: true, gen: hit.gen };
   if (req) req.zenProject = out;
   return out;
 }
@@ -1685,7 +1692,10 @@ function rotateSession(req, r) {
     proj.value = opencodeProjectId(`${k}#${proj.gen}`);
     proj.used = 0;
     proj.at = Date.now();
-    if (req?.zenProject) req.zenProject.value = proj.value;
+    if (req?.zenProject) {
+      req.zenProject.value = proj.value;
+      req.zenProject.gen = proj.gen;
+    }
     log(`project ${k.split("@")[0]} rotated after ${r.status}`);
   };
   if (r.status === 400) {
@@ -2777,19 +2787,35 @@ function envBlockText(req) {
 // anonymous bucket), the same prompt with the five fields got 200. So a partial block is
 // completed in place, not left alone and not appended next to it.
 const ENV_FIELDS = ["Working directory:", "Workspace root folder:", "Is directory a git repo:", "Platform:", "Today's date:"];
+function envBlockMatch(text) {
+  return /<env>[\s\S]*?<\/env>/.exec(String(text ?? ""))?.[0] ?? null;
+}
 function partialEnvBlock(text) {
-  const block = /<env>[\s\S]*?<\/env>/.exec(String(text ?? ""))?.[0];
+  const block = envBlockMatch(text);
   if (!block) return null;
   return ENV_FIELDS.every((f) => block.includes(f)) ? null : block;
+}
+
+// The block and the project header have to name the same bucket for one request, because the
+// block is what the gate counts the workspace on. A caller that brings all five fields names
+// its own bucket, so its wording is kept while the pool still holds the id that caller named;
+// past the first 429 the conversation has moved to a fresh bucket and the block has to move
+// with it, otherwise the header goes out on that fresh bucket while the gate still counts the
+// spent one — live 2026-10-30, one ZCode conversation: `project harness:… rotated after 429`
+// on every attempt, `429` on every request of the conversation.
+function renderEnvText(text, req, block) {
+  const s = String(text ?? "");
+  const found = envBlockMatch(s);
+  if (!found) return null;
+  return partialEnvBlock(s) || req?.zenProject?.gen > 1 ? s.replace(found, block) : s;
 }
 
 function withEnv(text, req) {
   const block = envBlockText(req)
   if (!block) return text
   const s = String(text ?? "")
-  const partial = partialEnvBlock(s)
-  if (partial) return s.replace(partial, block)
-  if (s.includes("<env>")) return s
+  const rendered = renderEnvText(s, req, block)
+  if (rendered !== null) return rendered
   return s ? `${s}\n\n${block}` : block
 }
 
@@ -2802,8 +2828,8 @@ function applyEnvBlock(payload, req) {
   const next = Array.isArray(c)
     ? (c.some((p) => String(p?.text ?? "").includes("<env>"))
       ? c.map((p) => {
-        const partial = partialEnvBlock(String(p?.text ?? ""))
-        return partial ? { ...p, text: String(p.text).replace(partial, block) } : p
+        const rendered = renderEnvText(String(p?.text ?? ""), req, block)
+        return rendered === null ? p : { ...p, text: rendered }
       })
       : [...c, { type: "text", text: block }])
     : withEnv(c, req)
