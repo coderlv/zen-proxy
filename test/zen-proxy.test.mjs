@@ -2618,6 +2618,15 @@ describe("Anthropic Messages API layer", () => {
     assert.ok(!rewritten.includes("/srv/app"), "the caller's own workspace does not go out");
     assert.ok(!rewritten.includes("Shell: zsh"), "the caller's shape is what the gate keys on, so the whole run goes, not only its values");
     assert.ok(zp.withEnv("Working directory: /srv/app\nprose\nPlatform: darwin\nToday's date: 2026-01-01", req).includes("<env>"), "labels spread over a prompt are prose, not a block, so the proxy block is added");
+    // ZCode's main agent writes the same fields dash-prefixed, without the root or the date.
+    const zcodeEnv = "# Environment\nYou have been invoked in the following environment:\n- Primary working directory: /srv/app\n- Is a git repository: no\n- Platform: darwin\n- Shell: zsh\n- OS Version: darwin 25.6.0 arm64\n- You are powered by the model named x/y.\n\n# Context management";
+    assert.ok(zp.envLabelRun(zcodeEnv), "the dash-prefixed run holding three of the gate's fields is the block the gate counts");
+    const zcodeOut = zp.withEnv(zcodeEnv, req);
+    assert.match(zcodeOut, /^# Environment/, "the caller's section heading stays");
+    assert.match(zcodeOut, /<env>[\s\S]*Working directory: \/conv\/[0-9a-f]{40}[\s\S]*<\/env>/, "its run is replaced with the canonical block");
+    assert.ok(!zcodeOut.includes("/srv/app"), "the spent workspace does not go out");
+    assert.ok(!zcodeOut.includes("OS Version"), "the whole run is replaced, not only its values");
+    assert.ok(zcodeOut.includes("# Context management"), "the prose after the run stays");
   })
 
   test("tool_use and tool_result become chat tool_calls and role:tool", () => {
@@ -5762,6 +5771,22 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     assert.ok(!res.body.includes('"q"'), "no stub argument text either")
     assert.match(res.body, /"stop_reason":"tool_use"/)
     assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"], "the stub rode along on the translated request")
+  })
+
+  test("exactToolShape sends the gate's manifest as the whole tool list", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([["/chat/completions", (u, opts) => { sent = JSON.parse(opts.body); return replyJson([]) }]])
+    const callerRead = { type: "function", function: { name: "Read", description: "caller read", parameters: { type: "object", properties: {} } } }
+    const bodyOf = (model) => JSON.stringify({ model, stream: false, messages: [{ role: "user", content: "hi" }], tools: [callerRead], tool_choice: "auto" })
+    const manifest = zp.loadAgentTools().map((t) => t.function.name)
+    await zp.handleChat(mockReq({ _body: bodyOf(m) }), mockRes())
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "Read"], "off by default: the caller's own tool rides with the stub")
+    zp.saveConfig({ exactToolShape: true })
+    await zp.handleChat(mockReq({ _body: bodyOf(m) }), mockRes())
+    assert.deepEqual(sent.tools.map((t) => t.function.name), manifest, "on: the tool list is exactly the manifest the gate counts, the caller's tool is not riding next to it")
+    zp.saveConfig({ exactToolShape: false })
   })
 
   test("a caller that already declares read gets nothing injected", async () => {

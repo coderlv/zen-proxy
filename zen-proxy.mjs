@@ -214,6 +214,16 @@ function agentToolsFor(callerToolNames) {
   return loadAgentTools().filter((t) => wanted.has(AGENT_TOOL_MAP[t.function.name].name))
 }
 
+// The gate's own tool list used as the whole list. Measured 2026-10-30 on one entry: the
+// manifest alone is counted per workspace, while a caller tool list riding next to it is
+// counted in the shared anonymous bucket (spent on this machine), so a tool-carrying caller
+// like ZCode answers 429 whatever the block says. Only worth turning on for a caller that
+// can live with the manifest's tools, because the model can then call nothing else.
+function gateShapeTools(callerTools) {
+  if (!config.agentTools || !config.exactToolShape || !callerTools?.length) return null
+  return loadAgentTools()
+}
+
 // The gate's `read`.
 //
 // The gate takes a tool named `read` and nothing else — `Read` with a capital,
@@ -1295,6 +1305,15 @@ const DEFAULT_CONFIG = {
   // Append opencode's own tools to Anthropic /v1/messages requests so the free
   // tier accepts them. Calls to them are renamed back to the caller's tools.
   agentTools: ENV.AGENT_TOOLS !== "0",
+  // Send opencode's manifest as the whole tool list instead of the caller's tools.
+  // Measured 2026-10-30 on one entry: a tool-carrying request whose list is exactly
+  // opencode's manifest gets 200, the same content with the caller's own tools riding
+  // next to the manifest gets 429 — a caller that brings tools is counted in the shared
+  // anonymous bucket, which this machine has spent, and no conversation key or block
+  // moves it. The cost is real: the model can only call what the manifest holds, so a
+  // caller like ZCode loses Agent, Skill, TodoWrite, WebFetch and its MCP tools, and a
+  // call to grep/glob/list comes back with a name it does not have. Off by default.
+  exactToolShape: ENV.EXACT_TOOL_SHAPE === "1",
   // The gate reads the system prompt: a caller prompt without OpenCode's `<env>`
   // block gets 429 even with OpenCode's headers, tools and ClientHello (measured
   // 2026-10-24, see docs/investigations/2026-10-24-free-tier-429.md). What it
@@ -1918,7 +1937,8 @@ function anthropicToChatBody(body, model) {
   // rejects the request outright; the caller's prompt and tools are untouched and
   // still take priority in the reply.
   const bridge = agentToolsFor((body?.tools ?? []).map((t) => t?.name))
-  let all = bridge.length ? [...bridge, ...(tools ?? [])] : tools
+  const exact = gateShapeTools(tools)
+  let all = exact ?? (bridge.length ? [...bridge, ...(tools ?? [])] : tools)
   // The gate wants a tool named `read` on the list by name alone. A pinned
   // caller whose tools match nothing (a helper like `set_title`) needed the
   // stub already; any other tool-carrying caller needs it too — measured
@@ -2805,7 +2825,7 @@ function envBlockText(req) {
 // replaced wherever it sits, and the proxy block is added only when the bundle carries no block
 // anywhere.
 const ENV_LABELS = [
-  { key: "cwd", labels: ["Working directory:"] },
+  { key: "cwd", labels: ["Working directory:", "Primary working directory:"] },
   { key: "root", labels: ["Workspace root folder:"] },
   { key: "git", labels: ["Is directory a git repo:", "Is a git repository:"] },
   { key: "platform", labels: ["Platform:"] },
@@ -3323,15 +3343,16 @@ async function handleChat(req, res, responsesRoute = false) {
   const retries = config.retriesPerModel > 0 ? Math.floor(config.retriesPerModel) : 0
   const bridge = chatBody.tools?.length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
+  const exact = gateShapeTools(chatBody.tools)
   // A caller that brings its own tools needs the gate's `read` on the list even
   // when nothing is pinned (measured: one 403 per model without it). Only the
   // request changes — `tool_choice` is forwarded untouched. A call to the stub
   // itself is a call on a tool the caller never offered, so the reply carries
   // the pinned call only when pinned, and never carries the stub's call.
-  const gateRead = bridged ? null : gateReadFor(chatBody)
+  const gateRead = (bridged || exact) ? null : gateReadFor(chatBody)
   const gateReadName = gateRead ? gateRead.function.name : null
   const pin = bridged ? null : pinnedToolName(chatBody.tool_choice)
-  const requestBody = applyEnvBlock(gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody, req)
+  const requestBody = applyEnvBlock(exact ? { ...chatBody, tools: exact } : gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody, req)
   let stopWalk = false
   let firstRetryAfter = 0
   let lastRetryAfter = 0
@@ -5418,6 +5439,7 @@ export {
   anthropicError,
   remapAgentTool,
   agentToolsFor,
+  gateShapeTools,
   loadAgentTools,
   AGENT_TOOL_MAP,
   AGENT_PREAMBLE_TEXT,
