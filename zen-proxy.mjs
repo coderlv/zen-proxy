@@ -2819,6 +2819,10 @@ function withEnv(text, req) {
   return s ? `${s}\n\n${block}` : block
 }
 
+// ZEN_DEBUG=1: what actually goes upstream for the counted identity, so a conversation
+// that keeps getting 429 can be told from one whose values never move.
+const DEBUG_WIRE = process.env.ZEN_DEBUG === "1";
+
 function applyEnvBlock(payload, req) {
   const block = envBlockText(req)
   if (!block || !Array.isArray(payload?.messages)) return payload
@@ -2833,6 +2837,10 @@ function applyEnvBlock(payload, req) {
       })
       : [...c, { type: "text", text: block }])
     : withEnv(c, req)
+  if (DEBUG_WIRE && block) {
+    const kept = next === c
+    log(`wire block ${conversationKey(req)}: ${kept ? "kept the caller's own block" : "sent the proxy block"}${kept ? "" : ` -> ${block.replace(/\n/g, " ")}`}`)
+  }
   if (next === c) return payload
   const messages = [...payload.messages]
   messages[i] = { ...payload.messages[i], content: next }
@@ -2850,6 +2858,7 @@ function zenHeaders(req, auth) {
   // same one the env block names.
   const send = !sess.injected || config.injectSession
   const headers = opencodeHeaders(req, auth, send ? sess.value : undefined, proj.value)
+  if (DEBUG_WIRE) log(`wire ${conversationKey(req)}: session=${sess.value}${sess.injected ? "" : " (caller named it)"} project=${proj.value} gen=${proj.gen}`)
   if (send) for (const h of SESSION_HEADERS) headers[h] = sess.value
   const ip = clientIp(req)
   if (!ipOmit(ip)) headers["x-real-ip"] = ip
