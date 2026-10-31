@@ -218,7 +218,10 @@ function agentToolsFor(callerToolNames) {
 // manifest alone is counted per workspace, while a caller tool list riding next to it is
 // counted in the shared anonymous bucket (spent on this machine), so a tool-carrying caller
 // like ZCode answers 429 whatever the block says. Only worth turning on for a caller that
-// can live with the manifest's tools, because the model can then call nothing else.
+// can live with the manifest's tools, because the model can then call nothing else — and the
+// reply has to hand those calls back under the names the caller owns (`Bash`, `Read`, …), or
+// the caller reads `bash` and reports the tool unavailable. Measured 2026-10-31 with ZCode:
+// only the manifest tools that have a counterpart on the caller run at all.
 function gateShapeTools(callerTools) {
   if (!config.agentTools || !config.exactToolShape || !callerTools?.length) return null
   return loadAgentTools()
@@ -2323,9 +2326,18 @@ function chatToResponses(content, requested, servedBy) {
 // Filter the output items of a collected Responses object: bridge calls the
 // caller never offered are removed entirely, a pinned call keeps only its own
 // `name`. Everything that is not a function_call stays.
-function filterResponsesOutput(data, callOk = null) {
+function filterResponsesOutput(data, callOk = null, rename = false) {
   if (!data || !Array.isArray(data.output)) return data
   const output = data.output.filter((item) => (item?.type === "function_call" ? callOk !== null && callOk(item) : true))
+  if (rename) {
+    for (const item of output) {
+      if (item?.type !== "function_call") continue
+      const mapped = remapAgentTool(item.name, item.arguments)
+      if (!mapped) continue
+      item.name = mapped.name
+      item.arguments = mapped.args
+    }
+  }
   if (output.length !== data.output.length) data.output = output
   return data
 }
@@ -3440,7 +3452,7 @@ async function handleChat(req, res, responsesRoute = false) {
           } else if (format === "responses") {
             relayResponsesStream(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
           } else {
-            relayStream(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
+            relayStream(req, res, upstreamRes, requested, bridged, pin, gateReadName, !!exact).catch(() => {})
           }
           res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
           return
@@ -3460,20 +3472,20 @@ async function handleChat(req, res, responsesRoute = false) {
             // rewritten and the calls it cannot run dropped.
             if (responsesRequestShape) {
               content.model = requested
-              if (pin) filterResponsesOutput(content, (i) => i?.name === pin)
-              else if (gateReadName) filterResponsesOutput(content, (i) => i?.name !== gateReadName)
-              else if (bridged) filterResponsesOutput(content, null)
+              if (pin) filterResponsesOutput(content, (i) => i?.name === pin, !!exact)
+              else if (gateReadName) filterResponsesOutput(content, (i) => i?.name !== gateReadName, !!exact)
+              else if (bridged) filterResponsesOutput(content, null, !!exact)
               if (model !== requested) content.zen_served_by = model
               return json(res, 200, content)
             }
-            return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin, gateReadName))
+            return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin, gateReadName, !!exact))
           }
           if (model !== requested) {
             // Make the fallback visible to any client, not just JSON readers.
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          const shaped = stripUnpinnedCalls(stripToolCalls(content, bridged), pin, gateReadName)
+          const shaped = stripUnpinnedCalls(stripToolCalls(content, bridged), pin, gateReadName, !!exact)
           if (responsesRequestShape) {
             return json(res, 200, chatToResponses(shaped, requested, model))
           }
@@ -3979,13 +3991,24 @@ function stripToolCalls(chunk, strip) {
 // here; streamed ones are filtered chunk by chunk in the relays, which carry
 // per-index state because a call's name arrives chunks apart from its
 // arguments.
-function stripUnpinnedCalls(content, pin, dropName = null) {
-  if ((!pin && !dropName) || !content || typeof content !== "object") return content
+function stripUnpinnedCalls(content, pin, dropName = null, rename = false) {
+  if ((!pin && !dropName && !rename) || !content || typeof content !== "object") return content
   for (const choice of content?.choices ?? []) {
     const body = choice?.message ?? choice?.delta
     if (Array.isArray(body?.tool_calls) && body.tool_calls.length) {
       const keep = pin ? (tc) => (tc?.function?.name ?? tc?.name) === pin : (tc) => (tc?.function?.name ?? tc?.name) !== dropName
       const kept = body.tool_calls.filter(keep)
+      if (rename) for (const tc of kept) {
+        const mapped = remapAgentTool(tc?.function?.name ?? tc?.name, tc?.function?.arguments ?? tc?.arguments)
+        if (!mapped) continue
+        if (tc.function) {
+          tc.function.name = mapped.name
+          tc.function.arguments = mapped.args
+        } else {
+          tc.name = mapped.name
+          tc.arguments = mapped.args
+        }
+      }
       if (kept.length) body.tool_calls = kept
       else delete body.tool_calls
     }
@@ -4001,8 +4024,13 @@ function stripUnpinnedCalls(content, pin, dropName = null) {
 // call once and every argument chunk follows under the same index with
 // `name: null`, so the keep/drop decision has to outlive the block that first
 // saw the name. Kept calls are renumbered into one clean sequence.
-function pinStreamState(pin, dropName = null) {
-  return { pin, dropName, byChoice: new Map() }
+//
+// `rename` is the same rename the Anthropic route has: a call to a manifest tool
+// has to come back under the tool the caller can actually run. Argument pieces
+// cannot be rewritten one at a time — a key can be split across chunks — so a
+// renamed call accumulates them and writes the renamed object once it is whole.
+function pinStreamState(pin, dropName = null, rename = false) {
+  return { pin, dropName, rename, byChoice: new Map() }
 }
 
 function filterPinnedDelta(parsed, pinState) {
@@ -4010,7 +4038,7 @@ function filterPinnedDelta(parsed, pinState) {
     const key = choice?.index ?? 0
     let s = pinState.byChoice.get(key)
     if (!s) {
-      s = { dropped: new Set(), kept: false, count: 0, renumber: new Map() }
+      s = { dropped: new Set(), kept: false, count: 0, renumber: new Map(), names: new Map(), args: new Map() }
       pinState.byChoice.set(key, s)
     }
     const body = choice?.delta ?? choice?.message
@@ -4019,15 +4047,16 @@ function filterPinnedDelta(parsed, pinState) {
       for (const tc of body.tool_calls) {
         const idx = tc?.index ?? 0
         if (tc?.function?.name) {
+          const rawName = tc.function.name
           if (pinState.pin) {
-            if (tc.function.name === pinState.pin) {
+            if (rawName === pinState.pin) {
               if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
               s.kept = true
             } else {
               s.dropped.add(idx)
               continue
             }
-          } else if (pinState.dropName && tc.function.name === pinState.dropName) {
+          } else if (pinState.dropName && rawName === pinState.dropName) {
             // The gate stub riding on a free `tool_choice`: drop it by name and
             // renumber whatever survives into one clean sequence.
             s.dropped.add(idx)
@@ -4036,10 +4065,26 @@ function filterPinnedDelta(parsed, pinState) {
             if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
             s.kept = true
           }
+          if (pinState.rename && AGENT_TOOL_MAP[rawName]) {
+            s.names.set(idx, rawName)
+            tc.function.name = AGENT_TOOL_MAP[rawName].name
+          }
         } else if (s.dropped.has(idx)) {
           continue
         }
         if (s.renumber.has(idx)) tc.index = s.renumber.get(idx)
+        if (pinState.rename && s.names.has(idx) && typeof tc?.function?.arguments === "string") {
+          const acc = (s.args.get(idx) ?? "") + tc.function.arguments
+          s.args.set(idx, acc)
+          let whole = null
+          try {
+            whole = JSON.parse(acc)
+          } catch {
+            whole = null
+          }
+          if (whole && typeof whole === "object") tc.function.arguments = remapAgentTool(s.names.get(idx), acc).args
+          else tc.function.arguments = ""
+        }
         kept.push(tc)
       }
       if (kept.length) body.tool_calls = kept
@@ -4049,7 +4094,7 @@ function filterPinnedDelta(parsed, pinState) {
   }
 }
 
-function relayStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null) {
+function relayStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null, rename = false) {
   res.writeHead(200, {
     "content-type": upstreamRes.headers.get("content-type") ?? "text/event-stream",
     "cache-control": "no-cache",
@@ -4059,7 +4104,7 @@ function relayStream(req, res, upstreamRes, requested, strip = false, pin = null
   // blocks, so the filter cannot see them one at a time. The gate stub's name
   // when it rode along on a non-pinned turn keeps the same per-index bookkeeping
   // for dropping that call.
-  const pinned = pin || gateName ? pinStreamState(pin, gateName) : null
+  const pinned = pin || gateName || rename ? pinStreamState(pin, gateName, rename) : null
   const reader = upstreamRes.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""

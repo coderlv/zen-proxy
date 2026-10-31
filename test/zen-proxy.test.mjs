@@ -5789,6 +5789,49 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     zp.saveConfig({ exactToolShape: false })
   })
 
+  test("exactToolShape hands the caller back tool names it can run", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    const caller = { type: "function", function: { name: "Bash", description: "caller bash", parameters: { type: "object", properties: {} } } }
+    const bodyOf = (stream) => JSON.stringify({ model: m, stream, messages: [{ role: "user", content: "hi" }], tools: [caller], tool_choice: "auto" })
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", () => replyJson([{ id: "c1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } }])],
+    ])
+    zp.saveConfig({ exactToolShape: true })
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: bodyOf(false) }), res)
+    assert.deepEqual(JSON.parse(res.body).choices[0].message.tool_calls.map((t) => t.function.name), ["Bash"], "the wire name is the manifest's, the reply name is the caller's")
+    zp.saveConfig({ exactToolShape: false })
+    const off = mockRes()
+    await zp.handleChat(mockReq({ _body: bodyOf(false) }), off)
+    assert.deepEqual(JSON.parse(off.body).choices[0].message.tool_calls.map((t) => t.function.name), ["bash"], "off: the reply is the wire as it came")
+  })
+
+  test("a renamed streamed call waits for its arguments to be whole", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    const caller = { type: "function", function: { name: "Read", description: "caller read", parameters: { type: "object", properties: {} } } }
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", () => toolSse([{ index: 0, name: "read", args: ['{"filePath": "/a/x.txt"', "}"] }])],
+    ])
+    zp.saveConfig({ exactToolShape: true })
+    const res = mockRes()
+    const handled = zp.handleChat(mockReq({ _body: JSON.stringify({ model: m, stream: true, messages: [{ role: "user", content: "hi" }], tools: [caller], tool_choice: "auto" }) }), res)
+    await res.done
+    await handled
+    const chunks = res.body
+      .split("\n\n")
+      .filter((b) => b.startsWith("data: "))
+      .map((b) => b.slice(6))
+      .filter((p) => p !== "[DONE]")
+      .map((p) => JSON.parse(p))
+    const calls = chunks.flatMap((c) => c.choices?.[0]?.delta?.tool_calls ?? [])
+    assert.deepEqual(calls.filter((c) => c.function.name).map((c) => c.function.name), ["Read"], "the name chunk carries the caller's tool")
+    assert.ok(calls.some((c) => c.function.arguments && JSON.parse(c.function.arguments)?.file_path === "/a/x.txt"), "the whole object arrives in the caller's key names")
+    assert.ok(!res.body.includes("filePath"), "a half argument cannot be rewritten, so it is not passed through under the manifest key")
+    zp.saveConfig({ exactToolShape: false })
+  })
+
   test("a caller that already declares read gets nothing injected", async () => {
     const m = "space-bunny-free"
     cfg(m)
