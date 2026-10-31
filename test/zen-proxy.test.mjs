@@ -2629,6 +2629,31 @@ describe("Anthropic Messages API layer", () => {
     assert.ok(zcodeOut.includes("# Context management"), "the prose after the run stays");
   })
 
+  test("a caller that names a directory that exists keeps it, because the model has to read a path it can use", () => {
+    zp.saveConfig({ envBlock: DEFAULT_ENV_BLOCK });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-named-"));
+    const req = mockReq({ headers: { "x-session-id": "named-workspace" } });
+    req.zenBody = { messages: [{ role: "system", content: `# Environment\n- Primary working directory: ${dir}\n- Is a git repository: no\n- Platform: darwin` }] };
+    assert.equal(zp.projectFor(req).value, dir, "the naming the caller gave the gate is the bucket");
+    const out = zp.withEnv("Caller prompt", req);
+    assert.ok(out.includes(`Working directory: ${dir}`), `the model reads a path that exists: ${out}`);
+    assert.equal(zp.zenHeaders(req, "Bearer public")["x-opencode-project"], dir, "the header names the same value the block names");
+    // A spent bucket has to move, and a moved key cannot be a directory on this machine, so
+    // past the cap the path the model reads is the synthetic one again. One request is one
+    // use of the bucket, so the second request is what shows the move.
+    zp.saveConfig({ projectMaxRequests: 1 });
+    const first = mockReq({ headers: { "x-session-id": "named-rotates" } });
+    first.zenBody = req.zenBody;
+    assert.equal(zp.projectFor(first).value, dir, "the caller naming is kept while its bucket is live");
+    const second = mockReq({ headers: { "x-session-id": "named-rotates" } });
+    second.zenBody = req.zenBody;
+    const moved = zp.projectFor(second).value;
+    assert.match(moved, /^[0-9a-f]{40}$/, "past the cap the bucket is a minted id");
+    assert.ok(zp.withEnv("Caller prompt", second).includes(`Working directory: /conv/${moved}`), "and the block names that key");
+    zp.saveConfig({ projectMaxRequests: 200 });
+    fs.rmSync(dir, { recursive: true });
+  })
+
   test("tool_use and tool_result become chat tool_calls and role:tool", () => {
     const out = zp.anthropicToChatBody(
       {

@@ -1647,9 +1647,11 @@ function conversationKey(req, proxy) {
 }
 function projectFor(req, proxy) {
   // One id per request: the header and the env block have to name the same bucket, and
-  // the block is what the gate counts the workspace on.
+  // the block is what the gate counts the workspace on. When the caller named a directory
+  // that exists here, that path is the bucket (measured 2026-10-26: the value is the key)
+  // and it is also the path the model can actually use.
   if (req?.zenProject) return req.zenProject
-  const own = req?.headers?.["x-opencode-project"];
+  const own = (req?.headers?.["x-opencode-project"] ?? "").trim() || namedWorkspace(req);
   const key = conversationKey(req, proxy);
   let hit = projectPool.get(key);
   // Same rule as a session: past the cap the id is one conversation hammering one
@@ -1660,9 +1662,7 @@ function projectFor(req, proxy) {
   // only until it is the thing that got 429.
   if (!hit || Date.now() - hit.at > SESSION_MAX_AGE_MS || (config.projectMaxRequests > 0 && hit.used >= config.projectMaxRequests)) {
     const gen = (hit?.gen ?? 0) + 1;
-    const value = gen === 1 && typeof own === "string" && own.trim()
-      ? own.trim()
-      : opencodeProjectId(gen === 1 ? key : `${key}#${gen}`);
+    const value = gen === 1 && own ? own : opencodeProjectId(gen === 1 ? key : `${key}#${gen}`);
     hit = { value, at: Date.now(), used: 0, gen };
     projectPool.delete(key);
     projectPool.set(key, hit);
@@ -2798,16 +2798,22 @@ function gitRootAt(dir) {
 // header so the two agree.
 function envValues(req) {
   // The project the gate counts this conversation on, not the first one it was given:
-  // after a 429 the bucket is spent, and the block has to move with it.
-  const proj = req ? projectFor(req).value : ""
-  const git = gitRootAt(process.cwd())
+  // after a 429 the bucket is spent, and the block has to move with it. A bucket key that is
+  // also a real directory is the only one the model can work in, so a caller that named one
+  // which exists keeps it; once the pool moves the key, the path the model reads is synthetic
+  // — a key that has to move cannot be a path on this machine.
+  const proj = req ? projectFor(req).value : "";
+  const git = gitRootAt(process.cwd());
+  const named = typeof proj === "string" && proj.startsWith("/") ? proj : "";
+  const cwd = named || (proj ? `/conv/${proj}` : process.cwd());
+  const root = named || (proj ? `/conv/${proj}` : git || process.cwd());
   return {
-    cwd: proj ? `/conv/${proj}` : process.cwd(),
-    root: proj ? `/conv/${proj}` : git || process.cwd(),
-    git: proj ? "yes" : git ? "yes" : "no",
+    cwd,
+    root,
+    git: named ? (gitRootAt(named) ? "yes" : "no") : proj ? "yes" : git ? "yes" : "no",
     platform: process.platform,
     date: new Date().toISOString().slice(0, 10),
-  }
+  };
 }
 
 function envBlockText(req) {
@@ -2894,6 +2900,59 @@ function renderEnvText(text, req, block) {
   const run = envLabelRun(s);
   if (!run) return null;
   return [...run.lines.slice(0, run.run[0]), block, ...run.lines.slice(run.run.at(-1) + 1)].join("\n");
+}
+
+// Whatever prompt text the caller sent, in one string, so the naming it gave the gate can be
+// read back. `req.zenBody` is the parsed body the route put there.
+function callerPromptText(req) {
+  const body = req?.zenBody;
+  if (!body || typeof body !== "object") return "";
+  const parts = [];
+  const push = (value) => {
+    if (typeof value === "string") parts.push(value);
+    else if (Array.isArray(value)) parts.push(value.map((p) => p?.text ?? "").join("\n"));
+  };
+  push(body.system);
+  push(body.instructions);
+  for (const item of Array.isArray(body.input) ? body.input : Array.isArray(body.messages) ? body.messages : []) {
+    if (item?.type === "text" && typeof item.text === "string") parts.push(item.text);
+    else push(item?.content);
+  }
+  return parts.join("\n");
+}
+
+// The directory the caller named in its own block, as written. ZCode names its
+// per-conversation workspace there, so that value is a per-conversation bucket key and at the
+// same time a path the model can use. Measured 2026-10-31: when the block names the minted
+// pool id as `/conv/<hex>` instead, ZCode read "the working directory does not exist" and went
+// looking for its files elsewhere. A made-up path is still a key for the gate, so this is only
+// about what the model reads — and it can only help when the named path really exists.
+function callerNamedCwd(text) {
+  const s = String(text ?? "");
+  let lines = [];
+  const wrapped = envBlockMatch(s);
+  if (wrapped) lines = wrapped.split("\n");
+  else {
+    const run = envLabelRun(s);
+    if (run) lines = run.run.map((i) => run.lines[i]);
+  }
+  for (const line of lines) {
+    const hit = envLabel(line);
+    if (hit?.entry.key !== "cwd") continue;
+    const value = line.slice(hit.at + hit.label.length).replace(/^[\s>*-]+/, "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+function namedWorkspace(req) {
+  const named = callerNamedCwd(callerPromptText(req));
+  if (!named.startsWith("/")) return "";
+  try {
+    return fs.statSync(named).isDirectory() ? named : "";
+  } catch {
+    return "";
+  }
 }
 
 // `withEnv` writes the block into a prompt. `counted` says the bundle already carries one
@@ -3042,6 +3101,7 @@ async function handleMessages(req, res) {
       const e = anthropicError(400, { error: { type: "invalid_request_error", message: "body must be a JSON object" } })
       return json(res, e.status, e.body)
     }
+    req.zenBody = body
   } catch (err) {
     const e = anthropicError(err?.statusCode === 413 ? 413 : 400, {
       error: { type: err?.statusCode === 413 ? "request_too_large" : "invalid_request_error", message: err?.message ?? "invalid JSON body" },
@@ -3319,6 +3379,7 @@ async function handleChat(req, res, responsesRoute = false) {
   try {
     const raw = await readBody(req)
     body = JSON.parse(raw)
+    req.zenBody = body
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
       return json(res, 400, { error: { type: "invalid_request_error", message: "body must be a JSON object" } })
     }
@@ -5494,6 +5555,9 @@ export {
   withEnv,
   envBlockMatch,
   envLabelRun,
+  callerPromptText,
+  callerNamedCwd,
+  namedWorkspace,
   conversationKey,
   agentProbePayload,
   relayStream,
