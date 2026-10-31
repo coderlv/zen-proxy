@@ -200,9 +200,12 @@ function loadAgentTools() {
 }
 
 // The gate wants opencode's tools, but a caller that sends none — a plain chat,
-// pi's auto-compaction — has nothing for agentToolsFor() to match. opencode
-// attaches its whole registry on every call and never filters it by relevance,
-// so the proxy sends the whole manifest too; the gate takes it on `read` alone.
+// pi's auto-compaction — has nothing for agentToolsFor() to match. So the proxy sends
+// the captured manifest. Not the whole registry: `agent-tools.json` is a snapshot of one
+// captured request (six entries), while the binary's registry is bigger — `tool/registry.ts`
+// also has task, ls, batch, webfetch, websearch, codesearch, todo, invalid — and
+// `session/prompt.ts:601` sends only the agent's active tools, filtered per agent. The gate
+// takes it on `read` alone.
 function gateBridgeTools() {
   return config.agentTools ? loadAgentTools() : []
 }
@@ -217,11 +220,17 @@ function agentToolsFor(callerToolNames) {
 // The gate's own tool list used as the whole list. Measured 2026-10-30 on one entry: the
 // manifest alone is counted per workspace, while a caller tool list riding next to it is
 // counted in the shared anonymous bucket (spent on this machine), so a tool-carrying caller
-// like ZCode answers 429 whatever the block says. Only worth turning on for a caller that
-// can live with the manifest's tools, because the model can then call nothing else — and the
-// reply has to hand those calls back under the names the caller owns (`Bash`, `Read`, …), or
-// the caller reads `bash` and reports the tool unavailable. Measured 2026-10-31 with ZCode:
-// only the manifest tools that have a counterpart on the caller run at all.
+// like ZCode answers 429 whatever the block says. The gate code does not explain that:
+// `zen/util/rateLimiter.ts` counts per (ip, model, hour), `trialLimiter.ts` per IP tokens,
+// the provider is picked by hashing the last four characters of `x-opencode-session`, and
+// `x-opencode-project` is only logged. That measurement did not hold the session still, so
+// the provider arm was a second variable — re-measure with one fixed session id, tool list
+// the only difference. Only worth turning on for a caller that can live with the manifest's
+// tools, because the model can then call nothing else — and the reply has to hand those
+// calls back under the names the caller owns (`Bash`, `Read`, …), or the caller reads `bash`
+// and reports the tool unavailable. Measured 2026-10-31 with ZCode: only the manifest tools
+// that have a counterpart on the caller run at all, and the manifest has no subagent tool,
+// while the binary's subagent turns carry `task` (`tool/task.ts`).
 function gateShapeTools(callerTools) {
   if (!config.agentTools || !config.exactToolShape || !callerTools?.length) return null
   return loadAgentTools()
@@ -1314,17 +1323,22 @@ const DEFAULT_CONFIG = {
   // next to the manifest gets 429 — a caller that brings tools is counted in the shared
   // anonymous bucket, which this machine has spent, and no conversation key or block
   // moves it. The cost is real: the model can only call what the manifest holds, so a
-  // caller like ZCode loses Agent, Skill, TodoWrite, WebFetch and its MCP tools, and a
-  // call to grep/glob/list comes back with a name it does not have. Off by default.
+  // caller like ZCode loses Agent, Skill, TodoWrite, WebFetch and its MCP tools, its
+  // subagents go uncallable (the binary's subagent turns carry `task`, which the manifest
+  // does not hold), and a call to grep/glob/list comes back with a name it does not have.
+  // Off by default.
   exactToolShape: ENV.EXACT_TOOL_SHAPE === "1",
   // The gate reads the system prompt: a caller prompt without OpenCode's `<env>`
   // block gets 429 even with OpenCode's headers, tools and ClientHello (measured
   // 2026-10-24, see docs/investigations/2026-10-24-free-tier-429.md). What it
-  // recognizes is the block's *field structure* — the five lines opencode itself
-  // writes — not the text under them: the same fields with the proxy's own values
-  // pass, a two-field block does not. So the default spells all five, and every
-  // placeholder is filled with something the proxy can state truthfully. Tools are
-  // not required once the block is right. "" leaves the caller's prompt exactly as
+  // recognizes is the block's *field structure* — not the text under them: the same
+  // fields with the proxy's own values pass, a two-field block does not. The binary
+  // writes four lines inside `<env>` (Working directory, Is directory a git repo,
+  // Platform, Today's date, plus a `<files>` block; `session/system.ts:37-52`), so
+  // `Workspace root folder` here is an extra field the proxy also recognizes from
+  // callers that write it, and the date format is free. So the default spells all five,
+  // and every placeholder is filled with something the proxy can state truthfully. Tools
+  // are not required once the block is right. "" leaves the caller's prompt exactly as
   // the caller wrote it.
   envBlock: ENV.ENV_BLOCK ?? "<env>\n  Working directory: {cwd}\n  Workspace root folder: {root}\n  Is directory a git repo: {git}\n  Platform: {platform}\n  Today's date: {date}\n</env>",
   // The binary names the token budget `max_completion_tokens` and sends
