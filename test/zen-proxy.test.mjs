@@ -2821,9 +2821,10 @@ describe("Anthropic Messages API layer", () => {
     assert.match(res.body, /"model":"big-pickle"/, "client's model name preserved in the stream")
   })
 
-  test("opencode bridge tools are added only for tools the caller actually has", () => {
-    // The free tier only accepts a request carrying opencode's own tool manifest.
-    // Offering one the caller lacks would produce a tool call it cannot run.
+  test("a caller tool that renames onto a manifest name is not doubled", () => {
+    // The free tier only accepts a request carrying opencode's own tool names, so a caller
+    // tool goes out under its registry name; the manifest entry for that name must not appear
+    // next to it. Offering a manifest tool the caller lacks would produce a call it cannot run.
     const has = zp.anthropicToChatBody({ tools: [{ name: "Read" }, { name: "Write" }], messages: [{ role: "user", content: "x" }] }, "m")
     const bridge = has.tools.filter((t) => ["read", "write"].includes(t.function.name)).map((t) => t.function.name)
     assert.deepEqual(bridge.sort(), ["read", "write"])
@@ -3029,7 +3030,7 @@ describe("bridge tools on the Anthropic path", () => {
     const res = mockRes()
     await zp.handleMessages(req, res)
     const names = sent.tools.map((t) => t.function.name)
-    assert.ok(names.includes("read") && names.includes("Read"), `the bridge plus the caller's tool, got ${names}`)
+    assert.deepEqual(names, ["read"], "the caller's tool goes out under the gate's name (measured 2026-11-01: its own names answer 429), and the manifest entry for that name is not added twice")
     assert.equal(sent.tool_choice, undefined, "an agent turn stays free to call tools")
   })
 })
@@ -4619,8 +4620,8 @@ describe("pinned tool calls on the Anthropic route", () => {
   })
 
   test("the stub cannot double up with the bridge's own read", async () => {
-    // A caller that has a `Read` gets opencode's real `read` through
-    // agentToolsFor(); the pin must not add a second one.
+    // A caller that has a `Read` sends it under the gate's name, so the manifest's own
+    // `read` must not be added next to it; the pin must not add a second one either.
     const m = "space-bunny-free"
     pinCfg(m)
     let sent = null
@@ -4644,7 +4645,7 @@ describe("pinned tool calls on the Anthropic route", () => {
     await zp.handleMessages(req, res)
     assert.equal(res.state.status, 200)
     assert.equal(sent.tools.filter((t) => t.function.name === "read").length, 1, "exactly one read on the list")
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "Read", "set_title"])
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "set_title"], "the caller's Read goes out under the gate's name once; the helper with no registry counterpart rides through")
   })
 
   test("an unpinned helper caller also gets the stub (issue #20)", async () => {
@@ -5807,7 +5808,7 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     const bodyOf = (model) => JSON.stringify({ model, stream: false, messages: [{ role: "user", content: "hi" }], tools: [callerRead], tool_choice: "auto" })
     const manifest = zp.loadAgentTools().map((t) => t.function.name)
     await zp.handleChat(mockReq({ _body: bodyOf(m) }), mockRes())
-    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read", "Read"], "off by default: the caller's own tool rides with the stub")
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["read"], "off by default: the caller's tool goes out under the gate's name, measured 2026-11-01 — the caller's own names answer 429, the registry names answer 200 on the same entry in the same minute")
     zp.saveConfig({ exactToolShape: true })
     await zp.handleChat(mockReq({ _body: bodyOf(m) }), mockRes())
     assert.deepEqual(sent.tools.map((t) => t.function.name), manifest, "on: the tool list is exactly the manifest the gate counts, the caller's tool is not riding next to it")
@@ -5829,7 +5830,36 @@ describe("the gate's read stub rides on un-pinned tool callers (issue #20)", () 
     zp.saveConfig({ exactToolShape: false })
     const off = mockRes()
     await zp.handleChat(mockReq({ _body: bodyOf(false) }), off)
-    assert.deepEqual(JSON.parse(off.body).choices[0].message.tool_calls.map((t) => t.function.name), ["bash"], "off: the reply is the wire as it came")
+    assert.deepEqual(JSON.parse(off.body).choices[0].message.tool_calls.map((t) => t.function.name), ["Bash"], "off: the wire name is the gate's (`shell`), the reply name is still the caller's")
+  })
+
+  test("a caller's tool names go out under the gate's names and unmappable ones ride through", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    let sent = null
+    globalThis.fetch = routeFetch([["/chat/completions", (u, opts) => { sent = JSON.parse(opts.body); return replyJson([]) }]])
+    const tools = ["Agent", "Bash", "Read", "TodoWrite", "mcp__codegraph__search_graph"].map((n) => ({ type: "function", function: { name: n, description: "d", parameters: { type: "object", properties: {} } } }))
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: m, stream: false, messages: [{ role: "user", content: "hi" }], tools, tool_choice: { type: "function", function: { name: "Bash" } } }) }), mockRes())
+    assert.deepEqual(sent.tools.map((t) => t.function.name), ["subagent", "shell", "read", "question", "mcp__codegraph__search_graph"], "the gate takes only registry names (measured 2026-11-01); a name with no registry counterpart cannot be renamed, so it goes out as the caller wrote it")
+    assert.equal(sent.tool_choice.function.name, "shell", "the pinned choice is renamed with the list")
+  })
+
+  test("the reply hands a renamed call back under the name the caller declared", async () => {
+    const m = "space-bunny-free"
+    cfg(m)
+    const caller = { type: "function", function: { name: "Bash", description: "caller bash", parameters: { type: "object", properties: {} } } }
+    const own = { type: "function", function: { name: "set_title", description: "d", parameters: { type: "object", properties: {} } } }
+    globalThis.fetch = routeFetch([
+      ["/chat/completions", () => replyJson([
+        { id: "c1", type: "function", function: { name: "shell", arguments: '{"command":"ls"}' } },
+        { id: "c2", type: "function", function: { name: "set_title", arguments: "{}" } },
+      ])],
+    ])
+    const res = mockRes()
+    await zp.handleChat(mockReq({ _body: JSON.stringify({ model: m, stream: false, messages: [{ role: "user", content: "hi" }], tools: [caller, own], tool_choice: "auto" }) }), res)
+    const calls = JSON.parse(res.body).choices[0].message.tool_calls
+    assert.deepEqual(calls.map((t) => t.function.name), ["Bash", "set_title"], "the renamed tool comes back as the caller's, the unmapped one under its own name")
+    assert.equal(JSON.parse(calls[0].function.arguments).command, "ls", "the caller's own schema went out, so its argument keys are already the caller's")
   })
 
   test("a renamed streamed call waits for its arguments to be whole", async () => {

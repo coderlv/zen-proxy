@@ -181,9 +181,23 @@ const AGENT_TOOL_MAP = {
   write: { name: "Write", args: { filePath: "file_path" } },
   // null means "this argument has no counterpart on the caller's tool; drop it".
   bash: { name: "Bash", args: { workdir: null } },
+  shell: { name: "Bash", args: { workdir: null } },
   grep: { name: "Grep", args: {} },
   glob: { name: "Glob", args: {} },
   list: { name: "LS", args: {} },
+  subagent: { name: "Agent", args: {} },
+  skill: { name: "Skill", args: {} },
+  webfetch: { name: "WebFetch", args: {} },
+  websearch: { name: "WebSearch", args: {} },
+  question: { name: "TodoWrite", args: {} },
+}
+// The caller's name as the gate wants it: the reverse of the map above, with the names
+// the live registry uses today. `Bash` goes to `shell` because that is the name the
+// binary has now (`tool/registry.ts`), not `bash`.
+const CALLER_TO_GATE = {
+  Read: "read", Edit: "edit", Write: "write", Bash: "shell", Grep: "grep", Glob: "glob",
+  LS: "list", Agent: "subagent", Skill: "skill", WebFetch: "webfetch", WebSearch: "websearch",
+  TodoWrite: "question",
 }
 let agentToolsCache = null
 function loadAgentTools() {
@@ -234,6 +248,31 @@ function agentToolsFor(callerToolNames) {
 function gateShapeTools(callerTools) {
   if (!config.agentTools || !config.exactToolShape || !callerTools?.length) return null
   return loadAgentTools()
+}
+
+// Measured 2026-11-01 on one entry, one minute, one body: the gate takes only opencode's
+// own tool names. The caller's names (`Agent`, `Bash`, `Read`, `Edit`, `Write`, `TodoWrite`,
+// `Skill`, `WebFetch`) answer 429; the same set renamed to the registry names answers 200,
+// and the session id has to be the descending `ses_` form the binary mints. So a
+// tool-carrying caller goes out under the registry names and the reply hands the calls back
+// under the names the caller declared. A name the registry has no entry for (`set_title`,
+// `client_nonce_lookup`, `mcp__*`) is sent as the caller wrote it: whether the gate takes an
+// unmapped name is unmeasured, and dropping it would take a tool the caller can run away
+// from the model. `back` maps every wire name to what the caller declared, so the reply
+// renames names only — the schema that went out is the caller's own, so its argument keys
+// are already the caller's vocabulary.
+function gateNameTools(callerTools) {
+  if (!config.agentTools || !callerTools?.length) return null
+  const tools = []
+  const back = new Map()
+  for (const t of callerTools) {
+    const name = t?.function?.name ?? t?.name
+    if (!name) continue
+    const wire = CALLER_TO_GATE[name] ?? name
+    back.set(wire, { name, args: null })
+    tools.push({ ...(t.type ? { type: t.type } : { type: "function" }), function: { ...(t.function ?? {}), name: wire } })
+  }
+  return tools.length ? { tools, back } : null
 }
 
 // The gate's `read`.
@@ -301,8 +340,20 @@ function gateReadFor(body) {
 }
 
 // An opencode tool call rewritten as the caller's tool call.
-function remapAgentTool(name, rawArgs) {
-  const spec = AGENT_TOOL_MAP[name]
+// The caller-side shape of a wire tool name: the per-request back map first (the name the
+// caller actually declared), then the static manifest map.
+function toolSpec(name, back = null) {
+  return (back && back.get(name)) || AGENT_TOOL_MAP[name] || null
+}
+
+// `back` is the per-request wire-name → caller-tool map from gateNameTools(). It wins over
+// AGENT_TOOL_MAP because the caller's own vocabulary is what it can run: a tool that went
+// out under its own name must come back under that name, and a tool whose schema was the
+// caller's already carries the caller's argument keys (spec.args null means "nothing to
+// rewrite"). An empty back map — the manifest path, where the wire schema is opencode's —
+// falls through to AGENT_TOOL_MAP.
+function remapAgentTool(name, rawArgs, back = null) {
+  const spec = toolSpec(name, back)
   if (!spec) return null
   let args = {}
   try {
@@ -311,14 +362,22 @@ function remapAgentTool(name, rawArgs) {
     args = {}
   }
   const out = {}
+  let rewrote = false
   for (const [k, v] of Object.entries(args)) {
-    if (k in spec.args) {
-      if (spec.args[k] === null) continue
+    if (spec.args && k in spec.args) {
+      if (spec.args[k] === null) {
+        rewrote = true
+        continue
+      }
       out[spec.args[k]] = v
+      if (spec.args[k] !== k) rewrote = true
     } else {
       out[k] = v
     }
   }
+  // Nothing to rewrite: hand the arguments over exactly as the model wrote them,
+  // not a re-serialization that changes spacing and key order.
+  if (!rewrote && typeof rawArgs === "string") return { name: spec.name, args: rawArgs }
   return { name: spec.name, args: JSON.stringify(out) }
 }
 
@@ -1952,10 +2011,18 @@ function anthropicToChatBody(body, model) {
   const tools = anthropicToolsToChat(body?.tools)
   // Ship opencode's own tools ahead of the caller's. Without them the free tier
   // rejects the request outright; the caller's prompt and tools are untouched and
-  // still take priority in the reply.
-  const bridge = agentToolsFor((body?.tools ?? []).map((t) => t?.name))
+  // still take priority in the reply. A caller tool that is not a registry name
+  // goes out under the registry name (measured 2026-11-01: the caller's own names
+  // answer 429, the registry names answer 200 on the same entry in the same
+  // minute), and the reply hands the call back under the name the caller declared.
+  const renamed = gateNameTools(tools)
+  // A caller tool that renames onto a manifest name already occupies that name, so the
+  // manifest entry for it is not added twice — one `read` on the list, under the caller's
+  // schema.
+  const wireNames = new Set((renamed?.tools ?? []).map((t) => t.function.name))
+  const bridge = agentToolsFor((body?.tools ?? []).map((t) => t?.name)).filter((t) => !wireNames.has(t.function.name))
   const exact = gateShapeTools(tools)
-  let all = exact ?? (bridge.length ? [...bridge, ...(tools ?? [])] : tools)
+  let all = exact ?? (bridge.length ? [...bridge, ...(renamed?.tools ?? [])] : renamed?.tools ?? tools)
   // The gate wants a tool named `read` on the list by name alone. A pinned
   // caller whose tools match nothing (a helper like `set_title`) needed the
   // stub already; any other tool-carrying caller needs it too — measured
@@ -1970,7 +2037,7 @@ function anthropicToChatBody(body, model) {
   if (all?.length) payload.tools = all
   // Anthropic's tool_choice and opencode's use the same vocabulary once renamed.
   if (typeof body?.tool_choice === "object" && body.tool_choice?.type === "tool") {
-    payload.tool_choice = { type: "function", function: { name: body.tool_choice.name } }
+    payload.tool_choice = { type: "function", function: { name: CALLER_TO_GATE[body.tool_choice.name] ?? body.tool_choice.name } }
   } else if (typeof body?.tool_choice === "object" && body.tool_choice?.type === "any") {
     // "any" means some call must happen; upstream has no object form for that
     // and "required" is its exact match (measured: it used to be dropped and
@@ -1997,7 +2064,7 @@ function parseToolArgs(args) {
 
 const STOP_REASON = { stop: "end_turn", length: "max_tokens", tool_calls: "tool_use", function_call: "tool_use", content_filter: "end_turn" }
 
-function chatToAnthropic(content, requested, servedBy, pin = null) {
+function chatToAnthropic(content, requested, servedBy, pin = null, back = null) {
   const msg = content?.choices?.[0]?.message ?? {}
   const blocks = []
   if (msg.reasoning_content) blocks.push({ type: "thinking", thinking: msg.reasoning_content, signature: "" })
@@ -2006,12 +2073,15 @@ function chatToAnthropic(content, requested, servedBy, pin = null) {
   for (const tc of msg.tool_calls ?? []) {
     // A call to an opencode bridge tool comes back under opencode's name; give
     // the caller back the tool it actually offered.
-    const mapped = remapAgentTool(tc?.function?.name ?? tc?.name, tc?.function?.arguments ?? tc?.arguments)
-    const name = mapped ? mapped.name : (tc?.function?.name ?? tc?.name ?? "unknown")
+    const rawName = tc?.function?.name ?? tc?.name
+    const mapped = remapAgentTool(rawName, tc?.function?.arguments ?? tc?.arguments, back)
+    const name = mapped ? mapped.name : (rawName ?? "unknown")
     // The pin is not enforcement: the provider may answer a pinned request with
     // a call the caller never offered (the injected stub `read` included). A
-    // pinned reply keeps the pinned call and nothing else.
-    if (pin && name !== pin) continue
+    // pinned reply keeps the pinned call and nothing else. The pin is the name the
+    // wire carries, so it is matched before the call is handed back under the
+    // caller's name.
+    if (pin && rawName !== pin) continue
     blocks.push({
       type: "tool_use",
       id: tc?.id ?? `toolu_${randomBytes(8).toString("hex")}`,
@@ -2346,7 +2416,7 @@ function filterResponsesOutput(data, callOk = null, rename = false) {
   if (rename) {
     for (const item of output) {
       if (item?.type !== "function_call") continue
-      const mapped = remapAgentTool(item.name, item.arguments)
+      const mapped = remapAgentTool(item.name, item.arguments, rename)
       if (!mapped) continue
       item.name = mapped.name
       item.arguments = mapped.args
@@ -3159,15 +3229,24 @@ async function handleMessages(req, res) {
   // the gate answers 403 for every model and the request walks the chain.
   const bridge = (body?.tools ?? []).length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
+  // Same rename as the chat path: `anthropicToChatBody()` sends the caller's tools under the
+  // registry names, so the reply needs the matching wire-name → caller-tool map. The pin is
+  // matched against the name on the wire, then handed back under the caller's name.
+  const renamed = gateNameTools(anthropicToolsToChat(body?.tools))
+  const back = renamed?.back ?? null
   // A caller that pins a tool gets a reply that carries only that call: the
   // provider ignores the pin sometimes, and a stray call (the gate stub's
   // `read` included) is a tool the caller cannot run. Un-pinned tool callers
   // still carry the stub on the translated request — the gate refuses any list
   // without a `read` (same rule the chat path applies) — and the reply filter
   // drops a stub call like any other un-invited one.
-  const gateRead = bridged ? null : gateReadFor(body)
+  const gateRead = bridged ? null : renamed
+    ? (renamed.tools.some((t) => t.function.name === "read") ? null : gateReadTool())
+    : gateReadFor(body)
   const gateReadName = gateRead ? gateRead.function.name : null
-  const pin = bridged ? null : pinnedToolName(body.tool_choice)
+  const pinned = bridged ? null : pinnedToolName(body.tool_choice)
+  // Filters match the names on the wire; the reply renames them back with `back`.
+  const pin = pinned && renamed ? CALLER_TO_GATE[pinned] ?? pinned : pinned
   let stopWalk = false
   let firstRetryAfter = 0
   let lastRetryAfter = 0
@@ -3240,7 +3319,7 @@ async function handleMessages(req, res) {
           // the pump is done — measured as process-level "TypeError:
           // terminated" noise. Sink the promise; the log guard stays for real
           // surprises.
-          relayAnthropicStream(req, res, chunks, requested, model, bridged, pin, gateReadName).catch(() => {})
+          relayAnthropicStream(req, res, chunks, requested, model, bridged, pin, gateReadName, back).catch(() => {})
           res.on("finish", () => {
             recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
             recordObserved(model, true)
@@ -3256,7 +3335,7 @@ async function handleMessages(req, res) {
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          return json(res, 200, chatToAnthropic(shaped, requested, model, pin))
+          return json(res, 200, chatToAnthropic(shaped, requested, model, pin, back))
         } catch (err) {
           // Upstream said OK but the reply never arrived whole (a mid-stream
           // error chunk, a cut, a hang-abort). Nothing reached the client yet,
@@ -3431,15 +3510,32 @@ async function handleChat(req, res, responsesRoute = false) {
   const bridge = chatBody.tools?.length ? [] : gateBridgeTools()
   const bridged = bridge.length > 0
   const exact = gateShapeTools(chatBody.tools)
+  // A caller that brings its own tools goes out under the gate's names (see gateNameTools);
+  // the reply hands the calls back under the names the caller declared, so `rename` is that
+  // back map. The manifest path has no caller names on the wire, so there an empty map falls
+  // through to AGENT_TOOL_MAP.
+  const renamed = exact ? null : gateNameTools(chatBody.tools)
+  const renamedTools = renamed?.tools ?? null
+  const rename = exact ? new Map() : renamed?.back ?? null
   // A caller that brings its own tools needs the gate's `read` on the list even
   // when nothing is pinned (measured: one 403 per model without it). Only the
   // request changes — `tool_choice` is forwarded untouched. A call to the stub
   // itself is a call on a tool the caller never offered, so the reply carries
   // the pinned call only when pinned, and never carries the stub's call.
-  const gateRead = (bridged || exact) ? null : gateReadFor(chatBody)
+  // The check is on the names that go out: a caller whose `Read` is renamed to the
+  // gate's `read` already satisfies it and must not get the stub next to it.
+  const gateRead = (bridged || exact) ? null : renamedTools
+    ? (renamedTools.some((t) => t.function.name === "read") ? null : gateReadTool())
+    : gateReadFor(chatBody)
   const gateReadName = gateRead ? gateRead.function.name : null
-  const pin = bridged ? null : pinnedToolName(chatBody.tool_choice)
-  const requestBody = applyEnvBlock(exact ? { ...chatBody, tools: exact } : gateRead ? { ...chatBody, tools: [gateRead, ...chatBody.tools] } : chatBody, req)
+  const wireChoice = chatBody.tool_choice && typeof chatBody.tool_choice === "object" && chatBody.tool_choice.function?.name && renamedTools
+    ? { ...chatBody.tool_choice, function: { ...chatBody.tool_choice.function, name: CALLER_TO_GATE[chatBody.tool_choice.function.name] ?? chatBody.tool_choice.function.name } }
+    : chatBody.tool_choice
+  // The pin is matched against the names on the wire, so it has to be the wire name; the
+  // reply renames it back with the same map.
+  const pin = bridged ? null : pinnedToolName(wireChoice)
+  const wireTools = exact ? exact : renamedTools ? [...(gateRead ? [gateRead] : []), ...renamedTools] : gateRead ? [gateRead, ...chatBody.tools] : chatBody.tools
+  const requestBody = applyEnvBlock(wireTools ? { ...chatBody, tools: wireTools, ...(wireChoice ? { tool_choice: wireChoice } : {}) } : chatBody, req)
   let stopWalk = false
   let firstRetryAfter = 0
   let lastRetryAfter = 0
@@ -3521,13 +3617,13 @@ async function handleChat(req, res, responsesRoute = false) {
           // client-visible failure, and undici's late socket rejections have
           // nowhere else to land (measured: 4 x "TypeError: terminated").
           if (responsesRequestShape && format === "responses") {
-            relayResponsesPassthrough(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
+            relayResponsesPassthrough(req, res, upstreamRes, requested, bridged, pin, gateReadName, rename).catch(() => {})
           } else if (responsesRequestShape) {
-            relayChatAsResponsesStream(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
+            relayChatAsResponsesStream(req, res, upstreamRes, requested, bridged, pin, gateReadName, rename).catch(() => {})
           } else if (format === "responses") {
-            relayResponsesStream(req, res, upstreamRes, requested, bridged, pin, gateReadName).catch(() => {})
+            relayResponsesStream(req, res, upstreamRes, requested, bridged, pin, gateReadName, rename).catch(() => {})
           } else {
-            relayStream(req, res, upstreamRes, requested, bridged, pin, gateReadName, !!exact).catch(() => {})
+            relayStream(req, res, upstreamRes, requested, bridged, pin, gateReadName, rename).catch(() => {})
           }
           res.on("finish", () => { recordReq(req, `${requested}→${model}`, Date.now() - start, 200); recordObserved(model, true) })
           return
@@ -3547,20 +3643,20 @@ async function handleChat(req, res, responsesRoute = false) {
             // rewritten and the calls it cannot run dropped.
             if (responsesRequestShape) {
               content.model = requested
-              if (pin) filterResponsesOutput(content, (i) => i?.name === pin, !!exact)
-              else if (gateReadName) filterResponsesOutput(content, (i) => i?.name !== gateReadName, !!exact)
-              else if (bridged) filterResponsesOutput(content, null, !!exact)
+              if (pin) filterResponsesOutput(content, (i) => i?.name === pin, rename)
+              else if (gateReadName) filterResponsesOutput(content, (i) => i?.name !== gateReadName, rename)
+              else if (bridged) filterResponsesOutput(content, null, rename)
               if (model !== requested) content.zen_served_by = model
               return json(res, 200, content)
             }
-            return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin, gateReadName, !!exact))
+            return json(res, 200, stripUnpinnedCalls(stripToolCalls(responsesToChat(content, requested, model), bridged), pin, gateReadName, rename))
           }
           if (model !== requested) {
             // Make the fallback visible to any client, not just JSON readers.
             res.setHeader?.("x-zen-served-by", model)
             res.setHeader?.("x-zen-fallback", "true")
           }
-          const shaped = stripUnpinnedCalls(stripToolCalls(content, bridged), pin, gateReadName, !!exact)
+          const shaped = stripUnpinnedCalls(stripToolCalls(content, bridged), pin, gateReadName, rename)
           if (responsesRequestShape) {
             return json(res, 200, chatToResponses(shaped, requested, model))
           }
@@ -3851,7 +3947,7 @@ function chatBlockError(block) {
   }
 }
 
-function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, gateName = null) {
+function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = false, pin = null, gateName = null, back = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -3961,9 +4057,8 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
                   st.dropped.add(tIndex)
                   continue
                 }
-                const mapped = remapAgentTool(tc.function.name, "{}")
-                const resolved = mapped ? mapped.name : tc.function.name
-                if (pin && resolved !== pin) {
+                const spec = toolSpec(tc.function.name, back)
+                if (pin && tc.function.name !== pin) {
                   st.dropped.add(tIndex)
                   continue
                 }
@@ -3975,12 +4070,12 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
               const blockIndex = st.blocks.has(tIndex) ? st.blocks.get(tIndex).index : st.nextIndex++
               if (!st.blocks.has(tIndex)) {
                 const rawName = tc.function?.name ?? "unknown"
-                const mapped = remapAgentTool(rawName, "{}")
+                const spec = toolSpec(rawName, back)
                 st.blocks.set(tIndex, {
                   index: blockIndex,
                   id: tc.id ?? `toolu_${randomBytes(8).toString("hex")}`,
                   raw: rawName,
-                  name: mapped ? mapped.name : rawName,
+                  name: spec ? spec.name : rawName,
                   args: "",
                 })
                 emit("content_block_start", {
@@ -4009,7 +4104,7 @@ function relayAnthropicStream(req, res, chunks, requested, servedBy, strip = fal
       for (const t of st.blocks.values()) {
         // Rename the caller's argument keys here too — streamed arguments are
         // accumulated and only emitted at the end of the block.
-        const mapped = remapAgentTool(t.raw, t.args || "{}")
+        const mapped = remapAgentTool(t.raw, t.args || "{}", back)
         const json = mapped ? mapped.args : t.args || "{}"
         emit("content_block_delta", { index: t.index, delta: { type: "input_json_delta", partial_json: json } })
         emit("content_block_stop", { index: t.index })
@@ -4074,7 +4169,7 @@ function stripUnpinnedCalls(content, pin, dropName = null, rename = false) {
       const keep = pin ? (tc) => (tc?.function?.name ?? tc?.name) === pin : (tc) => (tc?.function?.name ?? tc?.name) !== dropName
       const kept = body.tool_calls.filter(keep)
       if (rename) for (const tc of kept) {
-        const mapped = remapAgentTool(tc?.function?.name ?? tc?.name, tc?.function?.arguments ?? tc?.arguments)
+        const mapped = remapAgentTool(tc?.function?.name ?? tc?.name, tc?.function?.arguments ?? tc?.arguments, rename)
         if (!mapped) continue
         if (tc.function) {
           tc.function.name = mapped.name
@@ -4100,11 +4195,12 @@ function stripUnpinnedCalls(content, pin, dropName = null, rename = false) {
 // `name: null`, so the keep/drop decision has to outlive the block that first
 // saw the name. Kept calls are renumbered into one clean sequence.
 //
-// `rename` is the same rename the Anthropic route has: a call to a manifest tool
-// has to come back under the tool the caller can actually run. Argument pieces
-// cannot be rewritten one at a time — a key can be split across chunks — so a
-// renamed call accumulates them and writes the renamed object once it is whole.
-function pinStreamState(pin, dropName = null, rename = false) {
+// `rename` is the wire-name → caller-tool back map from gateNameTools(): a call has to come
+// back under the tool the caller can actually run. Argument pieces cannot be rewritten one at a
+// time — a key can be split across chunks — so a call whose keys really change accumulates them
+// and writes the rewritten object once it is whole; a call that only needed its name back
+// streams its arguments as they arrive, because the schema on the wire was the caller's.
+function pinStreamState(pin, dropName = null, rename = null) {
   return { pin, dropName, rename, byChoice: new Map() }
 }
 
@@ -4113,7 +4209,7 @@ function filterPinnedDelta(parsed, pinState) {
     const key = choice?.index ?? 0
     let s = pinState.byChoice.get(key)
     if (!s) {
-      s = { dropped: new Set(), kept: false, count: 0, renumber: new Map(), names: new Map(), args: new Map() }
+      s = { dropped: new Set(), kept: false, count: 0, renumber: new Map(), names: new Map(), args: new Map(), rewrite: new Set() }
       pinState.byChoice.set(key, s)
     }
     const body = choice?.delta ?? choice?.message
@@ -4140,15 +4236,21 @@ function filterPinnedDelta(parsed, pinState) {
             if (!s.renumber.has(idx)) s.renumber.set(idx, s.count++)
             s.kept = true
           }
-          if (pinState.rename && AGENT_TOOL_MAP[rawName]) {
+          const spec = pinState.rename ? toolSpec(rawName, pinState.rename) : null
+          if (spec) {
             s.names.set(idx, rawName)
-            tc.function.name = AGENT_TOOL_MAP[rawName].name
+            tc.function.name = spec.name
+            // Argument keys only have to be rewritten when the schema that went out was
+            // opencode's. A renamed caller's own schema already carried the caller's keys,
+            // so those arguments stream through as they arrive instead of being held until
+            // the object is whole.
+            if (spec.args && Object.keys(spec.args).length) s.rewrite.add(idx)
           }
         } else if (s.dropped.has(idx)) {
           continue
         }
         if (s.renumber.has(idx)) tc.index = s.renumber.get(idx)
-        if (pinState.rename && s.names.has(idx) && typeof tc?.function?.arguments === "string") {
+        if (s.names.has(idx) && s.rewrite.has(idx) && typeof tc?.function?.arguments === "string") {
           const acc = (s.args.get(idx) ?? "") + tc.function.arguments
           s.args.set(idx, acc)
           let whole = null
@@ -4157,7 +4259,7 @@ function filterPinnedDelta(parsed, pinState) {
           } catch {
             whole = null
           }
-          if (whole && typeof whole === "object") tc.function.arguments = remapAgentTool(s.names.get(idx), acc).args
+          if (whole && typeof whole === "object") tc.function.arguments = remapAgentTool(s.names.get(idx), acc, pinState.rename).args
           else tc.function.arguments = ""
         }
         kept.push(tc)
@@ -4316,7 +4418,7 @@ async function probeModel(id, auth, session) {
 }
 
 // Stream a Responses SSE body back as chat.completion.chunk SSE.
-function relayResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null) {
+function relayResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null, back = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -4421,6 +4523,13 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
                   }
                 } else if (state.dropped.has(idx)) continue
                 if (state.renumber.has(idx)) tc.index = state.renumber.get(idx)
+                // The wire carries the gate's name; the caller gets back the tool it
+                // declared. Argument keys need no rewrite here: on the renamed path the
+                // schema that went out was the caller's own.
+                if (back) {
+                  const spec = toolSpec(tc?.function?.name, back)
+                  if (spec) tc.function.name = spec.name
+                }
                 kept.push(tc)
               }
               if (kept.length) delta.tool_calls = kept
@@ -4461,7 +4570,7 @@ function relayResponsesStream(req, res, upstreamRes, requested, strip = false, p
 // gateway itself emits for native /responses traffic, emitted live — the
 // callers here are agents, and buffering the stream would throw the latency
 // away.
-function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null) {
+function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null, back = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -4539,7 +4648,9 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
           }
           if (!st.calls.has(tIndex)) {
             const index = items.length
-            const item = { type: "function_call", id: `fc_${randomBytes(8).toString("hex")}`, call_id: tc.id ?? `call_${index}`, name: tc.function?.name ?? "unknown", arguments: "" }
+            const rawName = tc.function?.name ?? "unknown"
+            const spec = back ? toolSpec(rawName, back) : null
+            const item = { type: "function_call", id: `fc_${randomBytes(8).toString("hex")}`, call_id: tc.id ?? `call_${index}`, name: spec ? spec.name : rawName, arguments: "" }
             const entry = { index, item, args: "" }
             st.calls.set(tIndex, entry)
             items.push(item)
@@ -4611,7 +4722,7 @@ function relayChatAsResponsesStream(req, res, upstreamRes, requested, strip = fa
 // native /responses one: upstream already speaks the same dialect, so this is
 // a passthrough that rewrites the model and drops calls the caller cannot run
 // (the bridge manifest's, and everything but the pinned one).
-function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null) {
+function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = false, pin = null, gateName = null, back = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -4619,6 +4730,13 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
   })
   const dropped = new Set()
   const allowed = new Set()
+  // Names go back to the vocabulary the caller declared; argument keys stay as they
+  // arrived because the schema on the wire was the caller's own.
+  const remapName = (item) => {
+    if (!back || item?.type !== "function_call") return
+    const spec = toolSpec(item.name, back)
+    if (spec) item.name = spec.name
+  }
   // One decision rule for every shape a call can arrive in: the added item
   // carries the name, the later chunks reference it by id.
   const decide = (item) => {
@@ -4696,11 +4814,13 @@ function relayResponsesPassthrough(req, res, upstreamRes, requested, strip = fal
           }
           if (type === "response.output_item.added" || type === "response.output_item.done") {
             if (data.item?.type === "function_call" && !decide(data.item)) continue
+            remapName(data.item)
           } else if (type.startsWith("response.function_call_arguments")) {
             const callId = data.item_id ?? data.call_id
             if (strip || dropped.has(callId)) continue
           } else if ((type === "response.completed" || type === "response.incomplete") && Array.isArray(data.response?.output)) {
             data.response.output = data.response.output.filter((item) => (item?.type === "function_call" ? decide(item) : true))
+            for (const item of data.response.output) remapName(item)
           }
           res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
         }
