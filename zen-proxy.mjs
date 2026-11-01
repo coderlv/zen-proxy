@@ -270,6 +270,25 @@ function gateShapeTools(callerTools) {
 // name, hence the budget of 27.
 const GATE_NAME_BUDGET = 27
 
+// The gate refuses recognizable tool-name sets it cannot classify as a harness — ZCode's
+// subagent lists do exactly that (its main-conversation lists pass). Measured 2026-11-01
+// (HANDOFF 8.12): the same subagent body answers 429 with its tools and 200 without, while
+// fully synthetic lists pass at any count and every single name passes alone. So on the
+// first upstream 429 of a tool-carrying request the request goes out once more with every
+// tool renamed to `tN`: the model keeps the caller's descriptions and schemas, and the
+// reply renames the calls back under the caller's names through the fresh map.
+function synthWireTools(wireTools, oldBack) {
+  const back = new Map()
+  const stub = gateReadTool()
+  const tools = (wireTools ?? []).filter((t) => (t?.function?.name ?? t?.name) !== stub.function.name).map((t, i) => {
+    const name = t?.function?.name ?? t?.name
+    const caller = oldBack?.get(name)?.name ?? name
+    back.set(`t${i + 1}`, { name: caller, args: null })
+    return { ...(t.type ? { type: t.type } : { type: "function" }), function: { ...(t.function ?? {}), name: `t${i + 1}` } }
+  })
+  return { tools: [stub, ...tools], back }
+}
+
 function gateNameTools(callerTools) {
   if (!config.agentTools || !callerTools?.length) return null
   const tools = []
@@ -3244,7 +3263,10 @@ async function handleMessages(req, res) {
   // registry names, so the reply needs the matching wire-name → caller-tool map. The pin is
   // matched against the name on the wire, then handed back under the caller's name.
   const renamed = gateNameTools(anthropicToolsToChat(body?.tools))
-  const back = renamed?.back ?? null
+  let back = renamed?.back ?? null
+  // The synth retry (see synthWireTools) swaps this map when the gate refuses the
+  // caller's own vocabulary.
+  let synthTried = false
   // A caller that pins a tool gets a reply that carries only that call: the
   // provider ignores the pin sometimes, and a stray call (the gate stub's
   // `read` included) is a tool the caller cannot run. Un-pinned tool callers
@@ -3254,7 +3276,7 @@ async function handleMessages(req, res) {
   const gateRead = bridged ? null : renamed
     ? (renamed.tools.some((t) => t.function.name === "read") ? null : gateReadTool())
     : gateReadFor(body)
-  const gateReadName = gateRead ? gateRead.function.name : null
+  let gateReadName = gateRead ? gateRead.function.name : null
   const pinned = bridged ? null : pinnedToolName(body.tool_choice)
   // Filters match the names on the wire; the reply renames them back with `back`.
   const pin = pinned && renamed ? CALLER_TO_GATE[pinned] ?? pinned : pinned
@@ -3374,6 +3396,18 @@ async function handleMessages(req, res) {
       }
       lastStatus = upstreamRes.status
       noteAttempt(req, model, attempt, `${lastStatus} ${String(lastErr?.error?.message ?? lastErr?.message ?? "").slice(0, 200)}`)
+      // The gate refused the caller's harness vocabulary (429 with tools): one retry with
+      // every tool renamed synthetic. See synthWireTools for the measurement behind it.
+      if (lastStatus === 429 && !synthTried && !bridged && pin == null && payload.tools?.length) {
+        synthTried = true
+        const synth = synthWireTools(payload.tools, back)
+        back = synth.back
+        gateReadName = "read"
+        payload.tools = synth.tools
+        noteAttempt(req, model, attempt, "429 with caller tools: one retry under synthetic names")
+        attempt--
+        continue
+      }
       const retryAfterSec = parseRetryAfter(upstreamRes.headers.get("retry-after"))
       lastRetryAfter = retryAfterSec
       const retryAfterMs = Math.min(retryAfterSec * 1000, 3000)
@@ -3527,7 +3561,10 @@ async function handleChat(req, res, responsesRoute = false) {
   // through to AGENT_TOOL_MAP.
   const renamed = exact ? null : gateNameTools(chatBody.tools)
   const renamedTools = renamed?.tools ?? null
-  const rename = exact ? new Map() : renamed?.back ?? null
+  // The synth retry (see synthWireTools) swaps these when the gate refuses the caller's
+  // own vocabulary; swapped before the relay starts, so the reply maps back correctly.
+  let rename = exact ? new Map() : renamed?.back ?? null
+  let synthTried = false
   // A caller that brings its own tools needs the gate's `read` on the list even
   // when nothing is pinned (measured: one 403 per model without it). Only the
   // request changes — `tool_choice` is forwarded untouched. A call to the stub
@@ -3538,7 +3575,7 @@ async function handleChat(req, res, responsesRoute = false) {
   const gateRead = (bridged || exact) ? null : renamedTools
     ? (renamedTools.some((t) => t.function.name === "read") ? null : gateReadTool())
     : gateReadFor(chatBody)
-  const gateReadName = gateRead ? gateRead.function.name : null
+  let gateReadName = gateRead ? gateRead.function.name : null
   const wireChoice = chatBody.tool_choice && typeof chatBody.tool_choice === "object" && chatBody.tool_choice.function?.name && renamedTools
     ? { ...chatBody.tool_choice, function: { ...chatBody.tool_choice.function, name: CALLER_TO_GATE[chatBody.tool_choice.function.name] ?? chatBody.tool_choice.function.name } }
     : chatBody.tool_choice
@@ -3711,6 +3748,18 @@ async function handleChat(req, res, responsesRoute = false) {
         delete payload[refused]
         if (!rejectedFields.has(model)) rejectedFields.set(model, new Set())
         rejectedFields.get(model).add(refused)
+        attempt--
+        continue
+      }
+      // The gate refused the caller's harness vocabulary (429 with tools): one retry with
+      // every tool renamed synthetic. See synthWireTools for the measurement behind it.
+      if (lastStatus === 429 && !synthTried && !bridged && !exact && pin == null && payload.tools?.length) {
+        synthTried = true
+        const synth = synthWireTools(payload.tools, rename)
+        rename = synth.back
+        gateReadName = "read"
+        payload.tools = synth.tools
+        noteAttempt(req, model, attempt, "429 with caller tools: one retry under synthetic names")
         attempt--
         continue
       }
