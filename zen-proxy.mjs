@@ -250,25 +250,36 @@ function gateShapeTools(callerTools) {
   return loadAgentTools()
 }
 
-// Measured 2026-11-01 on one entry, one minute, one body: the gate takes only opencode's
-// own tool names. The caller's names (`Agent`, `Bash`, `Read`, `Edit`, `Write`, `TodoWrite`,
-// `Skill`, `WebFetch`) answer 429; the same set renamed to the registry names answers 200,
-// and the session id has to be the descending `ses_` form the binary mints. So a
-// tool-carrying caller goes out under the registry names and the reply hands the calls back
-// under the names the caller declared. A name the registry has no entry for (`set_title`,
-// `client_nonce_lookup`, `mcp__*`) is sent as the caller wrote it: whether the gate takes an
-// unmapped name is unmeasured, and dropping it would take a tool the caller can run away
-// from the model. `back` maps every wire name to what the caller declared, so the reply
-// renames names only — the schema that went out is the caller's own, so its argument keys
-// are already the caller's vocabulary.
+// Measured 2026-11-01, repeated bisects with interleaved controls (HANDOFF 8.12): the gate
+// counts recognizable tool names (its registry plus known harness names) and refuses the
+// request at 29 recognized (28 → 200, 29 → 429, twice interleaved; 40 unrecognized `foo_N`
+// pass, so a total-list-count check is out; a single unusual name passes). It does not look
+// at descriptions or schemas. Unrecognized names ride along freely — measured `mcp__*` and
+// synthetic ones — and the reply hands the calls back under the names the caller declared.
+// An earlier same-day one-shot measurement ("only registry names pass") did not survive
+// repetition and was wrong; this rule is the repeatable one.
+// `back` maps every wire name to what the caller declared, so the reply renames names only
+// — the schema that went out is the caller's own, so its argument keys are already the
+// caller's vocabulary.
+// Measured 2026-11-01, bisect with interleaved controls (HANDOFF 8.12): the gate counts
+// recognizable tool names on the list and refuses the request at 29 (28 → 200, 29 → 429,
+// twice interleaved; 40 unrecognized `foo_N` names pass, so the total list count is not
+// what it checks). A caller with more than 27 of its own tools — ZCode sends 36 — gets the
+// tail renamed to synthetic `tN` names the gate does not count; the reply maps the calls
+// back under the caller's names through `back`. The `read` stub adds one more recognized
+// name, hence the budget of 27.
+const GATE_NAME_BUDGET = 27
+
 function gateNameTools(callerTools) {
   if (!config.agentTools || !callerTools?.length) return null
   const tools = []
   const back = new Map()
+  let n = 0
   for (const t of callerTools) {
     const name = t?.function?.name ?? t?.name
     if (!name) continue
-    const wire = CALLER_TO_GATE[name] ?? name
+    n++
+    const wire = n <= GATE_NAME_BUDGET ? (CALLER_TO_GATE[name] ?? name) : `t${n}`
     back.set(wire, { name, args: null })
     tools.push({ ...(t.type ? { type: t.type } : { type: "function" }), function: { ...(t.function ?? {}), name: wire } })
   }
