@@ -282,7 +282,9 @@ function synthWireTools(wireTools, oldBack) {
   const stub = gateReadTool()
   const tools = (wireTools ?? []).filter((t) => (t?.function?.name ?? t?.name) !== stub.function.name).map((t, i) => {
     const name = t?.function?.name ?? t?.name
-    const caller = oldBack?.get(name)?.name ?? name
+    // Bridge tools ride without a `back` entry (the anthropic route adds the manifest
+    // names itself), so the caller's vocabulary comes from the manifest map too.
+    const caller = oldBack?.get(name)?.name ?? AGENT_TOOL_MAP[name]?.name ?? name
     back.set(`t${i + 1}`, { name: caller, args: null })
     return { ...(t.type ? { type: t.type } : { type: "function" }), function: { ...(t.function ?? {}), name: `t${i + 1}` } }
   })
