@@ -283,9 +283,10 @@ function synthWireTools(wireTools, oldBack) {
   const tools = (wireTools ?? []).filter((t) => (t?.function?.name ?? t?.name) !== stub.function.name).map((t, i) => {
     const name = t?.function?.name ?? t?.name
     // Bridge tools ride without a `back` entry (the anthropic route adds the manifest
-    // names itself), so the caller's vocabulary comes from the manifest map too.
-    const caller = oldBack?.get(name)?.name ?? AGENT_TOOL_MAP[name]?.name ?? name
-    back.set(`t${i + 1}`, { name: caller, args: null })
+    // names itself), so the spec comes from the manifest map: its schema is opencode's,
+    // and the reply still needs its args rewritten like the plain path does.
+    const spec = oldBack?.get(name) ?? AGENT_TOOL_MAP[name]
+    back.set(`t${i + 1}`, { name: spec?.name ?? name, args: spec?.args ?? null })
     return { ...(t.type ? { type: t.type } : { type: "function" }), function: { ...(t.function ?? {}), name: `t${i + 1}` } }
   })
   return { tools: [stub, ...tools], back }
